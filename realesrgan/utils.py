@@ -74,9 +74,6 @@ class RealESRGANer():
         if self.half:
             self.model = self.model.half()
 
-        if torch.__version__[0] == '2':
-            self.model = self.model.to(memory_format=torch.channels_last)
-            # self.model = torch.compile(self.model)
 
     def dni(self, net_a, net_b, dni_weight, key='params', loc='cpu'):
         """Deep network interpolation.
