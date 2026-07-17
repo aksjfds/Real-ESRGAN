@@ -85,11 +85,6 @@ class VideoInfo:
     def fps(self) -> float:
         return self.fps_num / self.fps_den
 
-    @property
-    def fps_rate(self) -> str:
-        return f"{self.fps_num}/{self.fps_den}"
-
-
 @dataclass(frozen=True)
 class TileInfo:
     index: int
@@ -153,6 +148,20 @@ def parse_rate(value: str) -> Fraction:
     return rate
 
 
+def parse_output_rate(value: str, source_rate: Fraction) -> Fraction:
+    """Resolve an output FPS value while preserving rational rates exactly."""
+    normalized = str(value).strip().lower()
+    if normalized in {"", "0", "auto", "source", "original"}:
+        return source_rate
+    try:
+        return parse_rate(normalized)
+    except (ValueError, ZeroDivisionError) as error:
+        raise ValueError(
+            "--fps must be source/auto/0, a positive number such as 23 or 60, "
+            "or a rational rate such as 24000/1001."
+        ) from error
+
+
 def probe_video(path: Path, ffprobe_bin: str) -> VideoInfo:
     command = [
         ffprobe_bin,
@@ -198,14 +207,19 @@ def choose_input_size(info: VideoInfo, width: int, height: int) -> Tuple[int, in
     return width, height
 
 
-def resolve_range(info: VideoInfo, start: float, test_seconds: float) -> Tuple[float, float, int]:
+def resolve_range(
+    info: VideoInfo,
+    start: float,
+    test_seconds: float,
+    output_rate: Fraction,
+) -> Tuple[float, float, int]:
     if start < 0 or start >= info.duration:
         raise ValueError(f"--start-time must be in [0, {info.duration:.3f}).")
     available = info.duration - start
     duration = min(test_seconds, available) if test_seconds > 0 else available
     if duration <= 0:
         raise ValueError("Selected video range is empty.")
-    expected = max(1, int(round(duration * info.fps)))
+    expected = max(1, int(round(duration * float(output_rate))))
     return start, duration, expected
 
 
@@ -535,7 +549,8 @@ class RawVideoWriter:
         ffmpeg_bin: str,
         width: int,
         height: int,
-        fps_rate: str,
+        input_fps_rate: str,
+        output_fps_rate: str,
         codec: str,
         crf: int,
         preset: str,
@@ -556,13 +571,16 @@ class RawVideoWriter:
             "-s:v",
             f"{width}x{height}",
             "-r",
-            fps_rate,
+            input_fps_rate,
             "-i",
             "pipe:0",
             "-an",
-            "-c:v",
-            codec,
         ]
+        if output_fps_rate != input_fps_rate:
+            # Raising FPS duplicates already-enhanced frames here instead of
+            # running identical source frames through the model repeatedly.
+            command += ["-vf", f"fps={output_fps_rate}"]
+        command += ["-c:v", codec]
         if codec in {"libx264", "libx265"}:
             command += ["-preset", preset, "-crf", str(crf)]
         else:
@@ -874,6 +892,13 @@ def process_video(args: argparse.Namespace) -> None:
     temporary_video = output_path.with_name(output_path.stem + ".video_only.tmp.mp4")
 
     info = probe_video(input_path, args.ffprobe_bin)
+    source_rate = Fraction(info.fps_num, info.fps_den)
+    output_rate = parse_output_rate(args.fps, source_rate)
+    inference_rate = min(source_rate, output_rate)
+    output_fps = float(output_rate)
+    output_fps_rate = f"{output_rate.numerator}/{output_rate.denominator}"
+    inference_fps = float(inference_rate)
+    inference_fps_rate = f"{inference_rate.numerator}/{inference_rate.denominator}"
     input_width, input_height = choose_input_size(info, args.input_width, args.input_height)
     output_width = int(round(input_width * args.scale))
     output_height = int(round(input_height * args.scale))
@@ -882,7 +907,8 @@ def process_video(args: argparse.Namespace) -> None:
             f"yuv420p needs even output dimensions, got {output_width}x{output_height}. "
             "Adjust --input-width/--input-height or use an integer scale producing even dimensions."
         )
-    start, duration, expected_frames = resolve_range(info, args.start_time, args.test_seconds)
+    start, duration, expected_frames = resolve_range(info, args.start_time, args.test_seconds, inference_rate)
+    expected_output_frames = max(1, int(round(duration * output_fps)))
     end = start + duration
     gpu_ids = parse_gpu_ids(args.gpu_ids)
     effective_fp16 = args.fp16 and gpu_ids != [None]
@@ -904,12 +930,15 @@ def process_video(args: argparse.Namespace) -> None:
     print(f"[input] {input_path}", flush=True)
     print(
         f"[input] source={info.width}x{info.height}, inference={input_width}x{input_height}, "
-        f"output={output_width}x{output_height}, fps={info.fps:.6f}, audio={info.has_audio}",
+        f"output={output_width}x{output_height}, source_fps={info.fps:.6f}, "
+        f"inference_fps={inference_fps:.6f} ({inference_fps_rate}), "
+        f"output_fps={output_fps:.6f} ({output_fps_rate}), audio={info.has_audio}",
         flush=True,
     )
     print(
         f"[range] mode={mode}, start={format_seconds(start)}, end={format_seconds(end)}, "
-        f"duration={duration:.3f}s, expected_frames={expected_frames}",
+        f"duration={duration:.3f}s, expected_inference_frames={expected_frames}, "
+        f"expected_output_frames={expected_output_frames}",
         flush=True,
     )
     if args.tile_size == 0:
@@ -955,7 +984,7 @@ def process_video(args: argparse.Namespace) -> None:
             args.ffmpeg_bin,
             input_width,
             input_height,
-            info.fps_rate,
+            inference_fps_rate,
             start,
             duration,
         )
@@ -964,7 +993,8 @@ def process_video(args: argparse.Namespace) -> None:
             args.ffmpeg_bin,
             output_width,
             output_height,
-            info.fps_rate,
+            inference_fps_rate,
+            output_fps_rate,
             args.video_codec,
             args.crf,
             args.preset,
@@ -1059,7 +1089,8 @@ def process_video(args: argparse.Namespace) -> None:
 
     if not clean_video_ready or processed == 0:
         raise RuntimeError("No complete video was encoded.")
-    actual_duration = processed / info.fps
+    actual_duration = processed / inference_fps
+    output_frames = int(round(actual_duration * output_fps))
     stage_started = time.monotonic()
     mux_audio(
         temporary_video,
@@ -1078,7 +1109,8 @@ def process_video(args: argparse.Namespace) -> None:
     elapsed = time.monotonic() - started
     print(
         f"[range] actual_start={format_seconds(start)}, actual_end={format_seconds(start + actual_duration)}, "
-        f"processed_frames={processed}, output_duration={actual_duration:.3f}s",
+        f"processed_inference_frames={processed}, output_frames={output_frames}, "
+        f"output_duration={actual_duration:.3f}s",
         flush=True,
     )
     print(
@@ -1106,6 +1138,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default="", help="Optional local .pth override")
     parser.add_argument("--denoise-strength", type=float, default=1.0, help="DNI strength for general-x4v3")
     parser.add_argument("--scale", type=float, default=2.0, help="Final output scale")
+    parser.add_argument(
+        "--fps",
+        default="source",
+        help="Output FPS: source/auto/0, a number such as 23 or 60, or 24000/1001",
+    )
     parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--input-width", type=int, default=0, help="0 keeps source/aspect-derived width")
     parser.add_argument("--input-height", type=int, default=0, help="0 keeps source/aspect-derived height")

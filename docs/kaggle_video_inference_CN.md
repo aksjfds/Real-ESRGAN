@@ -22,6 +22,7 @@
 
 ```text
 --model realesr-animevideov3 --scale 2 --fp16 --channels-last
+--fps source
 --tile-size 0 --overlap 0 --batch-size 8 --gpu-ids 0,1
 --video-codec hevc_nvenc --cq 18 --nvenc-preset p7 --encode-gpu 0
 --audio-codec aac --audio-bitrate 192k
@@ -29,6 +30,9 @@
 ```
 
 `--input-width 0 --input-height 0` 保持源尺寸；只指定一个维度会保持宽高比。
+`--fps source`、`auto` 或 `0` 保持原视频帧率；也可设为 `23`、`60`、`23.976`
+或精确有理数 `24000/1001`。改变帧率时 ffmpeg 会按时间轴丢帧或复制帧，音频时长不变；
+这不是运动补帧。升帧在增强后完成，不会对重复帧再次执行 Real-ESRGAN 推理。
 完成 10 秒测试后将 `--test-seconds` 设为 `0`，即可从 `--start-time` 处理到末尾。
 
 ## OOM 降级顺序
