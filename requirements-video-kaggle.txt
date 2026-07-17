@@ -1,0 +1,4 @@
+# Keep Kaggle's matched torch/torchvision CUDA build; do not install the legacy
+# torch==2.1.0 pins from the upstream training requirements for this CLI.
+basicsr==1.4.2
+tqdm>=4.66,<5
