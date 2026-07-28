@@ -1,9 +1,5 @@
-basicsr
-numpy
-opencv-python
-Pillow
-torch==2.1.0
-torchvision==0.16.0
-tqdm
-ffmpeg
-ffmpeg-python
+# Fast video pipeline dependencies. Keep Kaggle's matched torch/torchvision CUDA build;
+# do not install the legacy
+# torch==2.1.0 pins from the upstream training requirements for this CLI.
+basicsr==1.4.2
+tqdm>=4.66,<5

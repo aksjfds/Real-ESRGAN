@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-GPU tiled Real-ESRGAN video inference for Kaggle.
+"""Fast multi-GPU Real-ESRGAN video upscaling for Kaggle.
 
 The parent process owns video decoding, overlap blending, progress reporting and
 encoding.  Exactly one persistent worker (and therefore one model copy) is

@@ -1,0 +1,8 @@
+# Masked VapourSynth pipeline dependencies.
+VapourSynth==77
+wrapt>=1.16,<3
+vapoursynth-ffms2>=2.40
+vapoursynth-mlrt-ort-cuda==16.0
+onnx>=1.17,<2
+py7zr>=0.22,<2
+
