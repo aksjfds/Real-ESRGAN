@@ -1159,7 +1159,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--video-codec",
         choices=("libx264", "libx265", "h264_nvenc", "hevc_nvenc"),
-        default="libx264",
+        default="hevc_nvenc",
     )
     parser.add_argument("--crf", type=int, default=18, help="Lower is higher video quality/larger file")
     parser.add_argument(
