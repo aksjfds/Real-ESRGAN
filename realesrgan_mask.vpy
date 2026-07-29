@@ -3,7 +3,7 @@
 Line regions:
     realesr-animevideov3 (native 4x, resized to requested 2x/3x)
 Flat regions:
-    ArtCNN R16F96 luma 2x + ArtCNN R16F96 Chroma reconstruction
+    NNEDI3 enlargement for luma and chroma
 
 The script is intended to be launched by ``realesrgan_mask.py``.  All
 capitalised settings below can also be injected with ``vspipe --arg``.
@@ -46,8 +46,6 @@ def setting_bool(name: str, default: bool) -> bool:
 INPUT = setting("INPUT", "")
 VSMLRT_PATH = setting("VSMLRT_PATH", "")
 REALESRGAN_MODEL = setting("REALESRGAN_MODEL", "")
-ARTCNN_LUMA_MODEL = setting("ARTCNN_LUMA_MODEL", "")
-ARTCNN_CHROMA_MODEL = setting("ARTCNN_CHROMA_MODEL", "")
 ENGINE_DIR = setting("ENGINE_DIR", "./vs-engine-cache")
 BACKEND = setting("BACKEND", "ort_cuda").lower()
 GPU_IDS = tuple(int(item) for item in setting("GPU_IDS", "0").split(",") if item.strip())
@@ -68,8 +66,12 @@ BATCH_SIZE = setting_int("BATCH_SIZE", 1)
 PREFER_NHWC = setting_bool("PREFER_NHWC", True)
 WORKSPACE_GIB = setting_float("WORKSPACE_GIB", 4.0)
 USE_CUDA_GRAPH = setting_bool("USE_CUDA_GRAPH", True)
-CORE_THREADS = setting_int("CORE_THREADS", 8)
+CORE_THREADS = setting_int("CORE_THREADS", 2)
 CACHE_MIB = setting_int("CACHE_MIB", 2048)
+NNEDI3_NSIZE = setting_int("NNEDI3_NSIZE", 0)
+NNEDI3_NNS = setting_int("NNEDI3_NNS", 2)
+NNEDI3_QUAL = setting_int("NNEDI3_QUAL", 2)
+NNEDI3_PSCRN = setting_int("NNEDI3_PSCRN", 2)
 
 MATRIX = setting("MATRIX", "709")
 TRANSFER = setting("TRANSFER", "709")
@@ -94,8 +96,6 @@ def validate_settings() -> None:
         "INPUT": INPUT,
         "VSMLRT_PATH": VSMLRT_PATH,
         "REALESRGAN_MODEL": REALESRGAN_MODEL,
-        "ARTCNN_LUMA_MODEL": ARTCNN_LUMA_MODEL,
-        "ARTCNN_CHROMA_MODEL": ARTCNN_CHROMA_MODEL,
     }
     for name, value in required_paths.items():
         if not value:
@@ -124,6 +124,14 @@ def validate_settings() -> None:
         raise ValueError("NUM_STREAMS and BATCH_SIZE must be positive")
     if WORKSPACE_GIB <= 0 or CORE_THREADS <= 0 or CACHE_MIB <= 0:
         raise ValueError("Workspace, core threads, and cache size must be positive")
+    if NNEDI3_NSIZE not in {0, 4}:
+        raise ValueError("NNEDI3_NSIZE must be 0 or 4 for enlargement")
+    if NNEDI3_NNS not in {0, 1, 2, 3, 4}:
+        raise ValueError("NNEDI3_NNS must be between 0 and 4")
+    if NNEDI3_QUAL not in {1, 2}:
+        raise ValueError("NNEDI3_QUAL must be 1 or 2")
+    if NNEDI3_PSCRN not in {0, 1, 2, 3, 4}:
+        raise ValueError("NNEDI3_PSCRN must be between 0 and 4")
     if not 0 <= MASK_LOW < MASK_HIGH <= 1:
         raise ValueError("MASK thresholds must satisfy 0 <= MASK_LOW < MASK_HIGH <= 1")
     if not 0 <= MASK_SUPPORT_LOW < MASK_SUPPORT_HIGH <= 1:
@@ -170,8 +178,8 @@ def make_backend(device_id: int):
         cudnn_benchmark=True,
         prefer_nhwc=PREFER_NHWC,
         output_format=1 if FP16 else 0,
-        # ORT CUDA graph capture is not safe for this multi-model graph on T4:
-        # ArtCNN convolution setup can call cuDNN while the stream is capturing.
+        # Keep ORT CUDA graph disabled for compatibility with the current
+        # VapourSynth scheduling path.
         use_cuda_graph=False,
     )
 
@@ -318,12 +326,58 @@ def run_model(
     )
 
 
+def nnedi3_function():
+    """Resolve the modern znedi3 namespace with an old-plugin fallback."""
+    try:
+        return core.znedi3.nnedi3
+    except AttributeError:
+        try:
+            return core.nnedi3.nnedi3
+        except AttributeError as error:
+            raise RuntimeError(
+                "NNEDI3 plugin is unavailable; install vapoursynth-znedi3"
+            ) from error
+
+
+def nnedi3_double(clip: vs.VideoNode) -> vs.VideoNode:
+    """Double both dimensions by applying NNEDI3 vertically, then horizontally."""
+    nnedi3 = nnedi3_function()
+    options = {
+        "field": 1,
+        "dh": True,
+        "nsize": NNEDI3_NSIZE,
+        "nns": NNEDI3_NNS,
+        "qual": NNEDI3_QUAL,
+        "pscrn": NNEDI3_PSCRN,
+    }
+    vertical = nnedi3(clip, **options)
+    transposed = core.std.Transpose(vertical)
+    horizontal = nnedi3(transposed, **options)
+    return core.std.Transpose(horizontal)
+
+
+def nnedi3_scale(clip: vs.VideoNode, width: int, height: int) -> vs.VideoNode:
+    """Enlarge to 2x/3x/4x; NNEDI3 itself operates in powers of two."""
+    passes = 1 if OUTPUT_SCALE == 2.0 else 2
+    result = clip
+    for _ in range(passes):
+        result = nnedi3_double(result)
+    if (result.width, result.height) != (width, height):
+        result = core.resize.Lanczos(
+            result,
+            width=width,
+            height=height,
+            filter_param_a=4,
+        )
+    return result
+
+
 def process_device(clip: vs.VideoNode, device_id: int) -> vs.VideoNode:
     backend = make_backend(device_id)
     target_width = int(round(clip.width * OUTPUT_SCALE))
     target_height = int(round(clip.height * OUTPUT_SCALE))
-    # Keep the mask in fp32, but feed fp16 data to fp16 neural networks. ORT
-    # otherwise keeps fp32 model I/O even when the internal weights are fp16.
+    # Keep the mask in fp32 and use 16-bit integer YUV for the CPU NNEDI3
+    # branch. Real-ESRGAN continues to use RGB fp16/fp32 on the selected GPU.
     mask_yuv444 = core.resize.Bilinear(
         clip,
         format=vs.YUV444PS,
@@ -331,12 +385,12 @@ def process_device(clip: vs.VideoNode, device_id: int) -> vs.VideoNode:
         range_s="full",
     )
     mask_y = core.std.ShufflePlanes(mask_yuv444, 0, vs.GRAY)
-    model_yuv444 = (
-        core.resize.Point(mask_yuv444, format=vs.YUV444PH)
-        if FP16
-        else mask_yuv444
+    flat_yuv444 = core.resize.Bicubic(
+        clip,
+        format=vs.YUV444P16,
+        range_in_s=INPUT_RANGE,
+        range_s="full",
     )
-    model_y = core.std.ShufflePlanes(model_yuv444, 0, vs.GRAY)
     rgb = core.resize.Bicubic(
         clip,
         format=vs.RGBH if FP16 else vs.RGBS,
@@ -362,45 +416,9 @@ def process_device(clip: vs.VideoNode, device_id: int) -> vs.VideoNode:
         )
     )
 
-    art_y2 = run_model(model_y, ARTCNN_LUMA_MODEL, backend)
-    assert isinstance(art_y2, vs.VideoNode)
-
-    chroma_input = core.std.Expr(model_yuv444, ["", "x 0.5 +"])
-    chroma_planes = run_model(
-        chroma_input,
-        ARTCNN_CHROMA_MODEL,
-        backend,
-        flexible=True,
-    )
-    assert isinstance(chroma_planes, list) and len(chroma_planes) == 2
-    art_chroma = core.std.ShufflePlanes(
-        [chroma_input, chroma_planes[0], chroma_planes[1]],
-        [0, 0, 0],
-        vs.YUV,
-    )
-    art_chroma = core.std.Expr(art_chroma, ["", "x 0.5 -"])
-    art_chroma2 = core.resize.Spline36(
-        art_chroma,
-        width=clip.width * 2,
-        height=clip.height * 2,
-    )
-    art_yuv2 = core.std.ShufflePlanes(
-        [art_y2, art_chroma2, art_chroma2],
-        [0, 1, 2],
-        vs.YUV,
-    )
-    art_yuv_scaled = (
-        art_yuv2
-        if OUTPUT_SCALE == 2.0
-        else core.resize.Lanczos(
-            art_yuv2,
-            width=target_width,
-            height=target_height,
-            filter_param_a=4,
-        )
-    )
-    art_rgb_scaled = core.resize.Bicubic(
-        art_yuv_scaled,
+    flat_yuv_scaled = nnedi3_scale(flat_yuv444, target_width, target_height)
+    flat_rgb_scaled = core.resize.Bicubic(
+        flat_yuv_scaled,
         format=vs.RGBS,
         matrix_in_s=MATRIX,
         range_in_s="full",
@@ -415,10 +433,10 @@ def process_device(clip: vs.VideoNode, device_id: int) -> vs.VideoNode:
         filter_param_a=0,
         filter_param_b=0.5,
     )
-    merged = core.std.MaskedMerge(art_rgb_scaled, line_scaled, mask_scaled)
+    merged = core.std.MaskedMerge(flat_rgb_scaled, line_scaled, mask_scaled)
     print(
         f"[gpu] cuda:{device_id} resident filters ready: "
-        "RealESRGAN animevideov3 + ArtCNN R16F96 luma/chroma",
+        "RealESRGAN animevideov3 + NNEDI3 flat/chroma",
         file=sys.stderr,
         flush=True,
     )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the masked Real-ESRGAN/ArtCNN video upscaling pipeline."""
+"""Run the masked Real-ESRGAN/NNEDI3 video upscaling pipeline."""
 
 from __future__ import annotations
 
@@ -30,18 +30,12 @@ REALESRGAN_ARCHIVE_URL = (
 REALESRGAN_ARCHIVE_SHA256 = (
     "ee25320125aac83b5662c770a76d961126fc5e2dc759c461ae67afa33b138ba9"
 )
-ARTCNN_ARCHIVE_URL = (
-    "https://github.com/AmusementClub/vs-mlrt/releases/download/"
-    "external-models/artcnn_v8.7z"
-)
-ARTCNN_ARCHIVE_SHA256 = (
-    "011623661f7273fe77c71bf419868da9700633eeea7bddcdac61a680951c6ab0"
-)
 VSMLRT_SCRIPT_URL = (
     "https://raw.githubusercontent.com/AmusementClub/vs-mlrt/"
     "1a14847b0652271d266efbfb691de15fb04bf988/scripts/vsmlrt.py"
 )
 VSMLRT_SCRIPT_SHA256 = "440703b8dc6ce265b3edcc4f1ac67cfc61d7ca128619e1c56eae3fd80af44dc1"
+PIPELINE_VERSION = "nnedi3-v1"
 
 
 @dataclass(frozen=True)
@@ -269,13 +263,7 @@ def prepare_assets(work_dir: Path) -> dict[str, Path]:
         download_dir / "RealESRGANv3_v1.7z",
         REALESRGAN_ARCHIVE_SHA256,
     )
-    art_archive = download(
-        ARTCNN_ARCHIVE_URL,
-        download_dir / "artcnn_v8.7z",
-        ARTCNN_ARCHIVE_SHA256,
-    )
     extract_archive(real_archive, model_dir)
-    extract_archive(art_archive, model_dir)
     vsmlrt_script = download(
         VSMLRT_SCRIPT_URL,
         work_dir / "vsmlrt.py",
@@ -284,8 +272,6 @@ def prepare_assets(work_dir: Path) -> dict[str, Path]:
     return {
         "vsmlrt": vsmlrt_script.resolve(),
         "realesrgan": find_model(model_dir, "realesr-animevideov3.onnx"),
-        "artcnn_luma": find_model(model_dir, "ArtCNN_R16F96.onnx"),
-        "artcnn_chroma": find_model(model_dir, "ArtCNN_R16F96_Chroma.onnx"),
     }
 
 
@@ -521,8 +507,6 @@ def vspipe_arguments(
         "INPUT": Path(args.input).resolve(),
         "VSMLRT_PATH": assets["vsmlrt"],
         "REALESRGAN_MODEL": assets["realesrgan"],
-        "ARTCNN_LUMA_MODEL": assets["artcnn_luma"],
-        "ARTCNN_CHROMA_MODEL": assets["artcnn_chroma"],
         "ENGINE_DIR": Path(args.engine_dir).resolve(),
         "BACKEND": backend,
         "GPU_IDS": gpu_ids if gpu_ids is not None else args.gpu_ids,
@@ -543,6 +527,10 @@ def vspipe_arguments(
         "USE_CUDA_GRAPH": int(args.cuda_graph),
         "CORE_THREADS": args.core_threads,
         "CACHE_MIB": args.cache_mib,
+        "NNEDI3_NSIZE": args.nnedi3_nsize,
+        "NNEDI3_NNS": args.nnedi3_nns,
+        "NNEDI3_QUAL": args.nnedi3_qual,
+        "NNEDI3_PSCRN": args.nnedi3_pscrn,
         "MATRIX": info.matrix,
         "TRANSFER": info.transfer,
         "PRIMARIES": info.primaries,
@@ -870,9 +858,30 @@ def mux_audio(
     start: float,
     duration: float,
 ) -> None:
+    container_args: list[str] = []
+    if output.suffix.lower() == ".mp4":
+        if args.video_codec in {"hevc_nvenc", "libx265"}:
+            container_args.extend(["-tag:v", "hvc1"])
+        container_args.extend(["-movflags", "+faststart"])
     if not info.has_audio:
-        temporary_video.replace(output)
-        print("[audio] input has no audio stream", flush=True)
+        command = [
+            args.ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-i",
+            str(temporary_video),
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            *container_args,
+            str(output),
+        ]
+        run_checked(command, "video remux")
+        temporary_video.unlink(missing_ok=True)
+        print("[audio] input has no audio stream; remuxed video-only output", flush=True)
         return
     command = [args.ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "warning"]
     if start > 0:
@@ -906,7 +915,7 @@ def mux_audio(
                 "aresample=async=1:first_pts=0",
             ]
         )
-    command.extend(["-shortest", "-movflags", "+faststart", str(output)])
+    command.extend(["-shortest", *container_args, str(output)])
     run_checked(command, "audio mux")
     temporary_video.unlink(missing_ok=True)
 
@@ -936,6 +945,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Streams, batch size, and TensorRT workspace must be positive")
     if args.core_threads <= 0 or args.cache_mib <= 0:
         raise ValueError("Core threads and cache size must be positive")
+    if args.nnedi3_nsize not in {0, 4}:
+        raise ValueError("--nnedi3-nsize must be 0 or 4 for image enlargement")
+    if args.nnedi3_nns not in {0, 1, 2, 3, 4}:
+        raise ValueError("--nnedi3-nns must be between 0 and 4")
+    if args.nnedi3_qual not in {1, 2}:
+        raise ValueError("--nnedi3-qual must be 1 or 2")
+    if args.nnedi3_pscrn not in {0, 1, 2, 3, 4}:
+        raise ValueError("--nnedi3-pscrn must be between 0 and 4")
     if not 0 <= args.mask_low < args.mask_high <= 1:
         raise ValueError("Mask thresholds must satisfy 0 <= low < high <= 1")
     if args.mask_dark_boost < 0 or args.mask_strength < 0:
@@ -1024,8 +1041,10 @@ def process(args: argparse.Namespace) -> None:
         flush=True,
     )
     print(
-        f"[pipeline] line=realesr-animevideov3, flat=ArtCNN_R16F96, "
-        f"chroma=ArtCNN_R16F96_Chroma, scale={args.scale:g}, gpu_ids={args.gpu_ids}",
+        f"[pipeline] line=realesr-animevideov3, flat/chroma=NNEDI3, "
+        f"nnedi3=nsize{args.nnedi3_nsize}/nns{args.nnedi3_nns}/"
+        f"qual{args.nnedi3_qual}/pscrn{args.nnedi3_pscrn}, "
+        f"scale={args.scale:g}, gpu_ids={args.gpu_ids}",
         flush=True,
     )
 
@@ -1047,7 +1066,7 @@ def process(args: argparse.Namespace) -> None:
     if backend == "ort_cuda" and args.cuda_graph:
         print(
             "[backend] CUDA Graph requested but disabled for ORT CUDA because the "
-            "multi-model T4 graph is not capture-safe",
+            "current vs-mlrt ORT path keeps it disabled for compatibility",
             flush=True,
         )
     print(
@@ -1113,9 +1132,10 @@ def process(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
-        description="Multi-GPU VapourSynth Real-ESRGAN/ArtCNN anime upscaler",
+        description="Multi-GPU VapourSynth Real-ESRGAN/NNEDI3 anime upscaler",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {PIPELINE_VERSION}")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--vpy-script", default=str(here / "realesrgan_mask.vpy"))
@@ -1151,8 +1171,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--workspace-gib", type=float, default=4.0)
     parser.add_argument("--cuda-graph", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--core-threads", type=int, default=8)
+    parser.add_argument("--core-threads", type=int, default=2)
     parser.add_argument("--cache-mib", type=int, default=2048)
+    parser.add_argument("--nnedi3-nsize", type=int, choices=(0, 4), default=0)
+    parser.add_argument("--nnedi3-nns", type=int, choices=range(5), default=2)
+    parser.add_argument("--nnedi3-qual", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--nnedi3-pscrn", type=int, choices=range(5), default=2)
 
     parser.add_argument("--mask-low", type=float, default=0.040)
     parser.add_argument("--mask-high", type=float, default=0.140)
@@ -1168,7 +1192,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--video-codec",
         choices=("auto", "hevc_nvenc", "h264_nvenc", "libx264", "libx265"),
-        default="auto",
+        default="hevc_nvenc",
     )
     parser.add_argument("--cq", type=int, default=14)
     parser.add_argument("--nvenc-preset", choices=tuple(f"p{i}" for i in range(1, 8)), default="p7")
