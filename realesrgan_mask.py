@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the masked Real-ESRGAN/NNEDI3 video upscaling pipeline."""
+"""Run the DPIR-denoised masked Real-ESRGAN/NNEDI3 video upscaling pipeline."""
 
 from __future__ import annotations
 
@@ -30,12 +30,17 @@ REALESRGAN_ARCHIVE_URL = (
 REALESRGAN_ARCHIVE_SHA256 = (
     "ee25320125aac83b5662c770a76d961126fc5e2dc759c461ae67afa33b138ba9"
 )
+DPIR_ARCHIVE_URL = (
+    "https://github.com/AmusementClub/vs-mlrt/releases/download/"
+    "model-20211209/dpir_v3.7z"
+)
+DPIR_ARCHIVE_SIZE = 482_255_023
 VSMLRT_SCRIPT_URL = (
     "https://raw.githubusercontent.com/AmusementClub/vs-mlrt/"
     "1a14847b0652271d266efbfb691de15fb04bf988/scripts/vsmlrt.py"
 )
 VSMLRT_SCRIPT_SHA256 = "440703b8dc6ce265b3edcc4f1ac67cfc61d7ca128619e1c56eae3fd80af44dc1"
-PIPELINE_VERSION = "nnedi3-v1"
+PIPELINE_VERSION = "dpir-nnedi3-v1"
 
 
 @dataclass(frozen=True)
@@ -191,12 +196,19 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download(url: str, target: Path, sha256: str | None = None) -> Path:
+def download(
+    url: str,
+    target: Path,
+    sha256: str | None = None,
+    expected_size: int | None = None,
+) -> Path:
     if target.is_file() and target.stat().st_size > 0:
-        if sha256 is None or file_sha256(target) == sha256:
+        size_ok = expected_size is None or target.stat().st_size == expected_size
+        checksum_ok = sha256 is None or file_sha256(target) == sha256
+        if size_ok and checksum_ok:
             print(f"[download] cached: {target}", flush=True)
             return target
-        print(f"[download] replacing cache with unexpected checksum: {target}", flush=True)
+        print(f"[download] replacing invalid cache: {target}", flush=True)
         target.unlink()
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".part")
@@ -220,6 +232,11 @@ def download(url: str, target: Path, sha256: str | None = None) -> Path:
 
     try:
         urllib.request.urlretrieve(url, temporary, reporthook=reporthook)
+        if expected_size is not None and temporary.stat().st_size != expected_size:
+            raise RuntimeError(
+                f"Size mismatch for {url}: expected {expected_size}, "
+                f"got {temporary.stat().st_size}"
+            )
         if sha256 is not None:
             actual = file_sha256(temporary)
             if actual != sha256:
@@ -263,7 +280,13 @@ def prepare_assets(work_dir: Path) -> dict[str, Path]:
         download_dir / "RealESRGANv3_v1.7z",
         REALESRGAN_ARCHIVE_SHA256,
     )
+    dpir_archive = download(
+        DPIR_ARCHIVE_URL,
+        download_dir / "dpir_v3.7z",
+        expected_size=DPIR_ARCHIVE_SIZE,
+    )
     extract_archive(real_archive, model_dir)
+    extract_archive(dpir_archive, model_dir)
     vsmlrt_script = download(
         VSMLRT_SCRIPT_URL,
         work_dir / "vsmlrt.py",
@@ -272,6 +295,7 @@ def prepare_assets(work_dir: Path) -> dict[str, Path]:
     return {
         "vsmlrt": vsmlrt_script.resolve(),
         "realesrgan": find_model(model_dir, "realesr-animevideov3.onnx"),
+        "dpir": find_model(model_dir, "drunet_color.onnx"),
     }
 
 
@@ -507,6 +531,7 @@ def vspipe_arguments(
         "INPUT": Path(args.input).resolve(),
         "VSMLRT_PATH": assets["vsmlrt"],
         "REALESRGAN_MODEL": assets["realesrgan"],
+        "DPIR_MODEL": assets["dpir"],
         "ENGINE_DIR": Path(args.engine_dir).resolve(),
         "BACKEND": backend,
         "GPU_IDS": gpu_ids if gpu_ids is not None else args.gpu_ids,
@@ -527,6 +552,9 @@ def vspipe_arguments(
         "USE_CUDA_GRAPH": int(args.cuda_graph),
         "CORE_THREADS": args.core_threads,
         "CACHE_MIB": args.cache_mib,
+        "DPIR_STRENGTH": args.dpir_strength,
+        "DPIR_TILE_SIZE": args.dpir_tile_size,
+        "DPIR_OVERLAP": args.dpir_overlap,
         "NNEDI3_NSIZE": args.nnedi3_nsize,
         "NNEDI3_NNS": args.nnedi3_nns,
         "NNEDI3_QUAL": args.nnedi3_qual,
@@ -937,6 +965,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Start and test duration must be non-negative")
     if args.tile_size < 0 or args.overlap < 0:
         raise ValueError("Tile size and overlap must be non-negative")
+    if args.dpir_strength < 0:
+        raise ValueError("--dpir-strength must be non-negative")
+    if args.dpir_tile_size < 0 or args.dpir_overlap < 0:
+        raise ValueError("DPIR tile size and overlap must be non-negative")
+    if args.dpir_tile_size and args.dpir_tile_size % 8:
+        raise ValueError("--dpir-tile-size must be a multiple of 8")
+    if args.dpir_tile_size and args.dpir_overlap * 2 >= args.dpir_tile_size:
+        raise ValueError("--dpir-overlap must be smaller than half of --dpir-tile-size")
     if args.input_width < 0 or args.input_height < 0:
         raise ValueError("Input width and height must be non-negative")
     if args.tile_size and args.overlap * 2 >= args.tile_size:
@@ -1041,7 +1077,9 @@ def process(args: argparse.Namespace) -> None:
         flush=True,
     )
     print(
-        f"[pipeline] line=realesr-animevideov3, flat/chroma=NNEDI3, "
+        f"[pipeline] prefilter=DPIR_color(strength={args.dpir_strength:g}, "
+        f"tile={args.dpir_tile_size}, overlap={args.dpir_overlap}), "
+        f"line=realesr-animevideov3, flat/chroma=NNEDI3, "
         f"nnedi3=nsize{args.nnedi3_nsize}/nns{args.nnedi3_nns}/"
         f"qual{args.nnedi3_qual}/pscrn{args.nnedi3_pscrn}, "
         f"scale={args.scale:g}, gpu_ids={args.gpu_ids}",
@@ -1132,7 +1170,7 @@ def process(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
-        description="Multi-GPU VapourSynth Real-ESRGAN/NNEDI3 anime upscaler",
+        description="Multi-GPU DPIR + Real-ESRGAN/NNEDI3 anime upscaler",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {PIPELINE_VERSION}")
@@ -1173,6 +1211,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cuda-graph", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--core-threads", type=int, default=2)
     parser.add_argument("--cache-mib", type=int, default=2048)
+    parser.add_argument(
+        "--dpir-strength",
+        type=float,
+        default=5.0,
+        help="DPIR color denoise sigma; 0 bypasses DPIR",
+    )
+    parser.add_argument(
+        "--dpir-tile-size",
+        type=int,
+        default=256,
+        help="DPIR input tile size; use a multiple of 8, or 0 for full frame",
+    )
+    parser.add_argument("--dpir-overlap", type=int, default=16)
     parser.add_argument("--nnedi3-nsize", type=int, choices=(0, 4), default=0)
     parser.add_argument("--nnedi3-nns", type=int, choices=range(5), default=2)
     parser.add_argument("--nnedi3-qual", type=int, choices=(1, 2), default=2)

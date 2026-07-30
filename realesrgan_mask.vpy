@@ -1,5 +1,7 @@
-"""VapourSynth Real-ESRGAN masked anime upscaler.
+"""VapourSynth DPIR + Real-ESRGAN masked anime upscaler.
 
+Before enlargement:
+    DPIR drunet_color denoising
 Line regions:
     realesr-animevideov3 (native 4x, resized to requested 2x/3x)
 Flat regions:
@@ -46,6 +48,7 @@ def setting_bool(name: str, default: bool) -> bool:
 INPUT = setting("INPUT", "")
 VSMLRT_PATH = setting("VSMLRT_PATH", "")
 REALESRGAN_MODEL = setting("REALESRGAN_MODEL", "")
+DPIR_MODEL = setting("DPIR_MODEL", "")
 ENGINE_DIR = setting("ENGINE_DIR", "./vs-engine-cache")
 BACKEND = setting("BACKEND", "ort_cuda").lower()
 GPU_IDS = tuple(int(item) for item in setting("GPU_IDS", "0").split(",") if item.strip())
@@ -68,6 +71,9 @@ WORKSPACE_GIB = setting_float("WORKSPACE_GIB", 4.0)
 USE_CUDA_GRAPH = setting_bool("USE_CUDA_GRAPH", True)
 CORE_THREADS = setting_int("CORE_THREADS", 2)
 CACHE_MIB = setting_int("CACHE_MIB", 2048)
+DPIR_STRENGTH = setting_float("DPIR_STRENGTH", 5.0)
+DPIR_TILE_SIZE = setting_int("DPIR_TILE_SIZE", 256)
+DPIR_OVERLAP = setting_int("DPIR_OVERLAP", 16)
 NNEDI3_NSIZE = setting_int("NNEDI3_NSIZE", 0)
 NNEDI3_NNS = setting_int("NNEDI3_NNS", 2)
 NNEDI3_QUAL = setting_int("NNEDI3_QUAL", 2)
@@ -96,6 +102,7 @@ def validate_settings() -> None:
         "INPUT": INPUT,
         "VSMLRT_PATH": VSMLRT_PATH,
         "REALESRGAN_MODEL": REALESRGAN_MODEL,
+        "DPIR_MODEL": DPIR_MODEL,
     }
     for name, value in required_paths.items():
         if not value:
@@ -120,6 +127,14 @@ def validate_settings() -> None:
         raise ValueError("TILE_SIZE and OVERLAP must be 0 or positive")
     if TILE_SIZE and OVERLAP * 2 >= TILE_SIZE:
         raise ValueError("OVERLAP must be smaller than half of TILE_SIZE")
+    if DPIR_STRENGTH < 0:
+        raise ValueError("DPIR_STRENGTH must be non-negative")
+    if DPIR_TILE_SIZE < 0 or DPIR_OVERLAP < 0:
+        raise ValueError("DPIR_TILE_SIZE and DPIR_OVERLAP must be non-negative")
+    if DPIR_TILE_SIZE and DPIR_TILE_SIZE % 8:
+        raise ValueError("DPIR_TILE_SIZE must be a multiple of 8")
+    if DPIR_TILE_SIZE and DPIR_OVERLAP * 2 >= DPIR_TILE_SIZE:
+        raise ValueError("DPIR_OVERLAP must be smaller than half of DPIR_TILE_SIZE")
     if NUM_STREAMS <= 0 or BATCH_SIZE <= 0:
         raise ValueError("NUM_STREAMS and BATCH_SIZE must be positive")
     if WORKSPACE_GIB <= 0 or CORE_THREADS <= 0 or CACHE_MIB <= 0:
@@ -225,9 +240,10 @@ def max_clips(clips: list[vs.VideoNode]) -> vs.VideoNode:
 
 
 def kirsch_mask(y: vs.VideoNode) -> vs.VideoNode:
-    # Denoise only the mask source. The neural model inputs remain untouched.
-    # Median removes isolated bright/dark specks, then the wider low-pass rejects
-    # grain and compression texture while retaining persistent character outlines.
+    # This extra prefilter affects only mask extraction; all upscale branches
+    # otherwise receive the same unmodified DPIR result. Median removes isolated
+    # specks, then the wider low-pass rejects residual grain while retaining
+    # persistent character outlines.
     if MASK_PREFILTER > 0:
         mask_source = core.std.Median(y)
         mask_source = core.std.BoxBlur(
@@ -306,6 +322,36 @@ def inference_options(clip: vs.VideoNode) -> tuple[tuple[int, int], tuple[int, i
     return (TILE_SIZE, TILE_SIZE), (OVERLAP, OVERLAP)
 
 
+def dpir_inference_options(clip: vs.VideoNode) -> tuple[tuple[int, int], tuple[int, int]]:
+    if DPIR_TILE_SIZE == 0:
+        return (clip.width, clip.height), (0, 0)
+    return (DPIR_TILE_SIZE, DPIR_TILE_SIZE), (DPIR_OVERLAP, DPIR_OVERLAP)
+
+
+def run_dpir(clip: vs.VideoNode, backend) -> vs.VideoNode:
+    """Run the official color DRUNet wrapper before any enlargement."""
+    if DPIR_STRENGTH == 0:
+        return clip
+    model_path = Path(DPIR_MODEL).resolve()
+    if model_path.parent.name != "dpir":
+        raise RuntimeError(
+            f"Unexpected DPIR model layout: {model_path}; expected .../dpir/drunet_color.onnx"
+        )
+    # The high-level wrapper adds DPIR's second sigma input and applies the
+    # TensorRT precision workaround required by older TensorRT releases.
+    vsmlrt.models_path = str(model_path.parent.parent)
+    tilesize, overlap = dpir_inference_options(clip)
+    result = vsmlrt.DPIR(
+        clip,
+        strength=DPIR_STRENGTH,
+        tilesize=tilesize,
+        overlap=overlap,
+        model=vsmlrt.DPIRModel.drunet_color,
+        backend=backend,
+    )
+    return result
+
+
 def run_model(
     clip: vs.VideoNode,
     model_path: str,
@@ -373,32 +419,37 @@ def nnedi3_scale(clip: vs.VideoNode, width: int, height: int) -> vs.VideoNode:
 
 
 def process_device(clip: vs.VideoNode, device_id: int) -> vs.VideoNode:
-    backend = make_backend(device_id)
+    # Separate backend objects keep both ONNX sessions resident on this GPU.
+    # The graph dependency guarantees DPIR completes before either upscale path.
+    dpir_backend = make_backend(device_id)
+    upscale_backend = make_backend(device_id)
     target_width = int(round(clip.width * OUTPUT_SCALE))
     target_height = int(round(clip.height * OUTPUT_SCALE))
-    # Keep the mask in fp32 and use 16-bit integer YUV for the CPU NNEDI3
-    # branch. Real-ESRGAN continues to use RGB fp16/fp32 on the selected GPU.
-    mask_yuv444 = core.resize.Bilinear(
-        clip,
-        format=vs.YUV444PS,
-        range_in_s=INPUT_RANGE,
-        range_s="full",
-    )
-    mask_y = core.std.ShufflePlanes(mask_yuv444, 0, vs.GRAY)
-    flat_yuv444 = core.resize.Bicubic(
-        clip,
-        format=vs.YUV444P16,
-        range_in_s=INPUT_RANGE,
-        range_s="full",
-    )
     rgb = core.resize.Bicubic(
         clip,
         format=vs.RGBH if FP16 else vs.RGBS,
         matrix_in_s=MATRIX,
         range_in_s=INPUT_RANGE,
     )
+    denoised_rgb = run_dpir(rgb, dpir_backend)
 
-    line4 = run_model(rgb, REALESRGAN_MODEL, backend)
+    # Derive every downstream branch from the same DPIR output so the mask,
+    # Real-ESRGAN lines and NNEDI3 flat regions remain spatially consistent.
+    mask_yuv444 = core.resize.Bilinear(
+        denoised_rgb,
+        format=vs.YUV444PS,
+        matrix_s=MATRIX,
+        range_s="full",
+    )
+    mask_y = core.std.ShufflePlanes(mask_yuv444, 0, vs.GRAY)
+    flat_yuv444 = core.resize.Bicubic(
+        denoised_rgb,
+        format=vs.YUV444P16,
+        matrix_s=MATRIX,
+        range_s="full",
+    )
+
+    line4 = run_model(denoised_rgb, REALESRGAN_MODEL, upscale_backend)
     assert isinstance(line4, vs.VideoNode)
     # std.MaskedMerge does not accept half-float RGBH/GRAYH. Keep neural
     # inference in fp16, then convert only the final model outputs to fp32.
@@ -436,7 +487,7 @@ def process_device(clip: vs.VideoNode, device_id: int) -> vs.VideoNode:
     merged = core.std.MaskedMerge(flat_rgb_scaled, line_scaled, mask_scaled)
     print(
         f"[gpu] cuda:{device_id} resident filters ready: "
-        "RealESRGAN animevideov3 + NNEDI3 flat/chroma",
+        "DPIR drunet_color + RealESRGAN animevideov3 + NNEDI3 flat/chroma",
         file=sys.stderr,
         flush=True,
     )
