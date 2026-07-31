@@ -40,7 +40,7 @@ VSMLRT_SCRIPT_URL = (
     "1a14847b0652271d266efbfb691de15fb04bf988/scripts/vsmlrt.py"
 )
 VSMLRT_SCRIPT_SHA256 = "440703b8dc6ce265b3edcc4f1ac67cfc61d7ca128619e1c56eae3fd80af44dc1"
-PIPELINE_VERSION = "dpir-nnedi3-v1"
+PIPELINE_VERSION = "dpir-deband-v1"
 
 
 @dataclass(frozen=True)
@@ -555,6 +555,14 @@ def vspipe_arguments(
         "DPIR_STRENGTH": args.dpir_strength,
         "DPIR_TILE_SIZE": args.dpir_tile_size,
         "DPIR_OVERLAP": args.dpir_overlap,
+        "DEBAND_ENABLED": int(args.deband),
+        "DEBAND1_RADIUS": args.deband1_radius,
+        "DEBAND1_THRESHOLD": args.deband1_threshold,
+        "DEBAND2_RADIUS": args.deband2_radius,
+        "DEBAND2_THRESHOLD": args.deband2_threshold,
+        "GRAIN_LUMA": args.grain_luma,
+        "GRAIN_CHROMA": args.grain_chroma,
+        "GRAIN_SEED": args.grain_seed,
         "NNEDI3_NSIZE": args.nnedi3_nsize,
         "NNEDI3_NNS": args.nnedi3_nns,
         "NNEDI3_QUAL": args.nnedi3_qual,
@@ -973,6 +981,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--dpir-tile-size must be a multiple of 8")
     if args.dpir_tile_size and args.dpir_overlap * 2 >= args.dpir_tile_size:
         raise ValueError("--dpir-overlap must be smaller than half of --dpir-tile-size")
+    if args.deband1_radius <= 0 or args.deband2_radius <= 0:
+        raise ValueError("Deband radii must be positive")
+    if args.deband1_threshold < 0 or args.deband2_threshold < 0:
+        raise ValueError("Deband thresholds must be non-negative")
+    if args.grain_luma < 0 or args.grain_chroma < 0:
+        raise ValueError("Grain strengths must be non-negative")
+    if args.grain_seed < 0:
+        raise ValueError("--grain-seed must be non-negative")
     if args.input_width < 0 or args.input_height < 0:
         raise ValueError("Input width and height must be non-negative")
     if args.tile_size and args.overlap * 2 >= args.tile_size:
@@ -1082,6 +1098,8 @@ def process(args: argparse.Namespace) -> None:
         f"line=realesr-animevideov3, flat/chroma=NNEDI3, "
         f"nnedi3=nsize{args.nnedi3_nsize}/nns{args.nnedi3_nns}/"
         f"qual{args.nnedi3_qual}/pscrn{args.nnedi3_pscrn}, "
+        f"deband={'two-stage' if args.deband else 'off'}, "
+        f"grain={'dynamic-gaussian' if args.deband and (args.grain_luma or args.grain_chroma) else 'off'}, "
         f"scale={args.scale:g}, gpu_ids={args.gpu_ids}",
         flush=True,
     )
@@ -1214,7 +1232,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dpir-strength",
         type=float,
-        default=5.0,
+        default=1.2,
         help="DPIR color denoise sigma; 0 bypasses DPIR",
     )
     parser.add_argument(
@@ -1224,6 +1242,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="DPIR input tile size; use a multiple of 8, or 0 for full frame",
     )
     parser.add_argument("--dpir-overlap", type=int, default=16)
+    parser.add_argument(
+        "--deband",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply two-stage 16-bit debanding and dynamic Gaussian grain after upscaling",
+    )
+    parser.add_argument("--deband1-radius", type=int, default=24)
+    parser.add_argument("--deband1-threshold", type=float, default=64.0)
+    parser.add_argument("--deband2-radius", type=int, default=12)
+    parser.add_argument("--deband2-threshold", type=float, default=32.0)
+    parser.add_argument("--grain-luma", type=float, default=32.0)
+    parser.add_argument("--grain-chroma", type=float, default=16.0)
+    parser.add_argument("--grain-seed", type=int, default=333)
     parser.add_argument("--nnedi3-nsize", type=int, choices=(0, 4), default=0)
     parser.add_argument("--nnedi3-nns", type=int, choices=range(5), default=2)
     parser.add_argument("--nnedi3-qual", type=int, choices=(1, 2), default=2)

@@ -1,8 +1,10 @@
 # Masked VapourSynth pipeline dependencies.
+--extra-index-url https://jaded-encoding-thaumaturgy.github.io/vs-wheels/simple
 VapourSynth==77
 wrapt>=1.16,<3
 vapoursynth-ffms2>=2.40
 vapoursynth-znedi3==3.3
 vapoursynth-mlrt-ort-cuda==16.0
+vsjetpack==2.1.1
 onnx>=1.17,<2
 py7zr>=0.22,<2

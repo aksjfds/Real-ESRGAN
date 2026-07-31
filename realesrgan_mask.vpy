@@ -6,6 +6,8 @@ Line regions:
     realesr-animevideov3 (native 4x, resized to requested 2x/3x)
 Flat regions:
     NNEDI3 enlargement for luma and chroma
+After enlargement:
+    two-stage vszip debanding and dynamic Gaussian grain
 
 The script is intended to be launched by ``realesrgan_mask.py``.  All
 capitalised settings below can also be injected with ``vspipe --arg``.
@@ -71,9 +73,17 @@ WORKSPACE_GIB = setting_float("WORKSPACE_GIB", 4.0)
 USE_CUDA_GRAPH = setting_bool("USE_CUDA_GRAPH", True)
 CORE_THREADS = setting_int("CORE_THREADS", 2)
 CACHE_MIB = setting_int("CACHE_MIB", 2048)
-DPIR_STRENGTH = setting_float("DPIR_STRENGTH", 5.0)
+DPIR_STRENGTH = setting_float("DPIR_STRENGTH", 1.2)
 DPIR_TILE_SIZE = setting_int("DPIR_TILE_SIZE", 256)
 DPIR_OVERLAP = setting_int("DPIR_OVERLAP", 16)
+DEBAND_ENABLED = setting_bool("DEBAND_ENABLED", True)
+DEBAND1_RADIUS = setting_int("DEBAND1_RADIUS", 24)
+DEBAND1_THRESHOLD = setting_float("DEBAND1_THRESHOLD", 64.0)
+DEBAND2_RADIUS = setting_int("DEBAND2_RADIUS", 12)
+DEBAND2_THRESHOLD = setting_float("DEBAND2_THRESHOLD", 32.0)
+GRAIN_LUMA = setting_float("GRAIN_LUMA", 32.0)
+GRAIN_CHROMA = setting_float("GRAIN_CHROMA", 16.0)
+GRAIN_SEED = setting_int("GRAIN_SEED", 333)
 NNEDI3_NSIZE = setting_int("NNEDI3_NSIZE", 0)
 NNEDI3_NNS = setting_int("NNEDI3_NNS", 2)
 NNEDI3_QUAL = setting_int("NNEDI3_QUAL", 2)
@@ -135,6 +145,12 @@ def validate_settings() -> None:
         raise ValueError("DPIR_TILE_SIZE must be a multiple of 8")
     if DPIR_TILE_SIZE and DPIR_OVERLAP * 2 >= DPIR_TILE_SIZE:
         raise ValueError("DPIR_OVERLAP must be smaller than half of DPIR_TILE_SIZE")
+    if DEBAND1_RADIUS <= 0 or DEBAND2_RADIUS <= 0:
+        raise ValueError("DEBAND radii must be positive")
+    if DEBAND1_THRESHOLD < 0 or DEBAND2_THRESHOLD < 0:
+        raise ValueError("DEBAND thresholds must be non-negative")
+    if GRAIN_LUMA < 0 or GRAIN_CHROMA < 0 or GRAIN_SEED < 0:
+        raise ValueError("Grain strengths and seed must be non-negative")
     if NUM_STREAMS <= 0 or BATCH_SIZE <= 0:
         raise ValueError("NUM_STREAMS and BATCH_SIZE must be positive")
     if WORKSPACE_GIB <= 0 or CORE_THREADS <= 0 or CACHE_MIB <= 0:
@@ -167,6 +183,12 @@ def validate_settings() -> None:
 validate_settings()
 sys.path.insert(0, str(Path(VSMLRT_PATH).resolve().parent))
 import vsmlrt  # noqa: E402
+try:
+    from vsdeband import f3k_deband  # noqa: E402
+except ImportError as error:
+    raise RuntimeError(
+        "vsjetpack is required for two-stage debanding; install requirements_mask.txt"
+    ) from error
 
 core.num_threads = CORE_THREADS
 core.max_cache_size = CACHE_MIB
@@ -418,6 +440,43 @@ def nnedi3_scale(clip: vs.VideoNode, width: int, height: int) -> vs.VideoNode:
     return result
 
 
+def finish_deband_and_grain(clip: vs.VideoNode) -> vs.VideoNode:
+    """Deband twice in 16-bit 4:4:4, then add frame-varying Gaussian grain."""
+    if not DEBAND_ENABLED:
+        return clip
+
+    # Coarse pass: remove wider gradients without adding grain yet.
+    stage1 = f3k_deband(
+        clip,
+        radius=DEBAND1_RADIUS,
+        thr=[DEBAND1_THRESHOLD] * 3,
+        grain=0,
+        sample_mode=f3k_deband.SampleMode.SQUARE,
+        dynamic_grain=False,
+        blur_first=True,
+        seed=GRAIN_SEED + START_FRAME,
+        random=f3k_deband.RandomAlgo.UNIFORM,
+    )
+
+    # Fine pass: use row/column mean sampling and Gaussian dynamic grain.
+    # The START_FRAME offset prevents the second GPU chunk from repeating the
+    # exact same seeded noise sequence at the join.
+    return f3k_deband(
+        stage1,
+        radius=DEBAND2_RADIUS,
+        thr=[DEBAND2_THRESHOLD] * 3,
+        grain=[GRAIN_LUMA, GRAIN_CHROMA, GRAIN_CHROMA],
+        sample_mode=f3k_deband.SampleMode.COL_ROW_MEAN,
+        dynamic_grain=True,
+        blur_first=True,
+        seed=GRAIN_SEED + START_FRAME + 1,
+        random=(
+            f3k_deband.RandomAlgo.UNIFORM,
+            f3k_deband.RandomAlgo.GAUSSIAN(0.5),
+        ),
+    )
+
+
 def process_device(clip: vs.VideoNode, device_id: int) -> vs.VideoNode:
     # Separate backend objects keep both ONNX sessions resident on this GPU.
     # The graph dependency guarantees DPIR completes before either upscale path.
@@ -525,10 +584,19 @@ hybrid = process_device(source, GPU_IDS[0])
 if output_rate > source_rate:
     hybrid = change_fps(hybrid, output_rate)
 
-output = core.resize.Bicubic(
+post_yuv444 = core.resize.Bicubic(
     hybrid,
-    format=vs.YUV420P8,
+    format=vs.YUV444P16,
     matrix_s=MATRIX,
+    range_s="full",
+    dither_type="error_diffusion",
+)
+post_yuv444 = finish_deband_and_grain(post_yuv444)
+
+output = core.resize.Bicubic(
+    post_yuv444,
+    format=vs.YUV420P8,
+    range_in_s="full",
     range_s=OUTPUT_RANGE,
     dither_type="error_diffusion",
 )
