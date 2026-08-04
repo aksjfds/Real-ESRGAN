@@ -169,12 +169,21 @@ class FrameEnhancementPipeline:
         """
         if not frames:
             return []
-        if any(frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3 for frame in frames):
-            raise TypeError("Decoded inputs must be uint8 HWC RGB")
+        if any(frame.ndim != 3 or frame.shape[2] != 3 for frame in frames):
+            raise TypeError("Inputs must be HWC RGB")
+        if any(frame.dtype not in (np.uint8, np.float32) for frame in frames):
+            raise TypeError("Inputs must be uint8 RGB or float32 RGB in [0,1]")
+        if len({frame.dtype for frame in frames}) != 1:
+            raise TypeError("A worker batch cannot mix uint8 and float32 frames")
 
         rgb = np.stack(frames)
         tensor = torch.from_numpy(rgb).permute(0, 3, 1, 2).to(self.device, non_blocking=True)
-        tensor = tensor.float().div_(255.0)
+        if rgb.dtype == np.uint8:
+            tensor = tensor.float().div_(255.0)
+        else:
+            if not np.isfinite(rgb).all():
+                raise ValueError("Float input contains NaN or Inf")
+            tensor = tensor.float().clamp_(0.0, 1.0)
         original_height, original_width = tensor.shape[-2:]
 
         if self.config.pre_pad:

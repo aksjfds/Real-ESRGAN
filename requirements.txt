@@ -1,6 +1,7 @@
 # Fast video pipeline dependencies. Keep Kaggle's matched torch/torchvision CUDA build;
 # do not install the legacy
 # torch==2.1.0 pins from the upstream training requirements for this CLI.
+# BasicVSR++ uses the existing matched torchvision.ops.deform_conv2d build.
 basicsr==1.4.2
 tqdm>=4.66,<5
 pytest>=8,<10

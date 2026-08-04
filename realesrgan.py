@@ -45,6 +45,11 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover
 
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from enhance.analysis import SourceAnalyzer, run_getnative
+from enhance.basicvsrpp import (
+    BasicVSRPPConfig,
+    BasicVSRPPPreprocessor,
+    BasicVSRPPStreamReader,
+)
 from enhance.pipeline import DescaleBackend, FrameEnhancementPipeline, PipelineConfig
 from enhance.srvgg_enhanced import EnhancedSRVGGNetCompact, assert_no_extra_state
 from enhance.tiles import (
@@ -1068,49 +1073,17 @@ def parse_gpu_ids(value: str) -> List[Optional[int]]:
     return ids
 
 
-def apply_quality_preset(args: argparse.Namespace, argv: Sequence[str]) -> None:
-    """Apply preset defaults without overriding explicitly supplied CLI options."""
+def apply_legacy_args(args: argparse.Namespace, argv: Sequence[str]) -> None:
+    """Map the removed overlap option without changing enhancement defaults."""
     explicit = {item.split("=", 1)[0] for item in argv if item.startswith("--")}
-    presets: Dict[str, Dict[str, object]] = {
-        "baseline": {
-            "tta": "none",
-            "shift_ensemble": "none",
-            "residual_mode": "official",
-            "base_correction": 0.0,
-            "back_projection_iterations": 0,
-            "dehalo_strength": 0.0,
-            "range_limit": 0.0,
-        },
-        "safe": {
-            "tta": "x8",
-            "shift_ensemble": "none",
-            "residual_mode": "official",
-            "base_correction": 0.0,
-            "back_projection_iterations": 1,
-            "dehalo_strength": 0.0,
-            "range_limit": 0.1,
-        },
-    }
-    option_names = {
-        "tta": "--tta",
-        "shift_ensemble": "--shift-ensemble",
-        "residual_mode": "--residual-mode",
-        "base_correction": "--base-correction",
-        "back_projection_iterations": "--back-projection-iterations",
-        "dehalo_strength": "--dehalo-strength",
-        "range_limit": "--range-limit",
-    }
-    for name, value in presets[args.quality_preset].items():
-        positive = option_names[name]
-        negative = "--no-" + positive[2:] if isinstance(value, bool) else ""
-        if positive not in explicit and negative not in explicit:
-            setattr(args, name, value)
     if args.overlap is not None:
         if "--tile-pad" in explicit:
             raise ValueError("--overlap and --tile-pad cannot be supplied together")
         args.tile_pad = args.overlap
-        print("[deprecated] --overlap now maps to --tile-pad; no feather blending is performed", flush=True)
-
+        print(
+            "[deprecated] --overlap now maps to --tile-pad; no feather blending is performed",
+            flush=True,
+        )
 
 def anime4k_filters(args: argparse.Namespace) -> list[str]:
     if not args.anime4k:
@@ -1194,6 +1167,37 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Dehalo/range strengths must be non-negative")
     if args.overshoot < 0 or args.undershoot < 0:
         raise ValueError("--overshoot and --undershoot must be non-negative")
+    if args.basicvsrpp:
+        if not torch.cuda.is_available():
+            raise RuntimeError("--basicvsrpp requires CUDA")
+        if args.basicvsrpp_gpu < 0 or args.basicvsrpp_gpu >= torch.cuda.device_count():
+            raise ValueError(
+                f"--basicvsrpp-gpu {args.basicvsrpp_gpu} is invalid; "
+                f"{torch.cuda.device_count()} CUDA device(s) are visible"
+            )
+        if args.basicvsrpp_clip_length < 2:
+            raise ValueError("--basicvsrpp-clip-length must be at least 2")
+        if not 0 <= args.basicvsrpp_clip_overlap < args.basicvsrpp_clip_length / 2:
+            raise ValueError(
+                "--basicvsrpp-clip-overlap must satisfy 0 <= overlap < clip_length/2"
+            )
+        if args.basicvsrpp_tile_size != 0 and (
+            args.basicvsrpp_tile_size < 256 or args.basicvsrpp_tile_size % 4
+        ):
+            raise ValueError(
+                "--basicvsrpp-tile-size must be 0 or at least 256 and divisible by 4"
+            )
+        if args.basicvsrpp_tile_pad < 0 or args.basicvsrpp_tile_pad % 4:
+            raise ValueError("--basicvsrpp-tile-pad must be non-negative and divisible by 4")
+        if (
+            args.basicvsrpp_tile_size
+            and args.basicvsrpp_tile_pad >= args.basicvsrpp_tile_size // 2
+        ):
+            raise ValueError("--basicvsrpp-tile-pad must be less than half of tile size")
+        if not 0.0 <= args.basicvsrpp_strength <= 1.0:
+            raise ValueError("--basicvsrpp-strength must be in [0,1]")
+        if args.basicvsrpp_scene_threshold < 0:
+            raise ValueError("--basicvsrpp-scene-threshold must be non-negative")
 
 
 def log_devices(gpu_ids: Sequence[Optional[int]], fp16: bool) -> None:
@@ -1227,9 +1231,17 @@ def finalize_output_frame(
     timings["dehalo"] += time.monotonic() - stage_started
 
     stage_started = time.monotonic()
+    if reference_frame.dtype == np.uint8:
+        reference_float = reference_frame.astype(np.float32) / 255.0
+    elif reference_frame.dtype == np.float32:
+        if not np.isfinite(reference_frame).all():
+            raise ValueError("Reference frame contains NaN or Inf")
+        reference_float = np.clip(reference_frame, 0.0, 1.0)
+    else:
+        raise TypeError(f"Unsupported reference frame dtype: {reference_frame.dtype}")
     output = full_frame_range_limit(
         output,
-        reference_frame.astype(np.float32) / 255.0,
+        reference_float,
         args.range_limit,
         args.range_radius,
         args.overshoot,
@@ -1461,6 +1473,17 @@ def process_video(args: argparse.Namespace) -> None:
         f"transfer={color_spec.transfer}, chroma={color_spec.chroma_location or 'unspecified'}",
         flush=True,
     )
+    if args.basicvsrpp:
+        print(
+            f"[basicvsrpp] enabled, track={args.basicvsrpp_track}, gpu=cuda:{args.basicvsrpp_gpu}, "
+            f"fp16={args.basicvsrpp_fp16}, clip={args.basicvsrpp_clip_length}, "
+            f"overlap={args.basicvsrpp_clip_overlap}, tile={args.basicvsrpp_tile_size}, "
+            f"tile_pad={args.basicvsrpp_tile_pad}, strength={args.basicvsrpp_strength:g}, "
+            f"scene_threshold={args.basicvsrpp_scene_threshold:g}",
+            flush=True,
+        )
+    else:
+        print("[basicvsrpp] disabled", flush=True)
     if tta_count * shift_count > 8:
         print("[warning] ensemble requires many model calls and has high runtime/VRAM pressure", flush=True)
     if args.tile_size == 0:
@@ -1484,16 +1507,19 @@ def process_video(args: argparse.Namespace) -> None:
         )
     log_devices(gpu_ids, effective_fp16)
 
-    reader: Optional[RawVideoReader] = None
+    reader: Optional[object] = None
+    basicvsrpp_reader: Optional[BasicVSRPPStreamReader] = None
     writer: Optional[RawVideoWriter] = None
     workers: Optional[PersistentWorkers] = None
     processed = 0
     started = time.monotonic()
     timings = {
         "model_startup": 0.0,
+        "basicvsrpp_startup": 0.0,
         "native_analysis": native_analysis_elapsed,
         "descale": 0.0,
         "decode": 0.0,
+        "basicvsrpp": 0.0,
         "inference": 0.0,
         "tta": 0.0,
         "shift_ensemble": 0.0,
@@ -1537,6 +1563,26 @@ def process_video(args: argparse.Namespace) -> None:
                 start,
                 duration,
             )
+        if args.basicvsrpp:
+            stage_started = time.monotonic()
+            preprocessor = BasicVSRPPPreprocessor(
+                BasicVSRPPConfig(
+                    track=args.basicvsrpp_track,
+                    model_path=args.basicvsrpp_model_path,
+                    gpu_id=args.basicvsrpp_gpu,
+                    fp16=args.basicvsrpp_fp16,
+                    clip_length=args.basicvsrpp_clip_length,
+                    clip_overlap=args.basicvsrpp_clip_overlap,
+                    tile_size=args.basicvsrpp_tile_size,
+                    tile_pad=args.basicvsrpp_tile_pad,
+                    strength=args.basicvsrpp_strength,
+                    scene_threshold=args.basicvsrpp_scene_threshold,
+                ),
+                checkpoint_dir=Path(__file__).resolve().parent / "weights",
+            )
+            basicvsrpp_reader = BasicVSRPPStreamReader(reader, preprocessor)
+            reader = basicvsrpp_reader
+            timings["basicvsrpp_startup"] += time.monotonic() - stage_started
         writer = RawVideoWriter(
             temporary_video,
             args.ffmpeg_bin,
@@ -1574,7 +1620,9 @@ def process_video(args: argparse.Namespace) -> None:
                             if frame is None:
                                 break
                             indexed_frames.append((processed + len(indexed_frames), frame))
-                        timings["descale" if args.descale else "decode"] += time.monotonic() - stage_started
+                        read_elapsed = time.monotonic() - stage_started
+                        if basicvsrpp_reader is None:
+                            timings["descale" if args.descale else "decode"] += read_elapsed
                         if not indexed_frames:
                             break
                         stage_started = time.monotonic()
@@ -1601,7 +1649,9 @@ def process_video(args: argparse.Namespace) -> None:
                     while True:
                         stage_started = time.monotonic()
                         frame = reader.read()
-                        timings["descale" if args.descale else "decode"] += time.monotonic() - stage_started
+                        read_elapsed = time.monotonic() - stage_started
+                        if basicvsrpp_reader is None:
+                            timings["descale" if args.descale else "decode"] += read_elapsed
                         if frame is None:
                             break
                         patches, tile_infos = tile_processor.split(frame)
@@ -1632,8 +1682,18 @@ def process_video(args: argparse.Namespace) -> None:
                         progress.set_postfix(fps=f"{processed / elapsed:.3f}", refresh=False)
         finally:
             progress.close()
+        if basicvsrpp_reader is not None:
+            timings["descale" if args.descale else "decode"] += basicvsrpp_reader.decode_elapsed
+            timings["basicvsrpp"] += basicvsrpp_reader.preprocessor.elapsed
+            print(
+                f"[basicvsrpp] clips={basicvsrpp_reader.preprocessor.clips}, "
+                f"tiles={basicvsrpp_reader.preprocessor.tiles}, "
+                f"scene_cuts={basicvsrpp_reader.scene_cuts}",
+                flush=True,
+            )
         reader.close()
         reader = None
+        basicvsrpp_reader = None
         stage_started = time.monotonic()
         writer.close()
         timings["encode_flush"] += time.monotonic() - stage_started
@@ -1707,11 +1767,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--denoise-strength", type=float, default=1.0, help="DNI strength for general-x4v3")
     parser.add_argument("--scale", type=float, default=2.0, help="Final output scale")
     parser.add_argument(
-        "--quality-preset",
-        choices=("baseline", "safe"),
-        default="safe",
-    )
-    parser.add_argument(
         "--fps",
         default="source",
         help="Output FPS: source/auto/0, a number such as 23 or 60, or 24000/1001",
@@ -1745,7 +1800,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--descale", action=argparse.BooleanOptionalAction, default=False)
 
-    parser.add_argument("--tta", choices=("none", "x8"), default="x8")
+    parser.add_argument(
+        "--basicvsrpp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Apply BasicVSR++ NTIRE compressed-video enhancement before Real-ESRGAN",
+    )
+    parser.add_argument(
+        "--basicvsrpp-track",
+        type=int,
+        choices=(1, 2, 3),
+        default=1,
+        help="NTIRE 2021 compressed-video checkpoint; track 1 is fidelity-oriented",
+    )
+    parser.add_argument("--basicvsrpp-model-path", default="", help="Optional local BasicVSR++ checkpoint")
+    parser.add_argument("--basicvsrpp-gpu", type=int, default=0)
+    parser.add_argument("--basicvsrpp-fp16", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--basicvsrpp-clip-length", type=int, default=7)
+    parser.add_argument("--basicvsrpp-clip-overlap", type=int, default=2)
+    parser.add_argument(
+        "--basicvsrpp-tile-size",
+        type=int,
+        default=256,
+        help="0 processes a full frame; 256 is the safer T4 default",
+    )
+    parser.add_argument("--basicvsrpp-tile-pad", type=int, default=32)
+    parser.add_argument("--basicvsrpp-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--basicvsrpp-scene-threshold",
+        type=float,
+        default=0.30,
+        help="Reset temporal clips at scene cuts; 0 disables cut detection",
+    )
+
+    parser.add_argument("--tta", choices=("none", "x8"), default="none")
     parser.add_argument("--tta-batch-size", type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument("--shift-ensemble", choices=("none", "x2", "x4"), default="none")
     parser.add_argument("--residual-mode", choices=("official", "global", "adaptive"), default="official")
@@ -1756,7 +1844,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--residual-edge-high", type=float, default=0.20)
     parser.add_argument("--base-correction", type=float, default=0.0)
 
-    parser.add_argument("--back-projection-iterations", type=int, default=1)
+    parser.add_argument("--back-projection-iterations", type=int, default=0)
     parser.add_argument("--back-projection-strength", type=float, default=0.2)
     parser.add_argument(
         "--back-projection-kernel", choices=("area", "bicubic", "lanczos"), default="lanczos"
@@ -1764,7 +1852,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--back-projection-clamp", type=float, default=0.05)
     parser.add_argument("--dehalo-strength", type=float, default=0.0)
     parser.add_argument("--dehalo-radius", type=int, default=2)
-    parser.add_argument("--range-limit", type=float, default=0.1)
+    parser.add_argument("--range-limit", type=float, default=0.0)
     parser.add_argument("--range-radius", type=int, default=2)
     parser.add_argument("--overshoot", type=float, default=1.0)
     parser.add_argument("--undershoot", type=float, default=1.0)
@@ -1816,7 +1904,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    apply_quality_preset(args, sys.argv[1:])
+    apply_legacy_args(args, sys.argv[1:])
     validate_args(args)
     process_video(args)
 
