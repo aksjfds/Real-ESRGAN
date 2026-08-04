@@ -1,6 +1,15 @@
 """Composable enhancement stages for the Real-ESRGAN video runner."""
 
-from .basicvsrpp import (
+import sys
+
+from . import basicvsrpp_quality as _basicvsrpp_quality
+
+# Keep the public BasicVSR++ import path stable while routing runtime
+# composition through the quality wrapper. The wrapper keeps the original
+# network/checkpoint implementation and only changes frame composition.
+sys.modules[f"{__name__}.basicvsrpp"] = _basicvsrpp_quality
+
+from .basicvsrpp_quality import (
     BASICVSRPP_TRACK_URLS,
     BasicVSRPPConfig,
     BasicVSRPPPreprocessor,
