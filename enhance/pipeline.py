@@ -1,7 +1,14 @@
-"""Resident, modular frame enhancement pipeline.
+"""Resident Real-ESRGAN frame enhancement pipeline.
 
-Internal contract: NCHW RGB tensors in [0, 1]. Model inference may use FP16;
-all accumulation, fusion, refinement and final resizing use FP32.
+Internal contract:
+- decoded input: uint8 HWC RGB
+- model input: NCHW RGB in [0, 1]
+- model convolutions may use FP16
+- ensemble accumulation, branch recombination and back projection use FP32
+- worker output: model-native-scale float32 HWC RGB in [0, 1]
+
+Final Lanczos resizing, dehalo and range limiting are intentionally performed in
+one shared parent-side path for both full-frame and tiled inference.
 """
 
 from __future__ import annotations
@@ -14,13 +21,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from .ops import (
-    BackProjectionRefiner,
-    EnsembleEngine,
-    adaptive_dehalo,
-    lanczos_resize,
-    soft_range_compress,
-)
+from .ops import BackProjectionRefiner, EnsembleEngine, lanczos_resize
 from .srvgg_enhanced import EnhancedSRVGGNetCompact, adaptive_residual_strength
 
 
@@ -41,18 +42,9 @@ class PipelineConfig:
     back_projection_kernel: str = "lanczos"
     back_projection_clamp: float = 0.05
     native_scale: int = 4
-    final_scale: float = 2.0
-    tile_size: int = 0
-    tile_pad: int = 10
     pre_pad: int = 0
     fp16: bool = True
     channels_last: bool = True
-    dehalo_strength: float = 0.0
-    dehalo_radius: int = 2
-    range_limit: float = 0.0
-    range_radius: int = 2
-    overshoot: float = 1.0
-    undershoot: float = 1.0
 
 
 class StageTimings:
@@ -66,9 +58,6 @@ class StageTimings:
                 "residual_control",
                 "base_correction",
                 "back_projection",
-                "lanczos",
-                "dehalo",
-                "range_limit",
             )
         }
 
@@ -106,6 +95,7 @@ class RealESRGANBackend:
             started = time.monotonic()
             components = self.model.forward_components(x)
             self.timings.add("realesrgan", started)
+
             started = time.monotonic()
             if self.config.residual_mode == "official":
                 strength: float | torch.Tensor = 1.0
@@ -122,11 +112,10 @@ class RealESRGANBackend:
                 )
             else:
                 raise ValueError(f"Unknown residual mode: {self.config.residual_mode}")
-            # Convolutions may run in FP16, but all branch recombination and
-            # adaptive strength arithmetic is intentionally FP32.
+
             output = components.nearest_base.float() + components.residual.float() * strength
             self.timings.add("residual_control", started)
-            lanczos_base = None
+
             if self.config.base_correction:
                 started = time.monotonic()
                 lanczos_base = lanczos_resize(
@@ -138,6 +127,7 @@ class RealESRGANBackend:
                 )
                 self.timings.add("base_correction", started)
             return output
+
         if self.config.residual_mode != "official" or self.config.base_correction:
             raise ValueError("Residual/base controls are only compatible with SRVGG models")
         started = time.monotonic()
@@ -169,17 +159,32 @@ class FrameEnhancementPipeline:
         return self.realesrgan(x)
 
     def enhance_batch(self, frames: Sequence[np.ndarray]) -> list[np.ndarray]:
+        """Return model-native-scale outputs.
+
+        ``pre_pad`` follows the official Real-ESRGAN convention: reflect-pad only
+        the right and bottom edges, run the model, then crop the native-scale
+        result before any arbitrary-scale resampling.  This avoids the sampling
+        phase shift that occurs when a padded image is resized first and cropped
+        afterwards at a non-integer final scale.
+        """
         if not frames:
             return []
         if any(frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3 for frame in frames):
             raise TypeError("Decoded inputs must be uint8 HWC RGB")
+
         rgb = np.stack(frames)
         tensor = torch.from_numpy(rgb).permute(0, 3, 1, 2).to(self.device, non_blocking=True)
         tensor = tensor.float().div_(255.0)
         original_height, original_width = tensor.shape[-2:]
+
         if self.config.pre_pad:
-            pad_mode = "reflect" if min(original_height, original_width) > self.config.pre_pad else "replicate"
-            tensor = F.pad(tensor, (self.config.pre_pad,) * 4, mode=pad_mode)
+            pad_mode = (
+                "reflect"
+                if original_height > self.config.pre_pad and original_width > self.config.pre_pad
+                else "replicate"
+            )
+            tensor = F.pad(tensor, (0, self.config.pre_pad, 0, self.config.pre_pad), mode=pad_mode)
+
         model_input = tensor
         inference_input = tensor
         if self.config.fp16 and self.device.type == "cuda":
@@ -200,36 +205,12 @@ class FrameEnhancementPipeline:
         refined = self.back_projection(native, model_input.float())
         self.timings.add("back_projection", started)
 
-        target_size = (
-            round(model_input.shape[-2] * self.config.final_scale),
-            round(model_input.shape[-1] * self.config.final_scale),
-        )
-        started = time.monotonic()
-        final = refined if self.config.final_scale == self.config.native_scale else lanczos_resize(refined, target_size)
-        self.timings.add("lanczos", started)
-
-        started = time.monotonic()
-        final = adaptive_dehalo(final, self.config.dehalo_strength, self.config.dehalo_radius)
-        self.timings.add("dehalo", started)
-        started = time.monotonic()
-        if self.config.range_limit > 0:
-            reference = lanczos_resize(model_input.float(), target_size)
-            final = soft_range_compress(
-                final,
-                reference,
-                self.config.range_limit,
-                self.config.range_radius,
-                self.config.overshoot,
-                self.config.undershoot,
-            )
-        self.timings.add("range_limit", started)
         if self.config.pre_pad:
-            x0 = round(self.config.pre_pad * self.config.final_scale)
-            y0 = round(self.config.pre_pad * self.config.final_scale)
-            x1 = x0 + round(original_width * self.config.final_scale)
-            y1 = y0 + round(original_height * self.config.final_scale)
-            final = final[:, :, y0:y1, x0:x1]
-        final = final.clamp(0, 1).permute(0, 2, 3, 1).contiguous().cpu().numpy().astype(np.float32)
+            native_height = original_height * self.config.native_scale
+            native_width = original_width * self.config.native_scale
+            refined = refined[:, :, :native_height, :native_width]
+
+        final = refined.clamp(0, 1).permute(0, 2, 3, 1).contiguous().cpu().numpy().astype(np.float32)
         return list(final)
 
     def timing_snapshot(self) -> dict[str, float]:

@@ -88,10 +88,107 @@ class VideoInfo:
     duration: float
     frames: Optional[int]
     has_audio: bool
+    color_range: Optional[str]
+    color_space: Optional[str]
+    color_primaries: Optional[str]
+    color_transfer: Optional[str]
+    chroma_location: Optional[str]
 
     @property
     def fps(self) -> float:
         return self.fps_num / self.fps_den
+
+
+@dataclass(frozen=True)
+class ColorSpec:
+    range: str
+    space: str
+    primaries: str
+    transfer: str
+    chroma_location: Optional[str]
+    inferred: bool = False
+
+    @property
+    def scale_matrix(self) -> str:
+        if self.space in {"smpte170m", "bt470bg"}:
+            return "bt601"
+        if self.space in {"bt2020nc", "bt2020c"}:
+            return "bt2020"
+        if self.space == "smpte240m":
+            return "smpte240m"
+        return "bt709"
+
+    @property
+    def is_hdr(self) -> bool:
+        return self.transfer in {"smpte2084", "arib-std-b67"} or self.primaries == "bt2020"
+
+
+def _known_color(value: object) -> Optional[str]:
+    text = str(value or "").strip().lower()
+    return None if text in {"", "unknown", "unspecified", "reserved", "n/a", "none"} else text
+
+
+def resolve_color_spec(info: VideoInfo, policy: str, hdr_policy: str) -> ColorSpec:
+    if policy == "bt709":
+        spec = ColorSpec("tv", "bt709", "bt709", "bt709", "left", inferred=True)
+    else:
+        space = _known_color(info.color_space)
+        primaries = _known_color(info.color_primaries)
+        transfer = _known_color(info.color_transfer)
+        range_value = _known_color(info.color_range)
+        inferred = not all((space, primaries, transfer, range_value))
+        if space is None or space == "gbr":
+            space = "bt709" if info.height >= 720 else "smpte170m"
+        if primaries is None:
+            primaries = "bt2020" if space.startswith("bt2020") else ("bt709" if info.height >= 720 else "smpte170m")
+        if transfer is None:
+            transfer = "bt709" if info.height >= 720 else "smpte170m"
+        if range_value in {"pc", "jpeg", "full"}:
+            range_value = "pc"
+        else:
+            range_value = "tv"
+        chroma = _known_color(info.chroma_location)
+        spec = ColorSpec(range_value, space, primaries, transfer, chroma, inferred=inferred)
+    if spec.is_hdr and hdr_policy == "reject":
+        raise ValueError(
+            "HDR/BT.2020 input was detected. This Real-ESRGAN pipeline processes nonlinear RGB code values "
+            "and is not HDR-aware. Use --hdr-policy passthrough only if that limitation is intentional."
+        )
+    if spec.is_hdr:
+        print("[warning] HDR metadata is being passed through; the model itself is not HDR-linear", flush=True)
+    return spec
+
+
+def color_filter_chain(spec: ColorSpec, output_pix_fmt: str, anime_filters: Sequence[str]) -> list[str]:
+    filters = [
+        f"setparams=range=pc:color_primaries={spec.primaries}:color_trc={spec.transfer}:colorspace=gbr",
+        f"scale=in_range=pc:out_range={spec.range}:out_color_matrix={spec.scale_matrix}",
+    ]
+    if anime_filters:
+        filters.append("format=yuv444p16le")
+        filters.extend(anime_filters)
+        filters.append("format=yuv444p16le")
+    filters.extend(
+        [
+            f"format={output_pix_fmt}",
+            f"setparams=range={spec.range}:color_primaries={spec.primaries}:"
+            f"color_trc={spec.transfer}:colorspace={spec.space}",
+        ]
+    )
+    return filters
+
+
+def color_output_args(spec: ColorSpec) -> list[str]:
+    args = [
+        "-color_range", spec.range,
+        "-colorspace", spec.space,
+        "-color_primaries", spec.primaries,
+        "-color_trc", spec.transfer,
+    ]
+    if spec.chroma_location:
+        args += ["-chroma_sample_location", spec.chroma_location]
+    return args
+
 
 @dataclass(frozen=True)
 class WorkerConfig:
@@ -113,19 +210,10 @@ class WorkerConfig:
     back_projection_kernel: str
     back_projection_clamp: float
     native_scale: int
-    final_scale: float
-    tile_size: int
-    tile_pad: int
     pre_pad: int
     batch_size: int
     fp16: bool
     channels_last: bool
-    dehalo_strength: float
-    dehalo_radius: int
-    range_limit: float
-    range_radius: int
-    overshoot: float
-    undershoot: float
 
 
 def now_text() -> str:
@@ -203,35 +291,28 @@ def probe_encoder_runtime(
     width: int,
     height: int,
     encode_gpu: int,
-    video_filters: Sequence[str] = (),
+    video_filters: Sequence[str],
+    color_spec: ColorSpec,
+    anime4k_enabled: bool,
 ) -> None:
-    """Open the complete filter/encoder graph at the real output size."""
-    command = [
-        ffmpeg_bin,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-    ]
-    if video_filters:
+    """Open the same RGB48/filter/encoder graph used by the real writer."""
+    command = [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
+    if anime4k_enabled:
         command += ["-init_hw_device", "vulkan=anime4k", "-filter_hw_device", "anime4k"]
     command += [
-        "-f",
-        "lavfi",
-        "-i",
-        f"color=black:size={width}x{height}:rate=1",
-        "-frames:v",
-        "1",
-        "-c:v",
-        codec,
+        "-f", "lavfi",
+        "-i", f"color=black:size={width}x{height}:rate=1,format=rgb48le",
+        "-frames:v", "1",
     ]
     if video_filters:
         command += ["-vf", ",".join(video_filters)]
+    command += ["-c:v", codec]
     if codec in {"h264_nvenc", "hevc_nvenc"}:
         command += ["-gpu", str(encode_gpu)]
-    command += ["-pix_fmt", pixel_format, "-f", "null", "-"]
-    run_checked(command, f"{codec} runtime probe at {width}x{height}/{pixel_format}")
-    print(f"[encoder] runtime OK: {codec}, {width}x{height}, {pixel_format}", flush=True)
-    if video_filters:
+    command += ["-pix_fmt", pixel_format, *color_output_args(color_spec), "-f", "null", "-"]
+    run_checked(command, f"{codec} RGB48 runtime probe at {width}x{height}/{pixel_format}")
+    print(f"[encoder] runtime OK: {codec}, RGB48 -> {width}x{height}/{pixel_format}", flush=True)
+    if anime4k_enabled:
         print("[anime4k] complete single-frame filter graph runtime OK", flush=True)
 
 
@@ -294,6 +375,11 @@ def probe_video(path: Path, ffprobe_bin: str) -> VideoInfo:
         duration=float(duration_value),
         frames=frames,
         has_audio=any(item.get("codec_type") == "audio" for item in data.get("streams", [])),
+        color_range=_known_color(stream.get("color_range")),
+        color_space=_known_color(stream.get("color_space")),
+        color_primaries=_known_color(stream.get("color_primaries")),
+        color_transfer=_known_color(stream.get("color_transfer")),
+        chroma_location=_known_color(stream.get("chroma_location")),
     )
 
 
@@ -460,18 +546,9 @@ def worker_main(
                 back_projection_kernel=config.back_projection_kernel,
                 back_projection_clamp=config.back_projection_clamp,
                 native_scale=native_scale,
-                final_scale=config.final_scale,
-                tile_size=config.tile_size,
-                tile_pad=config.tile_pad,
                 pre_pad=config.pre_pad,
                 fp16=config.fp16,
                 channels_last=config.channels_last,
-                dehalo_strength=config.dehalo_strength,
-                dehalo_radius=config.dehalo_radius,
-                range_limit=config.range_limit,
-                range_radius=config.range_radius,
-                overshoot=config.overshoot,
-                undershoot=config.undershoot,
             ),
         )
         output_queue.put(("ready", worker_id, str(device)))
@@ -775,7 +852,9 @@ class RawVideoWriter:
         nvenc_preset: str,
         encode_gpu: int,
         output_pix_fmt: str,
-        video_filters: Sequence[str] = (),
+        video_filters: Sequence[str],
+        color_spec: ColorSpec,
+        anime4k_enabled: bool,
     ) -> None:
         command = [
             ffmpeg_bin,
@@ -784,7 +863,7 @@ class RawVideoWriter:
             "-loglevel",
             "error",
         ]
-        if video_filters:
+        if anime4k_enabled:
             command += ["-init_hw_device", "vulkan=anime4k", "-filter_hw_device", "anime4k"]
         command += [
             "-f",
@@ -836,7 +915,7 @@ class RawVideoWriter:
                 "-bf",
                 "3",
             ]
-        command += ["-pix_fmt", output_pix_fmt]
+        command += ["-pix_fmt", output_pix_fmt, *color_output_args(color_spec)]
         if codec in {"libx265", "hevc_nvenc"}:
             command += ["-tag:v", "hvc1"]
         command.append(str(path))
@@ -1047,14 +1126,14 @@ def anime4k_filters(args: argparse.Namespace) -> list[str]:
             "Anime4K requires explicit --anime4k-shaders filenames; preset names are not emulated"
         )
     root = Path(args.anime4k_shader_dir).expanduser().resolve()
-    filters = ["format=yuv444p16le", "hwupload"]
+    filters = ["hwupload"]
     for name in (item.strip() for item in args.anime4k_shaders.split(",") if item.strip()):
         shader = (root / name).resolve()
         if root not in shader.parents or not shader.is_file():
             raise FileNotFoundError(f"Anime4K shader not found below shader directory: {shader}")
         shader_path = str(shader).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
         filters.append(f"libplacebo=custom_shader_path='{shader_path}'")
-    filters += ["hwdownload", "format=yuv444p16le"]
+    filters.append("hwdownload")
     return filters
 
 
@@ -1130,12 +1209,42 @@ def log_devices(gpu_ids: Sequence[Optional[int]], fp16: bool) -> None:
             )
 
 
+def finalize_output_frame(
+    native_output: np.ndarray,
+    reference_frame: np.ndarray,
+    output_width: int,
+    output_height: int,
+    args: argparse.Namespace,
+    timings: Dict[str, float],
+) -> np.ndarray:
+    """Apply one identical parent-side finalization path to every frame."""
+    stage_started = time.monotonic()
+    output = full_frame_lanczos(native_output, output_width, output_height)
+    timings["lanczos"] += time.monotonic() - stage_started
+
+    stage_started = time.monotonic()
+    output = full_frame_dehalo(output, args.dehalo_strength, args.dehalo_radius)
+    timings["dehalo"] += time.monotonic() - stage_started
+
+    stage_started = time.monotonic()
+    output = full_frame_range_limit(
+        output,
+        reference_frame.astype(np.float32) / 255.0,
+        args.range_limit,
+        args.range_radius,
+        args.overshoot,
+        args.undershoot,
+    )
+    timings["range_limit"] += time.monotonic() - stage_started
+    return np.ascontiguousarray(np.clip(output, 0.0, 1.0), dtype=np.float32)
+
+
 def process_video(args: argparse.Namespace) -> None:
     require_binary(args.ffmpeg_bin)
     require_binary(args.ffprobe_bin)
     require_encoder(args.ffmpeg_bin, args.video_codec)
     output_pix_fmt = resolve_output_pix_fmt(args.ffmpeg_bin, args.video_codec, args.output_pix_fmt)
-    writer_filters = anime4k_filters(args)
+    anime_filters = anime4k_filters(args)
     input_path = Path(args.input).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
     if not input_path.is_file():
@@ -1146,6 +1255,8 @@ def process_video(args: argparse.Namespace) -> None:
     temporary_video = output_path.with_name(output_path.stem + ".video_only.tmp.mp4")
 
     info = probe_video(input_path, args.ffprobe_bin)
+    color_spec = resolve_color_spec(info, args.color_policy, args.hdr_policy)
+    writer_filters = color_filter_chain(color_spec, output_pix_fmt, anime_filters)
     source_rate = Fraction(info.fps_num, info.fps_den)
     output_rate = parse_output_rate(args.fps, source_rate)
     inference_rate = min(source_rate, output_rate)
@@ -1272,6 +1383,8 @@ def process_video(args: argparse.Namespace) -> None:
         output_height,
         args.encode_gpu,
         writer_filters,
+        color_spec,
+        args.anime4k,
     )
 
     # Download/resolve the main checkpoint only after all inexpensive source,
@@ -1297,21 +1410,13 @@ def process_video(args: argparse.Namespace) -> None:
         back_projection_kernel=args.back_projection_kernel,
         back_projection_clamp=args.back_projection_clamp,
         native_scale=native_model_scale,
-        # Tile workers always return their native model scale.  The parent
-        # stitches that complete 4× frame before one global Lanczos resize.
-        final_scale=native_model_scale if args.tile_size else args.scale,
-        tile_size=args.tile_size,
-        tile_pad=args.tile_pad,
+        # Every worker returns the complete model-native-scale result.  The
+        # parent applies one shared final Lanczos/dehalo/range path for both
+        # full-frame and tiled inference.
         pre_pad=0 if args.tile_size else args.pre_pad,
         batch_size=args.batch_size,
         fp16=effective_fp16,
         channels_last=effective_channels_last,
-        dehalo_strength=0.0 if args.tile_size else args.dehalo_strength,
-        dehalo_radius=args.dehalo_radius,
-        range_limit=0.0 if args.tile_size else args.range_limit,
-        range_radius=args.range_radius,
-        overshoot=args.overshoot,
-        undershoot=args.undershoot,
     )
     tile_processor = TileProcessor(
         args.tile_size,
@@ -1350,6 +1455,12 @@ def process_video(args: argparse.Namespace) -> None:
         f"anime4k_shaders={args.anime4k_shaders or 'none'}",
         flush=True,
     )
+    print(
+        f"[color] policy={args.color_policy}, inferred={color_spec.inferred}, "
+        f"range={color_spec.range}, space={color_spec.space}, primaries={color_spec.primaries}, "
+        f"transfer={color_spec.transfer}, chroma={color_spec.chroma_location or 'unspecified'}",
+        flush=True,
+    )
     if tta_count * shift_count > 8:
         print("[warning] ensemble requires many model calls and has high runtime/VRAM pressure", flush=True)
     if args.tile_size == 0:
@@ -1360,8 +1471,8 @@ def process_video(args: argparse.Namespace) -> None:
         )
     else:
         stride = args.tile_size
-        tile_count = len(axis_starts(input_width + 2 * args.pre_pad, args.tile_size)) * len(
-            axis_starts(input_height + 2 * args.pre_pad, args.tile_size)
+        tile_count = len(axis_starts(input_width + args.pre_pad, args.tile_size)) * len(
+            axis_starts(input_height + args.pre_pad, args.tile_size)
         )
         print(
             f"[tiles] size={args.tile_size}, tile_pad={args.tile_pad}, pre_pad={args.pre_pad}, "
@@ -1441,6 +1552,8 @@ def process_video(args: argparse.Namespace) -> None:
             args.encode_gpu,
             output_pix_fmt,
             writer_filters,
+            color_spec,
+            args.anime4k,
         )
         progress = tqdm(
             total=expected_frames,
@@ -1467,10 +1580,18 @@ def process_video(args: argparse.Namespace) -> None:
                         stage_started = time.monotonic()
                         frame_outputs = workers.infer_frames(batch_id, indexed_frames)
                         timings["inference"] += time.monotonic() - stage_started
-                        stage_started = time.monotonic()
-                        for frame_id, _frame in indexed_frames:
-                            writer.write(frame_outputs[frame_id])
-                        timings["float_to_rgb48"] += time.monotonic() - stage_started
+                        for frame_id, reference_frame in indexed_frames:
+                            output = finalize_output_frame(
+                                frame_outputs[frame_id],
+                                reference_frame,
+                                output_width,
+                                output_height,
+                                args,
+                                timings,
+                            )
+                            stage_started = time.monotonic()
+                            writer.write(output)
+                            timings["float_to_rgb48"] += time.monotonic() - stage_started
                         processed += len(indexed_frames)
                         batch_id += 1
                         progress.update(len(indexed_frames))
@@ -1494,27 +1615,14 @@ def process_video(args: argparse.Namespace) -> None:
                         timings["tile_crop_stitch"] = timings.get("tile_crop_stitch", 0.0) + (
                             time.monotonic() - stage_started
                         )
-                        if args.scale != native_model_scale:
-                            stage_started = time.monotonic()
-                            output = full_frame_lanczos(
-                                output,
-                                output_width,
-                                output_height,
-                            )
-                            timings["lanczos"] += time.monotonic() - stage_started
-                        stage_started = time.monotonic()
-                        output = full_frame_dehalo(output, args.dehalo_strength, args.dehalo_radius)
-                        timings["dehalo"] += time.monotonic() - stage_started
-                        stage_started = time.monotonic()
-                        output = full_frame_range_limit(
+                        output = finalize_output_frame(
                             output,
-                            frame.astype(np.float32) / 255.0,
-                            args.range_limit,
-                            args.range_radius,
-                            args.overshoot,
-                            args.undershoot,
+                            frame,
+                            output_width,
+                            output_height,
+                            args,
+                            timings,
                         )
-                        timings["range_limit"] += time.monotonic() - stage_started
                         stage_started = time.monotonic()
                         writer.write(output)
                         timings["float_to_rgb48"] += time.monotonic() - stage_started
@@ -1683,6 +1791,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-pix-fmt",
         choices=("auto", "yuv420p", "yuv420p10le", "p010le"),
         default="auto",
+    )
+    parser.add_argument(
+        "--color-policy",
+        choices=("preserve", "bt709"),
+        default="preserve",
+        help="Preserve/infer source SDR metadata, or force BT.709 limited-range output",
+    )
+    parser.add_argument(
+        "--hdr-policy",
+        choices=("reject", "passthrough"),
+        default="reject",
+        help="Reject HDR by default because the SR model is not HDR-linear",
     )
     parser.add_argument("--audio-codec", choices=("aac", "copy"), default="aac")
     parser.add_argument("--audio-bitrate", default="192k")
