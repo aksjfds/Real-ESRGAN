@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Fast multi-GPU Real-ESRGAN video upscaling for Kaggle.
+"""Modular, float-first multi-GPU Real-ESRGAN video enhancement for Kaggle.
 
-The parent process owns video decoding, overlap blending, progress reporting and
+The parent process owns video decoding, direct tile stitching, progress reporting and
 encoding.  Exactly one persistent worker (and therefore one model copy) is
 created for every selected GPU.  Workers process fixed-size tiles in batches.
 """
@@ -20,16 +20,15 @@ import time
 import traceback
 import types
 import urllib.request
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 
 # BasicSR 1.4.2 imports a module removed by newer torchvision releases.  Kaggle
@@ -45,7 +44,10 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover
     sys.modules["torchvision.transforms.functional_tensor"] = _functional_tensor
 
 from basicsr.archs.rrdbnet_arch import RRDBNet
-from realesrgan.archs.srvgg_arch import SRVGGNetCompact
+from enhance.analysis import SourceAnalyzer, run_getnative
+from enhance.pipeline import DescaleBackend, FrameEnhancementPipeline, PipelineConfig
+from enhance.srvgg_enhanced import EnhancedSRVGGNetCompact, assert_no_extra_state
+from enhance.tiles import TileProcessor, axis_starts
 
 
 MODEL_URLS = {
@@ -86,24 +88,46 @@ class VideoInfo:
         return self.fps_num / self.fps_den
 
 @dataclass(frozen=True)
-class TileInfo:
-    index: int
-    x0: int
-    y0: int
-    x1: int
-    y1: int
-
-
-@dataclass(frozen=True)
 class WorkerConfig:
     model_name: str
     model_paths: Tuple[str, ...]
     denoise_strength: float
-    scale: float
+    preprocess_backend: str
+    preprocess_strength: float
+    preprocess_model_path: str
+    tta_mode: str
+    tta_batch_size: int
+    shift_ensemble: str
+    residual_mode: str
+    residual_strength: float
+    residual_flat_strength: float
+    residual_edge_strength: float
+    residual_edge_low: float
+    residual_edge_high: float
+    base_correction: float
+    cugan_ensemble: bool
+    cugan_model_path: str
+    cugan_alpha: float
+    cugan_global_weight: float
+    cugan_mask_mode: str
+    back_projection_iterations: int
+    back_projection_strength: float
+    back_projection_kernel: str
+    back_projection_clamp: float
+    native_scale: int
+    final_scale: float
     tile_size: int
+    tile_pad: int
+    pre_pad: int
     batch_size: int
     fp16: bool
     channels_last: bool
+    dehalo_strength: float
+    dehalo_radius: int
+    range_limit: float
+    range_radius: int
+    overshoot: float
+    undershoot: float
 
 
 def now_text() -> str:
@@ -137,6 +161,77 @@ def require_encoder(ffmpeg_bin: str, encoder: str) -> None:
     result = run_checked([ffmpeg_bin, "-hide_banner", "-encoders"], "ffmpeg encoder probe")
     if encoder not in (result.stdout + result.stderr):
         raise RuntimeError(f"ffmpeg does not provide the requested video encoder: {encoder}")
+
+
+def encoder_pixel_formats(ffmpeg_bin: str, encoder: str) -> set[str]:
+    result = run_checked([ffmpeg_bin, "-hide_banner", "-h", f"encoder={encoder}"], "encoder format probe")
+    text = result.stdout + result.stderr
+    for line in text.splitlines():
+        if "Supported pixel formats:" in line:
+            return set(line.split("Supported pixel formats:", 1)[1].strip().split())
+    return set()
+
+
+def resolve_output_pix_fmt(ffmpeg_bin: str, codec: str, requested: str) -> str:
+    defaults = {
+        "hevc_nvenc": "p010le",
+        "libx265": "yuv420p10le",
+        "h264_nvenc": "yuv420p",
+        "libx264": "yuv420p",
+    }
+    selected = defaults[codec] if requested == "auto" else requested
+    supported = encoder_pixel_formats(ffmpeg_bin, codec)
+    if selected in supported:
+        return selected
+    if requested != "auto":
+        raise RuntimeError(
+            f"Encoder {codec} does not advertise explicitly requested pixel format {selected}; "
+            f"supported={sorted(supported)}"
+        )
+    fallback = "yuv420p"
+    if fallback not in supported:
+        raise RuntimeError(f"Encoder {codec} has no supported automatic 4:2:0 output format")
+    print(
+        f"[warning] {codec} does not advertise {selected}; auto falling back to {fallback}",
+        flush=True,
+    )
+    return fallback
+
+
+def probe_encoder_runtime(
+    ffmpeg_bin: str,
+    codec: str,
+    pixel_format: str,
+    width: int,
+    height: int,
+    encode_gpu: int,
+) -> None:
+    """Open the selected encoder at the real output size before model startup."""
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=black:size={width}x{height}:rate=1",
+        "-frames:v",
+        "1",
+        "-c:v",
+        codec,
+    ]
+    if codec in {"h264_nvenc", "hevc_nvenc"}:
+        command += ["-gpu", str(encode_gpu)]
+    command += ["-pix_fmt", pixel_format, "-f", "null", "-"]
+    run_checked(command, f"{codec} runtime probe at {width}x{height}/{pixel_format}")
+    print(f"[encoder] runtime OK: {codec}, {width}x{height}, {pixel_format}", flush=True)
+
+
+def require_libplacebo(ffmpeg_bin: str) -> None:
+    result = run_checked([ffmpeg_bin, "-hide_banner", "-filters"], "FFmpeg filter probe")
+    if "libplacebo" not in (result.stdout + result.stderr):
+        raise RuntimeError("Anime4K requested, but this FFmpeg build has no libplacebo filter")
 
 
 def parse_rate(value: str) -> Fraction:
@@ -268,11 +363,11 @@ def build_model(name: str) -> Tuple[torch.nn.Module, int]:
     if name == "RealESRGAN_x2plus":
         return RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2), 2
     if name == "realesr-animevideov3":
-        return SRVGGNetCompact(
+        return EnhancedSRVGGNetCompact(
             num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16, upscale=4, act_type="prelu"
         ), 4
     if name == "realesr-general-x4v3":
-        return SRVGGNetCompact(
+        return EnhancedSRVGGNetCompact(
             num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type="prelu"
         ), 4
     raise ValueError(f"Unsupported model: {name}")
@@ -301,7 +396,12 @@ def load_worker_model(config: WorkerConfig, device: torch.device) -> Tuple[torch
         weak_state = checkpoint_state(config.model_paths[1])
         strength = config.denoise_strength
         state = {key: strength * value + (1.0 - strength) * weak_state[key] for key, value in state.items()}
-    model.load_state_dict(state, strict=True)
+    assert_no_extra_state(model, state)
+    print(
+        f"[checkpoint] strict=True OK, model={config.model_name}, "
+        f"keys={len(state)}, path={config.model_paths[0]}",
+        flush=True,
+    )
     model.eval().requires_grad_(False)
     if config.fp16 and device.type == "cuda":
         model.half()
@@ -309,37 +409,11 @@ def load_worker_model(config: WorkerConfig, device: torch.device) -> Tuple[torch
         model.to(device=device, memory_format=torch.channels_last)
     else:
         model.to(device)
+    if native_scale != config.native_scale:
+        raise RuntimeError(
+            f"Configured native scale {config.native_scale} does not match model scale {native_scale}"
+        )
     return model, native_scale
-
-
-def infer_image_batch(
-    model: torch.nn.Module,
-    patches: Sequence[np.ndarray],
-    device: torch.device,
-    fp16: bool,
-    native_scale: int,
-    output_scale: float,
-    channels_last: bool,
-) -> List[np.ndarray]:
-    # The raw pipeline is RGB end-to-end, matching the model's training order.
-    input_height, input_width = patches[0].shape[:2]
-    rgb = np.stack(patches)
-    tensor = torch.from_numpy(rgb).permute(0, 3, 1, 2).to(device, non_blocking=True)
-    tensor = tensor.half() if fp16 and device.type == "cuda" else tensor.float()
-    if channels_last and device.type == "cuda":
-        tensor = tensor.contiguous(memory_format=torch.channels_last)
-    tensor.div_(255.0)
-    with torch.inference_mode():
-        output = model(tensor)
-        if output_scale != native_scale:
-            output_height = max(1, int(round(input_height * output_scale)))
-            output_width = max(1, int(round(input_width * output_scale)))
-            output = F.interpolate(
-                output, size=(output_height, output_width), mode="bicubic", align_corners=False
-            )
-        output = output.clamp_(0, 1).mul_(255).round_().byte()
-    array = output.permute(0, 2, 3, 1).contiguous().cpu().numpy()
-    return list(array)
 
 
 def worker_main(
@@ -360,6 +434,47 @@ def worker_main(
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cuda.matmul.allow_tf32 = True
         model, native_scale = load_worker_model(config, device)
+        pipeline = FrameEnhancementPipeline(
+            model,
+            device,
+            PipelineConfig(
+                preprocess_backend=config.preprocess_backend,
+                preprocess_strength=config.preprocess_strength,
+                preprocess_model_path=config.preprocess_model_path,
+                tta_mode=config.tta_mode,
+                tta_batch_size=config.tta_batch_size,
+                shift_ensemble=config.shift_ensemble,
+                residual_mode=config.residual_mode,
+                residual_strength=config.residual_strength,
+                residual_flat_strength=config.residual_flat_strength,
+                residual_edge_strength=config.residual_edge_strength,
+                residual_edge_low=config.residual_edge_low,
+                residual_edge_high=config.residual_edge_high,
+                base_correction=config.base_correction,
+                cugan_ensemble=config.cugan_ensemble,
+                cugan_model_path=config.cugan_model_path,
+                cugan_alpha=config.cugan_alpha,
+                cugan_global_weight=config.cugan_global_weight,
+                cugan_mask_mode=config.cugan_mask_mode,
+                back_projection_iterations=config.back_projection_iterations,
+                back_projection_strength=config.back_projection_strength,
+                back_projection_kernel=config.back_projection_kernel,
+                back_projection_clamp=config.back_projection_clamp,
+                native_scale=native_scale,
+                final_scale=config.final_scale,
+                tile_size=config.tile_size,
+                tile_pad=config.tile_pad,
+                pre_pad=config.pre_pad,
+                fp16=config.fp16,
+                channels_last=config.channels_last,
+                dehalo_strength=config.dehalo_strength,
+                dehalo_radius=config.dehalo_radius,
+                range_limit=config.range_limit,
+                range_radius=config.range_radius,
+                overshoot=config.overshoot,
+                undershoot=config.undershoot,
+            ),
+        )
         output_queue.put(("ready", worker_id, str(device)))
         while True:
             job = input_queue.get()
@@ -367,24 +482,31 @@ def worker_main(
                 break
             job_type, job_id, indexed_patches = job
             results = []
+            timing_before = pipeline.timing_snapshot()
             # Full-frame jobs contain at most one frame per GPU.  Tile jobs use
             # the configured batch size to improve Tensor Core occupancy.
             batch_size = config.batch_size if job_type == "tiles" else 1
-            for offset in range(0, len(indexed_patches), batch_size):
-                chunk = indexed_patches[offset : offset + batch_size]
+            offset = 0
+            while offset < len(indexed_patches):
+                first_shape = indexed_patches[offset][1].shape
+                chunk = []
+                while (
+                    offset < len(indexed_patches)
+                    and len(chunk) < batch_size
+                    and indexed_patches[offset][1].shape == first_shape
+                ):
+                    chunk.append(indexed_patches[offset])
+                    offset += 1
                 indices = [item[0] for item in chunk]
                 patches = [item[1] for item in chunk]
-                outputs = infer_image_batch(
-                    model,
-                    patches,
-                    device,
-                    config.fp16,
-                    native_scale,
-                    config.scale,
-                    config.channels_last,
-                )
+                outputs = pipeline.enhance_batch(patches)
                 results.extend(zip(indices, outputs))
-            output_queue.put((f"{job_type}_result", worker_id, job_id, results))
+            timing_after = pipeline.timing_snapshot()
+            timing_delta = {
+                name: timing_after.get(name, 0.0) - timing_before.get(name, 0.0)
+                for name in timing_after
+            }
+            output_queue.put((f"{job_type}_result", worker_id, job_id, results, timing_delta))
     except Exception as error:  # send failures to the parent instead of hanging it
         output_queue.put(("error", worker_id, repr(error), traceback.format_exc()))
 
@@ -395,6 +517,7 @@ class PersistentWorkers:
         self.output_queue = self.context.Queue()
         self.input_queues = [self.context.Queue(maxsize=1) for _ in gpu_ids]
         self.processes = []
+        self.stage_timings: Dict[str, float] = {}
         for worker_id, gpu_id in enumerate(gpu_ids):
             process = self.context.Process(
                 target=worker_main,
@@ -442,8 +565,8 @@ class PersistentWorkers:
             if message[0] == "error":
                 if job_type == "frames":
                     hint = (
-                        "\nFull-frame OOM fallback: use --tile-size 576 --overlap 32 --batch-size 2; "
-                        "then try 256/32 with batch 16, 8, or 4. Keep FP16 enabled."
+                        "\nFull-frame OOM fallback: use --tile-size 576 --tile-pad 16 --batch-size 2; "
+                        "then try tile-size 256 with batch 16, 8, or 4. Keep FP16 enabled."
                     )
                 else:
                     hint = (
@@ -454,6 +577,9 @@ class PersistentWorkers:
             if message[0] != f"{job_type}_result" or message[2] != job_id:
                 raise RuntimeError(f"Unexpected worker message: {message[0]}")
             merged.update(message[3])
+            if len(message) > 4:
+                for name, value in message[4].items():
+                    self.stage_timings[name] = self.stage_timings.get(name, 0.0) + float(value)
             received += 1
         if len(merged) != len(indexed_images):
             raise RuntimeError(f"Expected {len(indexed_images)} outputs, received {len(merged)}.")
@@ -542,6 +668,98 @@ class RawVideoReader:
             raise RuntimeError(f"ffmpeg decode failed (exit {return_code}):\n{stderr.decode(errors='replace')}")
 
 
+class DescaleRawVideoReader(RawVideoReader):
+    """Persistent vspipe → FFmpeg RGB reader using the real descale plugin."""
+
+    def __init__(
+        self,
+        input_path: Path,
+        ffmpeg_bin: str,
+        width: int,
+        height: int,
+        fps_rate: str,
+        start: float,
+        duration: float,
+        source_fps: Fraction,
+        kernel: str,
+    ) -> None:
+        vspipe = shutil.which("vspipe")
+        if vspipe is None:
+            raise RuntimeError("--descale requires vspipe in PATH")
+        try:
+            import vapoursynth as vs  # type: ignore
+
+            if not hasattr(vs.core, "descale") or not hasattr(vs.core, "ffms2"):
+                raise RuntimeError("VapourSynth descale and ffms2 plugins must both be loaded")
+        except ImportError as error:
+            raise RuntimeError("--descale requires a compatible VapourSynth Python installation") from error
+        start_frame = round(start * float(source_fps))
+        frame_count = max(1, round(duration * float(source_fps)))
+        function = {"bilinear": "Debilinear", "bicubic": "Debicubic", "lanczos": "Delanczos"}[kernel]
+        handle = tempfile.NamedTemporaryFile("w", suffix=".vpy", prefix="realesrgan-descale-", delete=False)
+        self.script_path = Path(handle.name)
+        script = (
+            "import vapoursynth as vs\n"
+            "core = vs.core\n"
+            f"src = core.ffms2.Source(source={str(input_path)!r})\n"
+            f"src = src[{start_frame}:{start_frame + frame_count}]\n"
+            f"out = core.descale.{function}(src, width={width}, height={height})\n"
+            "out.set_output()\n"
+        )
+        handle.write(script)
+        handle.close()
+        self.vspipe_process = subprocess.Popen(
+            [vspipe, "--container", "y4m", str(self.script_path), "-"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert self.vspipe_process.stdout is not None
+        command = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-vf",
+            f"fps={fps_rate}",
+            "-an",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ]
+        self.frame_bytes = width * height * 3
+        self.width = width
+        self.height = height
+        self.process = subprocess.Popen(
+            command,
+            stdin=self.vspipe_process.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.vspipe_process.stdout.close()
+
+    def close(self) -> None:
+        ffmpeg_error: Exception | None = None
+        try:
+            super().close()
+        except Exception as error:
+            ffmpeg_error = error
+        vspipe_stderr = self.vspipe_process.stderr.read() if self.vspipe_process.stderr else b""
+        if self.vspipe_process.stderr:
+            self.vspipe_process.stderr.close()
+        vspipe_code = self.vspipe_process.wait()
+        self.script_path.unlink(missing_ok=True)
+        if ffmpeg_error is not None:
+            raise ffmpeg_error
+        if vspipe_code:
+            raise RuntimeError(
+                f"vspipe descale failed (exit {vspipe_code}):\n{vspipe_stderr.decode(errors='replace')}"
+            )
+
+
 class RawVideoWriter:
     def __init__(
         self,
@@ -557,6 +775,8 @@ class RawVideoWriter:
         cq: int,
         nvenc_preset: str,
         encode_gpu: int,
+        output_pix_fmt: str,
+        video_filters: Sequence[str] = (),
     ) -> None:
         command = [
             ffmpeg_bin,
@@ -567,7 +787,7 @@ class RawVideoWriter:
             "-f",
             "rawvideo",
             "-pix_fmt",
-            "rgb24",
+            "rgb48le",
             "-s:v",
             f"{width}x{height}",
             "-r",
@@ -576,10 +796,13 @@ class RawVideoWriter:
             "pipe:0",
             "-an",
         ]
+        filters = list(video_filters)
         if output_fps_rate != input_fps_rate:
             # Raising FPS duplicates already-enhanced frames here instead of
             # running identical source frames through the model repeatedly.
-            command += ["-vf", f"fps={output_fps_rate}"]
+            filters.append(f"fps={output_fps_rate}")
+        if filters:
+            command += ["-vf", ",".join(filters)]
         command += ["-c:v", codec]
         if codec in {"libx264", "libx265"}:
             command += ["-preset", preset, "-crf", str(crf)]
@@ -610,7 +833,7 @@ class RawVideoWriter:
                 "-bf",
                 "3",
             ]
-        command += ["-pix_fmt", "yuv420p"]
+        command += ["-pix_fmt", output_pix_fmt]
         if codec in {"libx265", "hevc_nvenc"}:
             command += ["-tag:v", "hvc1"]
         command.append(str(path))
@@ -618,8 +841,13 @@ class RawVideoWriter:
 
     def write(self, frame: np.ndarray) -> None:
         assert self.process.stdin is not None
+        if frame.dtype != np.float32 or frame.ndim != 3 or frame.shape[2] != 3:
+            raise TypeError("RawVideoWriter expects float32 HWC RGB")
+        if not np.isfinite(frame).all():
+            raise ValueError("Non-finite value found before rgb48le encoding")
+        frame16 = np.rint(np.clip(frame, 0.0, 1.0) * 65535.0).astype("<u2")
         try:
-            self.process.stdin.write(memoryview(np.ascontiguousarray(frame)).cast("B"))
+            self.process.stdin.write(memoryview(np.ascontiguousarray(frame16)).cast("B"))
         except BrokenPipeError as error:
             detail = self.process.stderr.read().decode(errors="replace") if self.process.stderr else ""
             raise RuntimeError(f"ffmpeg encoder closed its input early:\n{detail}") from error
@@ -633,89 +861,6 @@ class RawVideoWriter:
         return_code = self.process.wait()
         if return_code != 0:
             raise RuntimeError(f"ffmpeg encode failed (exit {return_code}):\n{stderr.decode(errors='replace')}")
-
-
-def axis_starts(length: int, tile_size: int, overlap: int) -> List[int]:
-    if length <= tile_size:
-        return [0]
-    stride = tile_size - overlap
-    # Let the final tile be smaller and reflect-pad it to tile_size.  Moving a
-    # full-size final tile back to the frame edge can create an almost complete
-    # duplicate tile when a dimension is only slightly larger than tile_size.
-    return list(range(0, length, stride))
-
-
-def split_tiles(frame: np.ndarray, tile_size: int, overlap: int) -> Tuple[List[np.ndarray], List[TileInfo]]:
-    height, width = frame.shape[:2]
-    patches: List[np.ndarray] = []
-    infos: List[TileInfo] = []
-    index = 0
-    for y0 in axis_starts(height, tile_size, overlap):
-        for x0 in axis_starts(width, tile_size, overlap):
-            y1 = min(y0 + tile_size, height)
-            x1 = min(x0 + tile_size, width)
-            patch = frame[y0:y1, x0:x1]
-            pad_bottom = tile_size - patch.shape[0]
-            pad_right = tile_size - patch.shape[1]
-            if pad_bottom or pad_right:
-                border = cv2.BORDER_REFLECT_101 if min(patch.shape[:2]) > 1 else cv2.BORDER_REPLICATE
-                patch = cv2.copyMakeBorder(patch, 0, pad_bottom, 0, pad_right, border)
-            patches.append(np.ascontiguousarray(patch))
-            infos.append(TileInfo(index, x0, y0, x1, y1))
-            index += 1
-    return patches, infos
-
-
-def feather_axis(length: int, fade: int, fade_start: bool, fade_end: bool) -> np.ndarray:
-    weights = np.ones(length, dtype=np.float32)
-    fade = min(fade, length // 2)
-    if fade > 0:
-        ramp = np.linspace(0.0, 1.0, fade, endpoint=False, dtype=np.float32)
-        if fade_start:
-            weights[:fade] = ramp
-        if fade_end:
-            weights[-fade:] = ramp[::-1]
-    return weights
-
-
-def blend_tiles(
-    outputs: Dict[int, np.ndarray],
-    infos: Sequence[TileInfo],
-    input_width: int,
-    input_height: int,
-    scale: float,
-    overlap: int,
-) -> np.ndarray:
-    output_width = int(round(input_width * scale))
-    output_height = int(round(input_height * scale))
-    accumulator = np.zeros((output_height, output_width, 3), dtype=np.float32)
-    weight_sum = np.zeros((output_height, output_width, 1), dtype=np.float32)
-    fade = max(1, int(round(overlap * scale))) if overlap else 0
-    for info in infos:
-        ox0 = int(round(info.x0 * scale))
-        oy0 = int(round(info.y0 * scale))
-        ox1 = int(round(info.x1 * scale))
-        oy1 = int(round(info.y1 * scale))
-        height = oy1 - oy0
-        width = ox1 - ox0
-        tile = outputs[info.index]
-        if tile.shape[0] < height or tile.shape[1] < width:
-            tile = cv2.resize(tile, (width, height), interpolation=cv2.INTER_CUBIC)
-        else:
-            tile = tile[:height, :width]
-        wx = feather_axis(width, fade, info.x0 > 0, info.x1 < input_width)
-        wy = feather_axis(height, fade, info.y0 > 0, info.y1 < input_height)
-        weight = (wy[:, None] * wx[None, :])[:, :, None]
-        accumulator[oy0:oy1, ox0:ox1] += tile.astype(np.float32) * weight
-        weight_sum[oy0:oy1, ox0:ox1] += weight
-    if np.any(weight_sum <= 0):
-        raise RuntimeError("Tile fusion produced uncovered output pixels; check tile/overlap settings.")
-    # Keep the large full-frame operations in-place to avoid several extra
-    # 95 MiB temporaries at 4K (and roughly 380 MiB each at 8K).
-    np.divide(accumulator, weight_sum, out=accumulator)
-    np.rint(accumulator, out=accumulator)
-    np.clip(accumulator, 0, 255, out=accumulator)
-    return accumulator.astype(np.uint8)
 
 
 class PeriodicRefresh:
@@ -841,16 +986,111 @@ def parse_gpu_ids(value: str) -> List[Optional[int]]:
     return ids
 
 
+def apply_quality_preset(args: argparse.Namespace, argv: Sequence[str]) -> None:
+    """Apply preset defaults without overriding explicitly supplied CLI options."""
+    explicit = {item.split("=", 1)[0] for item in argv if item.startswith("--")}
+    presets: Dict[str, Dict[str, object]] = {
+        "baseline": {
+            "preprocess": "none",
+            "tta": "none",
+            "shift_ensemble": "none",
+            "residual_mode": "official",
+            "base_correction": 0.0,
+            "cugan_ensemble": False,
+            "back_projection_iterations": 0,
+            "dehalo_strength": 0.0,
+            "range_limit": 0.0,
+        },
+        "safe": {
+            "preprocess": "none",
+            "tta": "x8",
+            "shift_ensemble": "none",
+            "residual_mode": "official",
+            "base_correction": 0.0,
+            "cugan_ensemble": False,
+            "back_projection_iterations": 1,
+            "dehalo_strength": 0.0,
+            "range_limit": 0.1,
+        },
+        "compressed-anime": {
+            "preprocess": "waifu2x",
+            "tta": "x8",
+            "residual_mode": "adaptive",
+            "back_projection_iterations": 1,
+            "dehalo_strength": 0.15,
+            "range_limit": 0.1,
+        },
+        "blurred-anime": {
+            "tta": "x8",
+            "residual_mode": "adaptive",
+            "back_projection_iterations": 1,
+            "range_limit": 0.1,
+        },
+        "max": {
+            "tta": "x8",
+            "shift_ensemble": "x4",
+            "cugan_ensemble": True,
+            "cugan_mask_mode": "adaptive",
+            "back_projection_iterations": 2,
+            "range_limit": 0.1,
+        },
+    }
+    option_names = {
+        "preprocess": "--preprocess",
+        "tta": "--tta",
+        "shift_ensemble": "--shift-ensemble",
+        "residual_mode": "--residual-mode",
+        "base_correction": "--base-correction",
+        "cugan_ensemble": "--cugan-ensemble",
+        "cugan_mask_mode": "--cugan-mask-mode",
+        "back_projection_iterations": "--back-projection-iterations",
+        "dehalo_strength": "--dehalo-strength",
+        "range_limit": "--range-limit",
+    }
+    for name, value in presets[args.quality_preset].items():
+        positive = option_names[name]
+        negative = "--no-" + positive[2:] if isinstance(value, bool) else ""
+        if positive not in explicit and negative not in explicit:
+            setattr(args, name, value)
+    if args.overlap is not None:
+        if "--tile-pad" in explicit:
+            raise ValueError("--overlap and --tile-pad cannot be supplied together")
+        args.tile_pad = args.overlap
+        print("[deprecated] --overlap now maps to --tile-pad; no feather blending is performed", flush=True)
+
+
+def anime4k_filters(args: argparse.Namespace) -> list[str]:
+    if not args.anime4k:
+        return []
+    require_libplacebo(args.ffmpeg_bin)
+    if args.anime4k_strength != 1.0:
+        raise ValueError(
+            "Official Anime4K .hook shaders do not expose one universal strength parameter; "
+            "--anime4k-strength must remain 1.0"
+        )
+    if not args.anime4k_shaders:
+        raise ValueError(
+            "Anime4K requires explicit --anime4k-shaders filenames; preset names are not emulated"
+        )
+    root = Path(args.anime4k_shader_dir).expanduser().resolve()
+    filters = []
+    for name in (item.strip() for item in args.anime4k_shaders.split(",") if item.strip()):
+        shader = (root / name).resolve()
+        if root not in shader.parents or not shader.is_file():
+            raise FileNotFoundError(f"Anime4K shader not found below shader directory: {shader}")
+        filters.append(f"libplacebo=custom_shader_path={shader}:custom_shader_bin=0")
+    return filters
+
+
 def validate_args(args: argparse.Namespace) -> None:
-    if args.scale <= 0:
-        raise ValueError("--scale must be positive.")
+    if not 0 < args.scale <= 4:
+        raise ValueError("--scale/final scale must satisfy 0 < scale <= 4.")
     if args.tile_size != 0 and (args.tile_size < 64 or args.tile_size % 4):
         raise ValueError("--tile-size must be 0 (full frame), or at least 64 and divisible by 4.")
-    if args.tile_size == 0:
-        if args.overlap != 0:
-            raise ValueError("--overlap must be 0 when --tile-size is 0 (full-frame mode).")
-    elif args.overlap < 0 or args.overlap >= args.tile_size // 2:
-        raise ValueError("--overlap must be non-negative and less than half of --tile-size.")
+    if args.tile_pad < 0 or args.pre_pad < 0:
+        raise ValueError("--tile-pad and --pre-pad must be non-negative")
+    if args.tile_size and args.tile_pad >= args.tile_size // 2:
+        raise ValueError("--tile-pad must be less than half of --tile-size")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1.")
     if not 0 <= args.crf <= 51:
@@ -863,6 +1103,55 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--denoise-strength must be between 0 and 1.")
     if args.progress_interval <= 0:
         raise ValueError("--progress-interval must be positive.")
+    if args.native_samples < 1:
+        raise ValueError("--native-samples must be at least 1")
+    if not 0 < args.native_confidence <= 1:
+        raise ValueError("--native-confidence must be in (0, 1]")
+    if args.native_min_height <= 0 or args.native_max_height < args.native_min_height:
+        raise ValueError("Invalid native height search range")
+    native_kernels = [item.strip() for item in args.native_kernels.split(",") if item.strip()]
+    if not native_kernels or any(item not in {"bilinear", "bicubic", "lanczos"} for item in native_kernels):
+        raise ValueError("--native-kernels must be a non-empty comma-separated subset of bilinear,bicubic,lanczos")
+    if not 0 <= args.preprocess_strength <= 1:
+        raise ValueError("--preprocess-strength must be between 0 and 1")
+    if args.tta_batch_size not in {1, 2, 4, 8}:
+        raise ValueError("--tta-batch-size must be 1, 2, 4, or 8")
+    if not 0 <= args.back_projection_iterations <= 3:
+        raise ValueError("--back-projection-iterations must be between 0 and 3")
+    if args.back_projection_strength < 0 or args.back_projection_clamp <= 0:
+        raise ValueError("Back-projection strength must be non-negative and clamp positive")
+    if args.preprocess == "realcugan-1x" and args.cugan_ensemble:
+        raise ValueError("Real-CUGAN 1x preprocessing and 4x CUGAN ensemble cannot both be enabled")
+    if args.preprocess == "auto" and not args.preprocess_auto_apply:
+        print("[warning] preprocess=auto is report-only because --preprocess-auto-apply is disabled", flush=True)
+    if args.quality_preset == "blurred-anime" and args.preprocess not in {
+        "restormer-motion",
+        "restormer-defocus",
+    }:
+        raise ValueError("blurred-anime requires explicit Restormer motion or defocus preprocessing")
+    if args.descale and args.native_height == 0 and args.native_analysis == "off":
+        raise ValueError("--descale requires --native-height or native analysis")
+    if args.descale and (args.input_width or args.input_height):
+        raise ValueError(
+            "--descale cannot be combined with --input-width/--input-height; "
+            "use --native-height to choose the actual descale target"
+        )
+    if args.descale and args.native_height > 0 and args.native_kernel == "auto" and args.native_analysis == "off":
+        raise ValueError("Explicit --descale requires a concrete --native-kernel when analysis is off")
+    if not 0 <= args.base_correction <= 0.5:
+        raise ValueError("--base-correction must be between 0 and 0.5")
+    if args.residual_edge_high <= args.residual_edge_low:
+        raise ValueError("--residual-edge-high must be greater than --residual-edge-low")
+    if min(args.residual_strength, args.residual_flat_strength, args.residual_edge_strength) < 0:
+        raise ValueError("Residual strengths must be non-negative")
+    if not 0 <= args.cugan_global_weight <= 1:
+        raise ValueError("--cugan-global-weight must be between 0 and 1")
+    if args.dehalo_radius < 1 or args.range_radius < 1:
+        raise ValueError("Dehalo/range radii must be positive")
+    if args.dehalo_strength < 0 or args.range_limit < 0:
+        raise ValueError("Dehalo/range strengths must be non-negative")
+    if args.overshoot < 0 or args.undershoot < 0:
+        raise ValueError("--overshoot and --undershoot must be non-negative")
 
 
 def log_devices(gpu_ids: Sequence[Optional[int]], fp16: bool) -> None:
@@ -882,6 +1171,8 @@ def process_video(args: argparse.Namespace) -> None:
     require_binary(args.ffmpeg_bin)
     require_binary(args.ffprobe_bin)
     require_encoder(args.ffmpeg_bin, args.video_codec)
+    output_pix_fmt = resolve_output_pix_fmt(args.ffmpeg_bin, args.video_codec, args.output_pix_fmt)
+    writer_filters = anime4k_filters(args)
     input_path = Path(args.input).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
     if not input_path.is_file():
@@ -900,29 +1191,182 @@ def process_video(args: argparse.Namespace) -> None:
     inference_fps = float(inference_rate)
     inference_fps_rate = f"{inference_rate.numerator}/{inference_rate.denominator}"
     input_width, input_height = choose_input_size(info, args.input_width, args.input_height)
-    output_width = int(round(input_width * args.scale))
-    output_height = int(round(input_height * args.scale))
-    if output_width % 2 or output_height % 2:
-        raise ValueError(
-            f"yuv420p needs even output dimensions, got {output_width}x{output_height}. "
-            "Adjust --input-width/--input-height or use an integer scale producing even dimensions."
-        )
     start, duration, expected_frames = resolve_range(info, args.start_time, args.test_seconds, inference_rate)
     expected_output_frames = max(1, int(round(duration * output_fps)))
     end = start + duration
     gpu_ids = parse_gpu_ids(args.gpu_ids)
     effective_fp16 = args.fp16 and gpu_ids != [None]
     effective_channels_last = args.channels_last and gpu_ids != [None]
+    native_model_scale = 2 if args.model == "RealESRGAN_x2plus" else 4
+    if args.scale > native_model_scale:
+        raise ValueError(
+            f"Final scale {args.scale:g} exceeds model-native scale {native_model_scale}; "
+            "post-model enlargement is not allowed"
+        )
+
+    analysis_rows = []
+    native_analysis_elapsed = 0.0
+    effective_preprocess = args.preprocess
+    if args.native_analysis != "off" or args.preprocess == "auto":
+        analysis_started = time.monotonic()
+        analysis_rows = SourceAnalyzer(args.ffmpeg_bin).analyze(
+            input_path, info.width, info.height, start, duration, args.native_samples
+        )
+        for row in analysis_rows:
+            print(f"[analysis] {json.dumps(asdict(row), sort_keys=True)}", flush=True)
+        recommendation, reason = SourceAnalyzer.recommend(analysis_rows)
+        print(f"[analysis] preprocess_recommendation={recommendation}, reason={reason}", flush=True)
+        if args.preprocess == "auto":
+            effective_preprocess = recommendation if args.preprocess_auto_apply else "none"
+        native_analysis_elapsed = time.monotonic() - analysis_started
+        print(f"[timing] native/degradation_analysis={native_analysis_elapsed:.2f}s", flush=True)
+
+    selected_native_height = args.native_height
+    selected_native_kernel = args.native_kernel
+    if selected_native_height > 0 and selected_native_kernel != "auto":
+        print(
+            f"[native] explicit candidate height={selected_native_height}, kernel={selected_native_kernel}; "
+            "automatic getnative skipped",
+            flush=True,
+        )
+    elif args.native_analysis != "off":
+        last_source_frame = max(
+            0,
+            (info.frames if info.frames is not None else int(info.duration * info.fps)) - 1,
+        )
+        sample_frames = [
+            min(last_source_frame, round((start + fraction * duration) * info.fps))
+            for fraction in np.linspace(0.0, 0.999, args.native_samples)
+        ]
+        try:
+            candidates = run_getnative(
+                input_path,
+                sample_frames,
+                [item.strip() for item in args.native_kernels.split(",") if item.strip()],
+                args.native_min_height,
+                args.native_max_height,
+            )
+            for candidate in candidates:
+                print(f"[native] {json.dumps(asdict(candidate), sort_keys=True)}", flush=True)
+            groups: Dict[Tuple[int, str], int] = {}
+            for candidate in candidates:
+                key = (candidate.height, candidate.kernel)
+                groups[key] = groups.get(key, 0) + 1
+            best, count = max(groups.items(), key=lambda item: item[1])
+            # Every source frame is tested with every kernel.  Confidence is
+            # therefore agreement across sampled frames for one (height,
+            # kernel), not its share of all frame×kernel trials.
+            confidence = count / max(args.native_samples, 1)
+            if confidence >= args.native_confidence and best[0] < info.height * 0.95:
+                selected_native_height, selected_native_kernel = best
+                if args.native_analysis == "auto" and not args.descale:
+                    if DescaleBackend.available() and shutil.which("vspipe") is not None:
+                        args.descale = True
+                        auto_status = "auto-enabled"
+                    else:
+                        auto_status = "unavailable; keeping source size"
+                else:
+                    auto_status = "enabled" if args.descale else "report-only"
+                print(
+                    f"[native] consensus height={best[0]}, kernel={best[1]}, confidence={confidence:.3f}; "
+                    f"descale={auto_status}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[native] no safe consensus: best={best}, confidence={confidence:.3f}; keeping source size",
+                    flush=True,
+                )
+        except Exception as error:
+            if args.native_analysis == "report":
+                raise
+            print(f"[native] auto disabled: {error}", flush=True)
+
+    if args.descale:
+        if not DescaleBackend.available() or shutil.which("vspipe") is None:
+            raise RuntimeError(
+                "--descale requires a working vspipe plus VapourSynth descale and ffms2 plugins. "
+                "No ordinary resize fallback is permitted."
+            )
+        if selected_native_height <= 0 or selected_native_kernel == "auto":
+            raise RuntimeError(
+                "Native analysis did not produce a safe height/kernel consensus; "
+                "provide both --native-height and --native-kernel or disable --descale"
+            )
+        input_height = selected_native_height
+        input_width = max(2, int(round(input_height * info.width / info.height)))
+        input_width -= input_width % 2
+
+    output_width = int(round(input_width * args.scale))
+    output_height = int(round(input_height * args.scale))
+    if output_width % 2 or output_height % 2:
+        raise ValueError(
+            f"4:2:0 encoding needs even output dimensions, got {output_width}x{output_height}. "
+            "Adjust the selected dimensions or scale."
+        )
+    probe_encoder_runtime(
+        args.ffmpeg_bin,
+        args.video_codec,
+        output_pix_fmt,
+        output_width,
+        output_height,
+        args.encode_gpu,
+    )
+
+    if effective_preprocess != "none":
+        raise RuntimeError(
+            f"Selected preprocessing backend {effective_preprocess!r} is not installed and verified in "
+            "this build. Disable it or install an explicitly supported official integration; "
+            "no substitute will be used."
+        )
+
+    # Download/resolve the main checkpoint only after all inexpensive source,
+    # capability and encoder checks have succeeded.
     model_paths = resolve_model_paths(args)
+
     config = WorkerConfig(
         model_name=args.model,
         model_paths=model_paths,
         denoise_strength=args.denoise_strength,
-        scale=args.scale,
+        preprocess_backend=effective_preprocess,
+        preprocess_strength=args.preprocess_strength,
+        preprocess_model_path=args.preprocess_model_path,
+        tta_mode=args.tta,
+        tta_batch_size=args.tta_batch_size,
+        shift_ensemble=args.shift_ensemble,
+        residual_mode=args.residual_mode,
+        residual_strength=args.residual_strength,
+        residual_flat_strength=args.residual_flat_strength,
+        residual_edge_strength=args.residual_edge_strength,
+        residual_edge_low=args.residual_edge_low,
+        residual_edge_high=args.residual_edge_high,
+        base_correction=args.base_correction,
+        cugan_ensemble=args.cugan_ensemble,
+        cugan_model_path=args.cugan_model_path,
+        cugan_alpha=args.cugan_alpha,
+        cugan_global_weight=args.cugan_global_weight,
+        cugan_mask_mode=args.cugan_mask_mode,
+        back_projection_iterations=args.back_projection_iterations,
+        back_projection_strength=args.back_projection_strength,
+        back_projection_kernel=args.back_projection_kernel,
+        back_projection_clamp=args.back_projection_clamp,
+        native_scale=native_model_scale,
+        final_scale=args.scale,
         tile_size=args.tile_size,
+        tile_pad=args.tile_pad,
+        pre_pad=args.pre_pad,
         batch_size=args.batch_size,
         fp16=effective_fp16,
         channels_last=effective_channels_last,
+        dehalo_strength=args.dehalo_strength,
+        dehalo_radius=args.dehalo_radius,
+        range_limit=args.range_limit,
+        range_radius=args.range_radius,
+        overshoot=args.overshoot,
+        undershoot=args.undershoot,
+    )
+    tile_processor = TileProcessor(
+        args.tile_size, args.tile_pad, args.pre_pad, args.scale, args.tile_verify_coverage
     )
 
     mode = "timed test" if args.test_seconds > 0 else "selected/full range"
@@ -941,6 +1385,21 @@ def process_video(args: argparse.Namespace) -> None:
         f"expected_output_frames={expected_output_frames}",
         flush=True,
     )
+    tta_count = 8 if args.tta == "x8" else 1
+    shift_count = {"none": 1, "x2": 2, "x4": 4}[args.shift_ensemble]
+    print(
+        f"[pipeline] model={args.model}, weight={model_paths[0]}, strict_load=True, "
+        f"native_scale={native_model_scale}, final_scale={args.scale:g}, preprocess={effective_preprocess}, "
+        f"descale={'on' if args.descale else 'off'}, native_kernel={selected_native_kernel}, "
+        f"tta={tta_count}, shift={shift_count}, model_calls={tta_count * shift_count}, "
+        f"residual={args.residual_mode}, base_correction={args.base_correction:g}, "
+        f"cugan={args.cugan_ensemble}, back_projection={args.back_projection_iterations}, "
+        f"internal=fp32/fp16-model, raw=rgb48le, encode_pix_fmt={output_pix_fmt}, "
+        f"anime4k_shaders={args.anime4k_shaders or 'none'}",
+        flush=True,
+    )
+    if tta_count * shift_count > 8:
+        print("[warning] ensemble requires many model calls and has high runtime/VRAM pressure", flush=True)
     if args.tile_size == 0:
         print(
             f"[inference] full-frame mode, parallel_frames={len(gpu_ids)}, "
@@ -948,12 +1407,13 @@ def process_video(args: argparse.Namespace) -> None:
             flush=True,
         )
     else:
-        stride = args.tile_size - args.overlap
-        tile_count = len(axis_starts(input_width, args.tile_size, args.overlap)) * len(
-            axis_starts(input_height, args.tile_size, args.overlap)
+        stride = args.tile_size
+        tile_count = len(axis_starts(input_width, args.tile_size)) * len(
+            axis_starts(input_height, args.tile_size)
         )
         print(
-            f"[tiles] size={args.tile_size}, overlap={args.overlap}, stride={stride}, "
+            f"[tiles] size={args.tile_size}, tile_pad={args.tile_pad}, pre_pad={args.pre_pad}, "
+            f"stride={stride}, direct_stitch=True, "
             f"tiles_per_frame={tile_count}, batch_per_gpu={args.batch_size}, "
             f"channels_last={effective_channels_last}",
             flush=True,
@@ -967,10 +1427,25 @@ def process_video(args: argparse.Namespace) -> None:
     started = time.monotonic()
     timings = {
         "model_startup": 0.0,
+        "native_analysis": native_analysis_elapsed,
+        "descale": 0.0,
         "decode": 0.0,
         "inference": 0.0,
-        "blend": 0.0,
-        "write": 0.0,
+        "preprocess": 0.0,
+        "tta": 0.0,
+        "shift_ensemble": 0.0,
+        "realesrgan": 0.0,
+        "residual_control": 0.0,
+        "base_correction": 0.0,
+        "realcugan": 0.0,
+        "ensemble_fusion": 0.0,
+        "back_projection": 0.0,
+        "lanczos": 0.0,
+        "tile_crop_stitch": 0.0,
+        "dehalo": 0.0,
+        "range_limit": 0.0,
+        "anime4k": 0.0,
+        "float_to_rgb48": 0.0,
         "encode_flush": 0.0,
         "audio_mux": 0.0,
     }
@@ -979,15 +1454,28 @@ def process_video(args: argparse.Namespace) -> None:
         stage_started = time.monotonic()
         workers = PersistentWorkers(gpu_ids, config)
         timings["model_startup"] += time.monotonic() - stage_started
-        reader = RawVideoReader(
-            input_path,
-            args.ffmpeg_bin,
-            input_width,
-            input_height,
-            inference_fps_rate,
-            start,
-            duration,
-        )
+        if args.descale:
+            reader = DescaleRawVideoReader(
+                input_path,
+                args.ffmpeg_bin,
+                input_width,
+                input_height,
+                inference_fps_rate,
+                start,
+                duration,
+                source_rate,
+                selected_native_kernel,
+            )
+        else:
+            reader = RawVideoReader(
+                input_path,
+                args.ffmpeg_bin,
+                input_width,
+                input_height,
+                inference_fps_rate,
+                start,
+                duration,
+            )
         writer = RawVideoWriter(
             temporary_video,
             args.ffmpeg_bin,
@@ -1001,6 +1489,8 @@ def process_video(args: argparse.Namespace) -> None:
             args.cq,
             args.nvenc_preset,
             args.encode_gpu,
+            output_pix_fmt,
+            writer_filters,
         )
         progress = tqdm(
             total=expected_frames,
@@ -1021,7 +1511,7 @@ def process_video(args: argparse.Namespace) -> None:
                             if frame is None:
                                 break
                             indexed_frames.append((processed + len(indexed_frames), frame))
-                        timings["decode"] += time.monotonic() - stage_started
+                        timings["descale" if args.descale else "decode"] += time.monotonic() - stage_started
                         if not indexed_frames:
                             break
                         stage_started = time.monotonic()
@@ -1030,7 +1520,7 @@ def process_video(args: argparse.Namespace) -> None:
                         stage_started = time.monotonic()
                         for frame_id, _frame in indexed_frames:
                             writer.write(frame_outputs[frame_id])
-                        timings["write"] += time.monotonic() - stage_started
+                        timings["float_to_rgb48"] += time.monotonic() - stage_started
                         processed += len(indexed_frames)
                         batch_id += 1
                         progress.update(len(indexed_frames))
@@ -1040,26 +1530,23 @@ def process_video(args: argparse.Namespace) -> None:
                     while True:
                         stage_started = time.monotonic()
                         frame = reader.read()
-                        timings["decode"] += time.monotonic() - stage_started
+                        timings["descale" if args.descale else "decode"] += time.monotonic() - stage_started
                         if frame is None:
                             break
-                        patches, tile_infos = split_tiles(frame, args.tile_size, args.overlap)
+                        patches, tile_infos = tile_processor.split(frame)
                         stage_started = time.monotonic()
                         tile_outputs = workers.infer_tiles(processed, patches)
                         timings["inference"] += time.monotonic() - stage_started
                         stage_started = time.monotonic()
-                        output = blend_tiles(
-                            tile_outputs,
-                            tile_infos,
-                            input_width,
-                            input_height,
-                            args.scale,
-                            args.overlap,
+                        output = tile_processor.stitch(
+                            tile_outputs, tile_infos, input_width, input_height
                         )
-                        timings["blend"] += time.monotonic() - stage_started
+                        timings["tile_crop_stitch"] = timings.get("tile_crop_stitch", 0.0) + (
+                            time.monotonic() - stage_started
+                        )
                         stage_started = time.monotonic()
                         writer.write(output)
-                        timings["write"] += time.monotonic() - stage_started
+                        timings["float_to_rgb48"] += time.monotonic() - stage_started
                         processed += 1
                         progress.update(1)
                         elapsed = max(time.monotonic() - started, 1e-6)
@@ -1085,6 +1572,8 @@ def process_video(args: argparse.Namespace) -> None:
             except Exception:
                 pass
         if workers is not None:
+            for name, value in workers.stage_timings.items():
+                timings[name] = timings.get(name, 0.0) + value
             workers.close()
 
     if not clean_video_ready or processed == 0:
@@ -1129,7 +1618,7 @@ def process_video(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Persistent multi-GPU, overlap-blended Real-ESRGAN video inference.",
+        description="Persistent multi-GPU, float-first Real-ESRGAN video enhancement.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--input", required=True, help="Input video path")
@@ -1138,6 +1627,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default="", help="Optional local .pth override")
     parser.add_argument("--denoise-strength", type=float, default=1.0, help="DNI strength for general-x4v3")
     parser.add_argument("--scale", type=float, default=2.0, help="Final output scale")
+    parser.add_argument(
+        "--quality-preset",
+        choices=("baseline", "safe", "compressed-anime", "blurred-anime", "max"),
+        default="safe",
+    )
     parser.add_argument(
         "--fps",
         default="source",
@@ -1152,10 +1646,83 @@ def build_parser() -> argparse.ArgumentParser:
         default=256,
         help="0 uses fastest full-frame inference; use tiles only as an OOM fallback",
     )
-    parser.add_argument("--overlap", type=int, default=32)
+    parser.add_argument("--tile-pad", type=int, default=10, help="Model context around each direct-write tile")
+    parser.add_argument("--pre-pad", type=int, default=0)
+    parser.add_argument("--tile-verify-coverage", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--overlap", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--batch-size", type=int, default=4, help="Tiles per inference batch on each GPU")
     parser.add_argument("--gpu-ids", default="0,1", help="Comma-separated IDs, or cpu")
     parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=True)
+
+    parser.add_argument("--native-analysis", choices=("off", "report", "auto"), default="off")
+    parser.add_argument("--native-samples", type=int, default=5)
+    parser.add_argument("--native-min-height", type=int, default=500)
+    parser.add_argument("--native-max-height", type=int, default=1080)
+    parser.add_argument("--native-kernels", default="bilinear,bicubic,lanczos")
+    parser.add_argument("--native-confidence", type=float, default=0.85)
+    parser.add_argument("--native-height", type=int, default=0)
+    parser.add_argument(
+        "--native-kernel", choices=("auto", "bilinear", "bicubic", "lanczos"), default="auto"
+    )
+    parser.add_argument("--descale", action=argparse.BooleanOptionalAction, default=False)
+
+    parser.add_argument(
+        "--preprocess",
+        choices=(
+            "none",
+            "auto",
+            "waifu2x",
+            "swinir-jpeg",
+            "scunet",
+            "restormer-motion",
+            "restormer-defocus",
+            "realcugan-1x",
+        ),
+        default="none",
+    )
+    parser.add_argument("--preprocess-strength", type=float, default=1.0)
+    parser.add_argument("--preprocess-model-path", default="")
+    parser.add_argument("--preprocess-auto-apply", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--scunet-model", choices=("psnr", "gan"), default="psnr")
+
+    parser.add_argument("--tta", choices=("none", "x8"), default="x8")
+    parser.add_argument("--tta-batch-size", type=int, choices=(1, 2, 4, 8), default=1)
+    parser.add_argument("--shift-ensemble", choices=("none", "x2", "x4"), default="none")
+    parser.add_argument("--residual-mode", choices=("official", "global", "adaptive"), default="official")
+    parser.add_argument("--residual-strength", type=float, default=1.0)
+    parser.add_argument("--residual-flat-strength", type=float, default=0.9)
+    parser.add_argument("--residual-edge-strength", type=float, default=1.0)
+    parser.add_argument("--residual-edge-low", type=float, default=0.05)
+    parser.add_argument("--residual-edge-high", type=float, default=0.20)
+    parser.add_argument("--base-correction", type=float, default=0.0)
+
+    parser.add_argument("--cugan-ensemble", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--cugan-model-path", default="")
+    parser.add_argument("--cugan-scale", type=int, choices=(4,), default=4)
+    parser.add_argument("--cugan-alpha", type=float, default=1.0)
+    parser.add_argument("--cugan-global-weight", type=float, default=0.25)
+    parser.add_argument("--cugan-mask-mode", choices=("fixed", "adaptive"), default="adaptive")
+
+    parser.add_argument("--back-projection-iterations", type=int, default=1)
+    parser.add_argument("--back-projection-strength", type=float, default=0.2)
+    parser.add_argument(
+        "--back-projection-kernel", choices=("area", "bicubic", "lanczos"), default="lanczos"
+    )
+    parser.add_argument("--back-projection-clamp", type=float, default=0.05)
+    parser.add_argument("--dehalo-strength", type=float, default=0.0)
+    parser.add_argument("--dehalo-radius", type=int, default=2)
+    parser.add_argument("--range-limit", type=float, default=0.1)
+    parser.add_argument("--range-radius", type=int, default=2)
+    parser.add_argument("--overshoot", type=float, default=1.0)
+    parser.add_argument("--undershoot", type=float, default=1.0)
+
+    parser.add_argument("--anime4k", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--anime4k-shader-dir", default="")
+    parser.add_argument(
+        "--anime4k-preset", choices=("none", "line", "line-deblur", "resample-fix", "custom"), default="none"
+    )
+    parser.add_argument("--anime4k-strength", type=float, default=1.0)
+    parser.add_argument("--anime4k-shaders", default="")
     parser.add_argument(
         "--video-codec",
         choices=("libx264", "libx265", "h264_nvenc", "hevc_nvenc"),
@@ -1170,6 +1737,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cq", type=int, default=18, help="NVENC quality target; lower is higher quality")
     parser.add_argument("--nvenc-preset", choices=tuple(f"p{i}" for i in range(1, 8)), default="p7")
     parser.add_argument("--encode-gpu", type=int, default=0)
+    parser.add_argument(
+        "--output-pix-fmt",
+        choices=("auto", "yuv420p", "yuv420p10le", "p010le"),
+        default="auto",
+    )
     parser.add_argument("--audio-codec", choices=("aac", "copy"), default="aac")
     parser.add_argument("--audio-bitrate", default="192k")
     parser.add_argument("--start-time", type=float, default=0.0, help="Arbitrary source start in seconds")
@@ -1182,6 +1754,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    apply_quality_preset(args, sys.argv[1:])
     validate_args(args)
     process_video(args)
 

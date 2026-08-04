@@ -8,9 +8,30 @@
 - `realesrgan.ipynb`
 - `requirements.txt`
 
-使用 PyTorch `realesr-animevideov3`，支持 T4 × 2 常驻模型、整帧或重叠图块、
-任意起点测试、原帧率、音频封装和 HEVC NVENC。Notebook 默认使用
-`hevc_nvenc`、`CQ 18`、`p7`，输出 8-bit `yuv420p`。
+使用官方 PyTorch `realesr-animevideov3` checkpoint，并以 `strict=True` 加载。
+支持 T4 × 2 每卡一份常驻模型、整帧或带上下文的单次写入 tile、任意起点测试、
+原帧率、音频封装和 HEVC NVENC。增强管线内部保持浮点，编码器输入为
+`rgb48le`；Notebook 默认的 `hevc_nvenc + OUTPUT_PIX_FMT=auto` 输出 `p010le`。
+
+`baseline` 是重构后的官方模型路径；`safe` 另外启用 X8、一次反投影、Lanczos4
+最终缩放和轻度局部范围约束。X8 会将主模型调用次数提高到 8 倍，优先画质而非速度。
+可选 getnative/Descale 有独立安装单元；组件不完整时不会用普通 resize 冒充。
+Waifu2x、SwinIR、SCUNet、Restormer 和 Real-CUGAN 只保留显式能力边界，当前未接入
+经验证的官方常驻后端，选择相关预设或参数会直接报错而不会静默替换。
+
+### 快速版新增参数
+
+| 分组 | 参数 |
+| --- | --- |
+| 预设 | `--quality-preset baseline\|safe\|compressed-anime\|blurred-anime\|max` |
+| 原生分析 | `--native-analysis`、`--native-samples`、`--native-min-height`、`--native-max-height`、`--native-kernels`、`--native-confidence`、`--native-height`、`--native-kernel`、`--descale` |
+| 单一前处理 | `--preprocess`、`--preprocess-strength`、`--preprocess-model-path`、`--preprocess-auto-apply`、`--scunet-model` |
+| 集成/残差 | `--tta`、`--tta-batch-size`、`--shift-ensemble`、`--residual-mode`、`--residual-strength`、`--residual-flat-strength`、`--residual-edge-strength`、`--residual-edge-low`、`--residual-edge-high`、`--base-correction` |
+| CUGAN | `--cugan-ensemble`、`--cugan-model-path`、`--cugan-scale`、`--cugan-alpha`、`--cugan-global-weight`、`--cugan-mask-mode` |
+| 反投影 | `--back-projection-iterations`、`--back-projection-strength`、`--back-projection-kernel`、`--back-projection-clamp` |
+| tile | `--tile-pad`、`--pre-pad`、`--tile-verify-coverage`；旧 `--overlap` 仅映射到 `tile-pad` |
+| 后处理 | `--anime4k`、`--anime4k-shader-dir`、`--anime4k-preset`、`--anime4k-strength`、`--anime4k-shaders`、`--dehalo-strength`、`--dehalo-radius`、`--range-limit`、`--range-radius`、`--overshoot`、`--undershoot` |
+| 编码 | `--output-pix-fmt auto\|yuv420p\|yuv420p10le\|p010le` |
 
 ## 遮罩版
 
