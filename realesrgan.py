@@ -20,7 +20,6 @@ import time
 import traceback
 import types
 import urllib.request
-import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from fractions import Fraction
@@ -44,13 +43,12 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover
     sys.modules["torchvision.transforms.functional_tensor"] = _functional_tensor
 
 from basicsr.archs.rrdbnet_arch import RRDBNet
-from enhance.analysis import SourceAnalyzer, run_getnative
 from enhance.basicvsrpp import (
     BasicVSRPPConfig,
     BasicVSRPPPreprocessor,
     BasicVSRPPStreamReader,
 )
-from enhance.pipeline import DescaleBackend, FrameEnhancementPipeline, PipelineConfig
+from enhance.pipeline import FrameEnhancementPipeline, PipelineConfig
 from enhance.srvgg_enhanced import EnhancedSRVGGNetCompact, assert_no_extra_state
 from enhance.tiles import (
     TileProcessor,
@@ -749,98 +747,6 @@ class RawVideoReader:
             raise RuntimeError(f"ffmpeg decode failed (exit {return_code}):\n{stderr.decode(errors='replace')}")
 
 
-class DescaleRawVideoReader(RawVideoReader):
-    """Persistent vspipe → FFmpeg RGB reader using the real descale plugin."""
-
-    def __init__(
-        self,
-        input_path: Path,
-        ffmpeg_bin: str,
-        width: int,
-        height: int,
-        fps_rate: str,
-        start: float,
-        duration: float,
-        source_fps: Fraction,
-        kernel: str,
-    ) -> None:
-        vspipe = shutil.which("vspipe")
-        if vspipe is None:
-            raise RuntimeError("--descale requires vspipe in PATH")
-        try:
-            import vapoursynth as vs  # type: ignore
-
-            if not hasattr(vs.core, "descale") or not hasattr(vs.core, "ffms2"):
-                raise RuntimeError("VapourSynth descale and ffms2 plugins must both be loaded")
-        except ImportError as error:
-            raise RuntimeError("--descale requires a compatible VapourSynth Python installation") from error
-        start_frame = round(start * float(source_fps))
-        frame_count = max(1, round(duration * float(source_fps)))
-        function = {"bilinear": "Debilinear", "bicubic": "Debicubic", "lanczos": "Delanczos"}[kernel]
-        handle = tempfile.NamedTemporaryFile("w", suffix=".vpy", prefix="realesrgan-descale-", delete=False)
-        self.script_path = Path(handle.name)
-        script = (
-            "import vapoursynth as vs\n"
-            "core = vs.core\n"
-            f"src = core.ffms2.Source(source={str(input_path)!r})\n"
-            f"src = src[{start_frame}:{start_frame + frame_count}]\n"
-            f"out = core.descale.{function}(src, width={width}, height={height})\n"
-            "out.set_output()\n"
-        )
-        handle.write(script)
-        handle.close()
-        self.vspipe_process = subprocess.Popen(
-            [vspipe, "--container", "y4m", str(self.script_path), "-"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert self.vspipe_process.stdout is not None
-        command = [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            "pipe:0",
-            "-vf",
-            f"fps={fps_rate}",
-            "-an",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
-        ]
-        self.frame_bytes = width * height * 3
-        self.width = width
-        self.height = height
-        self.process = subprocess.Popen(
-            command,
-            stdin=self.vspipe_process.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        self.vspipe_process.stdout.close()
-
-    def close(self) -> None:
-        ffmpeg_error: Exception | None = None
-        try:
-            super().close()
-        except Exception as error:
-            ffmpeg_error = error
-        vspipe_stderr = self.vspipe_process.stderr.read() if self.vspipe_process.stderr else b""
-        if self.vspipe_process.stderr:
-            self.vspipe_process.stderr.close()
-        vspipe_code = self.vspipe_process.wait()
-        self.script_path.unlink(missing_ok=True)
-        if ffmpeg_error is not None:
-            raise ffmpeg_error
-        if vspipe_code:
-            raise RuntimeError(
-                f"vspipe descale failed (exit {vspipe_code}):\n{vspipe_stderr.decode(errors='replace')}"
-            )
-
-
 class RawVideoWriter:
     def __init__(
         self,
@@ -1131,30 +1037,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--denoise-strength must be between 0 and 1.")
     if args.progress_interval <= 0:
         raise ValueError("--progress-interval must be positive.")
-    if args.native_samples < 1:
-        raise ValueError("--native-samples must be at least 1")
-    if not 0 < args.native_confidence <= 1:
-        raise ValueError("--native-confidence must be in (0, 1]")
-    if args.native_min_height <= 0 or args.native_max_height < args.native_min_height:
-        raise ValueError("Invalid native height search range")
-    native_kernels = [item.strip() for item in args.native_kernels.split(",") if item.strip()]
-    if not native_kernels or any(item not in {"bilinear", "bicubic", "lanczos"} for item in native_kernels):
-        raise ValueError("--native-kernels must be a non-empty comma-separated subset of bilinear,bicubic,lanczos")
     if args.tta_batch_size not in {1, 2, 4, 8}:
         raise ValueError("--tta-batch-size must be 1, 2, 4, or 8")
     if not 0 <= args.back_projection_iterations <= 3:
         raise ValueError("--back-projection-iterations must be between 0 and 3")
     if args.back_projection_strength < 0 or args.back_projection_clamp <= 0:
         raise ValueError("Back-projection strength must be non-negative and clamp positive")
-    if args.descale and args.native_height == 0 and args.native_analysis == "off":
-        raise ValueError("--descale requires --native-height or native analysis")
-    if args.descale and (args.input_width or args.input_height):
-        raise ValueError(
-            "--descale cannot be combined with --input-width/--input-height; "
-            "use --native-height to choose the actual descale target"
-        )
-    if args.descale and args.native_height > 0 and args.native_kernel == "auto" and args.native_analysis == "off":
-        raise ValueError("Explicit --descale requires a concrete --native-kernel when analysis is off")
     if not 0 <= args.base_correction <= 0.5:
         raise ValueError("--base-correction must be between 0 and 0.5")
     if args.residual_edge_high <= args.residual_edge_low:
@@ -1290,96 +1178,6 @@ def process_video(args: argparse.Namespace) -> None:
             "post-model enlargement is not allowed"
         )
 
-    analysis_rows = []
-    native_analysis_elapsed = 0.0
-    if args.native_analysis != "off":
-        analysis_started = time.monotonic()
-        analysis_rows = SourceAnalyzer(args.ffmpeg_bin).analyze(
-            input_path, info.width, info.height, start, duration, args.native_samples
-        )
-        for row in analysis_rows:
-            print(f"[analysis] {json.dumps(asdict(row), sort_keys=True)}", flush=True)
-        recommendation, reason = SourceAnalyzer.recommend(analysis_rows)
-        print(f"[analysis] degradation_profile={recommendation}, reason={reason}", flush=True)
-        native_analysis_elapsed = time.monotonic() - analysis_started
-        print(f"[timing] native/degradation_analysis={native_analysis_elapsed:.2f}s", flush=True)
-
-    selected_native_height = args.native_height
-    selected_native_kernel = args.native_kernel
-    if selected_native_height > 0 and selected_native_kernel != "auto":
-        print(
-            f"[native] explicit candidate height={selected_native_height}, kernel={selected_native_kernel}; "
-            "automatic getnative skipped",
-            flush=True,
-        )
-    elif args.native_analysis != "off":
-        last_source_frame = max(
-            0,
-            (info.frames if info.frames is not None else int(info.duration * info.fps)) - 1,
-        )
-        sample_frames = [
-            min(last_source_frame, round((start + fraction * duration) * info.fps))
-            for fraction in np.linspace(0.0, 0.999, args.native_samples)
-        ]
-        try:
-            candidates = run_getnative(
-                input_path,
-                sample_frames,
-                [item.strip() for item in args.native_kernels.split(",") if item.strip()],
-                args.native_min_height,
-                args.native_max_height,
-            )
-            for candidate in candidates:
-                print(f"[native] {json.dumps(asdict(candidate), sort_keys=True)}", flush=True)
-            groups: Dict[Tuple[int, str], int] = {}
-            for candidate in candidates:
-                key = (candidate.height, candidate.kernel)
-                groups[key] = groups.get(key, 0) + 1
-            best, count = max(groups.items(), key=lambda item: item[1])
-            # Every source frame is tested with every kernel.  Confidence is
-            # therefore agreement across sampled frames for one (height,
-            # kernel), not its share of all frame×kernel trials.
-            confidence = count / max(args.native_samples, 1)
-            if confidence >= args.native_confidence and best[0] < info.height * 0.95:
-                selected_native_height, selected_native_kernel = best
-                if args.native_analysis == "auto" and not args.descale:
-                    if DescaleBackend.available() and shutil.which("vspipe") is not None:
-                        args.descale = True
-                        auto_status = "auto-enabled"
-                    else:
-                        auto_status = "unavailable; keeping source size"
-                else:
-                    auto_status = "enabled" if args.descale else "report-only"
-                print(
-                    f"[native] consensus height={best[0]}, kernel={best[1]}, confidence={confidence:.3f}; "
-                    f"descale={auto_status}",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[native] no safe consensus: best={best}, confidence={confidence:.3f}; keeping source size",
-                    flush=True,
-                )
-        except Exception as error:
-            if args.native_analysis == "report":
-                raise
-            print(f"[native] auto disabled: {error}", flush=True)
-
-    if args.descale:
-        if not DescaleBackend.available() or shutil.which("vspipe") is None:
-            raise RuntimeError(
-                "--descale requires a working vspipe plus VapourSynth descale and ffms2 plugins. "
-                "No ordinary resize fallback is permitted."
-            )
-        if selected_native_height <= 0 or selected_native_kernel == "auto":
-            raise RuntimeError(
-                "Native analysis did not produce a safe height/kernel consensus; "
-                "provide both --native-height and --native-kernel or disable --descale"
-            )
-        input_height = selected_native_height
-        input_width = max(2, int(round(input_height * info.width / info.height)))
-        input_width -= input_width % 2
-
     output_width = int(round(input_width * args.scale))
     output_height = int(round(input_height * args.scale))
     if output_width % 2 or output_height % 2:
@@ -1459,7 +1257,6 @@ def process_video(args: argparse.Namespace) -> None:
     print(
         f"[pipeline] model={args.model}, weight={model_paths[0]}, strict_load=True, "
         f"native_scale={native_model_scale}, final_scale={args.scale:g}, "
-        f"descale={'on' if args.descale else 'off'}, native_kernel={selected_native_kernel}, "
         f"tta={tta_count}, shift={shift_count}, model_calls={tta_count * shift_count}, "
         f"residual={args.residual_mode}, base_correction={args.base_correction:g}, "
         f"back_projection={args.back_projection_iterations}, "
@@ -1516,8 +1313,6 @@ def process_video(args: argparse.Namespace) -> None:
     timings = {
         "model_startup": 0.0,
         "basicvsrpp_startup": 0.0,
-        "native_analysis": native_analysis_elapsed,
-        "descale": 0.0,
         "decode": 0.0,
         "basicvsrpp": 0.0,
         "inference": 0.0,
@@ -1541,28 +1336,15 @@ def process_video(args: argparse.Namespace) -> None:
         stage_started = time.monotonic()
         workers = PersistentWorkers(gpu_ids, config)
         timings["model_startup"] += time.monotonic() - stage_started
-        if args.descale:
-            reader = DescaleRawVideoReader(
-                input_path,
-                args.ffmpeg_bin,
-                input_width,
-                input_height,
-                inference_fps_rate,
-                start,
-                duration,
-                source_rate,
-                selected_native_kernel,
-            )
-        else:
-            reader = RawVideoReader(
-                input_path,
-                args.ffmpeg_bin,
-                input_width,
-                input_height,
-                inference_fps_rate,
-                start,
-                duration,
-            )
+        reader = RawVideoReader(
+            input_path,
+            args.ffmpeg_bin,
+            input_width,
+            input_height,
+            inference_fps_rate,
+            start,
+            duration,
+        )
         if args.basicvsrpp:
             stage_started = time.monotonic()
             preprocessor = BasicVSRPPPreprocessor(
@@ -1622,7 +1404,7 @@ def process_video(args: argparse.Namespace) -> None:
                             indexed_frames.append((processed + len(indexed_frames), frame))
                         read_elapsed = time.monotonic() - stage_started
                         if basicvsrpp_reader is None:
-                            timings["descale" if args.descale else "decode"] += read_elapsed
+                            timings["decode"] += read_elapsed
                         if not indexed_frames:
                             break
                         stage_started = time.monotonic()
@@ -1651,7 +1433,7 @@ def process_video(args: argparse.Namespace) -> None:
                         frame = reader.read()
                         read_elapsed = time.monotonic() - stage_started
                         if basicvsrpp_reader is None:
-                            timings["descale" if args.descale else "decode"] += read_elapsed
+                            timings["decode"] += read_elapsed
                         if frame is None:
                             break
                         patches, tile_infos = tile_processor.split(frame)
@@ -1683,7 +1465,7 @@ def process_video(args: argparse.Namespace) -> None:
         finally:
             progress.close()
         if basicvsrpp_reader is not None:
-            timings["descale" if args.descale else "decode"] += basicvsrpp_reader.decode_elapsed
+            timings["decode"] += basicvsrpp_reader.decode_elapsed
             timings["basicvsrpp"] += basicvsrpp_reader.preprocessor.elapsed
             print(
                 f"[basicvsrpp] clips={basicvsrpp_reader.preprocessor.clips}, "
@@ -1787,18 +1569,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=4, help="Tiles per inference batch on each GPU")
     parser.add_argument("--gpu-ids", default="0,1", help="Comma-separated IDs, or cpu")
     parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=True)
-
-    parser.add_argument("--native-analysis", choices=("off", "report", "auto"), default="off")
-    parser.add_argument("--native-samples", type=int, default=5)
-    parser.add_argument("--native-min-height", type=int, default=500)
-    parser.add_argument("--native-max-height", type=int, default=1080)
-    parser.add_argument("--native-kernels", default="bilinear,bicubic,lanczos")
-    parser.add_argument("--native-confidence", type=float, default=0.85)
-    parser.add_argument("--native-height", type=int, default=0)
-    parser.add_argument(
-        "--native-kernel", choices=("auto", "bilinear", "bicubic", "lanczos"), default="auto"
-    )
-    parser.add_argument("--descale", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument(
         "--basicvsrpp",

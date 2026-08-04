@@ -65,25 +65,6 @@ class StageTimings:
         self.values[name] += time.monotonic() - started
 
 
-class SourceAnalyzer:
-    """Interface marker; the parent-side implementation lives in analysis.py."""
-
-
-class DescaleBackend:
-    """Descale is never emulated with resize; unavailable means a hard bypass/error."""
-
-    @staticmethod
-    def available() -> bool:
-        try:
-            import vapoursynth as vs  # type: ignore
-
-            return hasattr(vs.core, "descale") and (
-                hasattr(vs.core, "ffms2") or hasattr(vs.core, "lsmas")
-            )
-        except ImportError:
-            return False
-
-
 class RealESRGANBackend:
     def __init__(self, model: torch.nn.Module, config: PipelineConfig, timings: StageTimings):
         self.model = model
