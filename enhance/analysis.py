@@ -64,8 +64,15 @@ class SourceAnalyzer:
         gradient = np.hypot(gx, gy)
         blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
         noise = gray - blur
-        vertical_boundaries = np.abs(gray[:, 8::8] - gray[:, 7::8]).mean() if gray.shape[1] > 8 else 0.0
-        horizontal_boundaries = np.abs(gray[8::8] - gray[7::8]).mean() if gray.shape[0] > 8 else 0.0
+        # Compare the pixels immediately across each internal 8×8 boundary.
+        # ``7::8`` contains one extra element when the dimension is exactly a
+        # multiple of eight, so bound it to the number of right/bottom samples.
+        right = gray[:, 8::8]
+        left = gray[:, 7::8][:, : right.shape[1]]
+        bottom = gray[8::8]
+        top = gray[7::8][: bottom.shape[0]]
+        vertical_boundaries = float(np.abs(right - left).mean()) if right.size else 0.0
+        horizontal_boundaries = float(np.abs(bottom - top).mean()) if bottom.size else 0.0
         ordinary_x = np.abs(np.diff(gray, axis=1)).mean() + 1e-6
         ordinary_y = np.abs(np.diff(gray, axis=0)).mean() + 1e-6
         jpeg_block = float((vertical_boundaries / ordinary_x + horizontal_boundaries / ordinary_y) / 2)
@@ -101,14 +108,14 @@ class SourceAnalyzer:
     def recommend(rows: list[FrameMetrics]) -> tuple[str, str]:
         avg = {key: float(np.mean([getattr(row, key) for row in rows])) for key in asdict(rows[0]) if key != "timestamp"}
         if avg["jpeg_block"] > 1.35 and avg["ringing"] > 0.02:
-            return "swinir-jpeg", "JPEG block and edge-ringing scores are both elevated"
+            return "jpeg-artifacts", "JPEG block and edge-ringing scores are both elevated"
         if avg["directional_blur"] > 0.035 and avg["laplacian_sharpness"] < 0.01:
-            return "restormer-motion", "strong directional blur with low sharpness"
+            return "directional-motion-blur", "strong directional blur with low sharpness"
         if avg["laplacian_sharpness"] < 0.004 and avg["directional_blur"] < 0.015:
-            return "restormer-defocus", "low non-directional sharpness"
+            return "defocus-blur", "low non-directional sharpness"
         if avg["high_frequency_noise"] > 0.025:
-            return "scunet", "mixed high-frequency noise"
-        return "waifu2x", "ordinary compressed anime profile"
+            return "high-frequency-noise", "mixed high-frequency noise"
+        return "ordinary-anime-compression", "ordinary compressed anime profile"
 
 
 def getnative_available() -> bool:

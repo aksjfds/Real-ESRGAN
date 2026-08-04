@@ -98,21 +98,28 @@ class EnsembleEngine:
             return self._tta(x, model_fn)
         height, width = x.shape[-2:]
         accumulated: torch.Tensor | None = None
-        counts: torch.Tensor | None = None
+        identity: torch.Tensor | None = None
+        max_dx = max(dx for dx, _dy in self.phases)
+        max_dy = max(dy for _dx, dy in self.phases)
+        valid_h = height * native_scale - max_dy * native_scale
+        valid_w = width * native_scale - max_dx * native_scale
         for dx, dy in self.phases:
             padded = F.pad(x, (1, 1, 1, 1), mode="reflect")
             shifted = padded[:, :, 1 - dy : 1 - dy + height, 1 - dx : 1 - dx + width]
             sr = self._tta(shifted, model_fn)
             aligned = torch.roll(sr, shifts=(-dy * native_scale, -dx * native_scale), dims=(-2, -1))
+            if dx == 0 and dy == 0:
+                identity = aligned.float()
             if accumulated is None:
-                accumulated = torch.zeros_like(aligned, dtype=torch.float32)
-                counts = torch.zeros_like(aligned[:, :1], dtype=torch.float32)
-            valid_h = aligned.shape[-2] - dy * native_scale
-            valid_w = aligned.shape[-1] - dx * native_scale
+                accumulated = torch.zeros_like(aligned[:, :, :valid_h, :valid_w], dtype=torch.float32)
             accumulated[:, :, :valid_h, :valid_w] += aligned[:, :, :valid_h, :valid_w].float()
-            counts[:, :, :valid_h, :valid_w] += 1.0
-        assert accumulated is not None and counts is not None
-        return accumulated / counts.clamp_min(1.0)
+        assert accumulated is not None and identity is not None
+        # Every ensemble phase contributes to one identical common region.
+        # Borders that cannot be aligned for all phases come from identity,
+        # avoiding the previous position-dependent phase count.
+        result = identity.clone()
+        result[:, :, :valid_h, :valid_w] = accumulated / float(len(self.phases))
+        return result
 
 
 def _lanczos_weights(

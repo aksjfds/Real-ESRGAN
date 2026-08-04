@@ -7,12 +7,12 @@ all accumulation, fusion, refinement and final resizing use FP32.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Sequence
+from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 from .ops import (
     BackProjectionRefiner,
@@ -26,9 +26,6 @@ from .srvgg_enhanced import EnhancedSRVGGNetCompact, adaptive_residual_strength
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    preprocess_backend: str = "none"
-    preprocess_strength: float = 1.0
-    preprocess_model_path: str = ""
     tta_mode: str = "none"
     tta_batch_size: int = 1
     shift_ensemble: str = "none"
@@ -39,11 +36,6 @@ class PipelineConfig:
     residual_edge_low: float = 0.05
     residual_edge_high: float = 0.20
     base_correction: float = 0.0
-    cugan_ensemble: bool = False
-    cugan_model_path: str = ""
-    cugan_alpha: float = 1.0
-    cugan_global_weight: float = 0.25
-    cugan_mask_mode: str = "adaptive"
     back_projection_iterations: int = 0
     back_projection_strength: float = 0.2
     back_projection_kernel: str = "lanczos"
@@ -68,14 +60,11 @@ class StageTimings:
         self.values: dict[str, float] = {
             name: 0.0
             for name in (
-                "preprocess",
                 "tta",
                 "shift_ensemble",
                 "realesrgan",
                 "residual_control",
                 "base_correction",
-                "realcugan",
-                "ensemble_fusion",
                 "back_projection",
                 "lanczos",
                 "dehalo",
@@ -104,23 +93,6 @@ class DescaleBackend:
             )
         except ImportError:
             return False
-
-
-class Preprocessor:
-    VERIFIED_BACKENDS = {"none"}
-
-    def __init__(self, backend: str, strength: float, model_path: str):
-        self.backend = backend
-        self.strength = strength
-        self.model_path = model_path
-        if backend not in self.VERIFIED_BACKENDS:
-            raise RuntimeError(
-                f"Preprocessor {backend!r} is unavailable in this build. Its official repository/API and "
-                "checkpoint have not been installed and verified; no substitute will be used."
-            )
-
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        return x
 
 
 class RealESRGANBackend:
@@ -174,17 +146,6 @@ class RealESRGANBackend:
         return output
 
 
-class RealCUGANBackend:
-    def __init__(self, enabled: bool, model_path: str):
-        self.enabled = enabled
-        self.model_path = model_path
-        if enabled:
-            raise RuntimeError(
-                "Real-CUGAN ensemble is unavailable: no verified resident 4x PyTorch backend/checkpoint "
-                "was provided. Real-ESRGAN will not be silently replaced."
-            )
-
-
 class AnimePostProcessor:
     """Anime4K shaders are applied by the persistent FFmpeg writer, never here."""
 
@@ -195,11 +156,7 @@ class FrameEnhancementPipeline:
         self.device = device
         self.config = config
         self.timings = StageTimings()
-        self.preprocessor = Preprocessor(
-            config.preprocess_backend, config.preprocess_strength, config.preprocess_model_path
-        )
         self.realesrgan = RealESRGANBackend(model, config, self.timings)
-        self.realcugan = RealCUGANBackend(config.cugan_ensemble, config.cugan_model_path)
         self.ensemble = EnsembleEngine(config.tta_mode, config.tta_batch_size, config.shift_ensemble)
         self.back_projection = BackProjectionRefiner(
             config.back_projection_iterations,
@@ -219,13 +176,14 @@ class FrameEnhancementPipeline:
         rgb = np.stack(frames)
         tensor = torch.from_numpy(rgb).permute(0, 3, 1, 2).to(self.device, non_blocking=True)
         tensor = tensor.float().div_(255.0)
-        started = time.monotonic()
-        processed = self.preprocessor(tensor)
-        self.timings.add("preprocess", started)
-        model_input = processed
-        inference_input = processed
+        original_height, original_width = tensor.shape[-2:]
+        if self.config.pre_pad:
+            pad_mode = "reflect" if min(original_height, original_width) > self.config.pre_pad else "replicate"
+            tensor = F.pad(tensor, (self.config.pre_pad,) * 4, mode=pad_mode)
+        model_input = tensor
+        inference_input = tensor
         if self.config.fp16 and self.device.type == "cuda":
-            inference_input = processed.half()
+            inference_input = tensor.half()
         if self.config.channels_last and self.device.type == "cuda":
             inference_input = inference_input.contiguous(memory_format=torch.channels_last)
 
@@ -265,6 +223,12 @@ class FrameEnhancementPipeline:
                 self.config.undershoot,
             )
         self.timings.add("range_limit", started)
+        if self.config.pre_pad:
+            x0 = round(self.config.pre_pad * self.config.final_scale)
+            y0 = round(self.config.pre_pad * self.config.final_scale)
+            x1 = x0 + round(original_width * self.config.final_scale)
+            y1 = y0 + round(original_height * self.config.final_scale)
+            final = final[:, :, y0:y1, x0:x1]
         final = final.clamp(0, 1).permute(0, 2, 3, 1).contiguous().cpu().numpy().astype(np.float32)
         return list(final)
 

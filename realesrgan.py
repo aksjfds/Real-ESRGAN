@@ -47,7 +47,13 @@ from basicsr.archs.rrdbnet_arch import RRDBNet
 from enhance.analysis import SourceAnalyzer, run_getnative
 from enhance.pipeline import DescaleBackend, FrameEnhancementPipeline, PipelineConfig
 from enhance.srvgg_enhanced import EnhancedSRVGGNetCompact, assert_no_extra_state
-from enhance.tiles import TileProcessor, axis_starts
+from enhance.tiles import (
+    TileProcessor,
+    axis_starts,
+    full_frame_dehalo,
+    full_frame_lanczos,
+    full_frame_range_limit,
+)
 
 
 MODEL_URLS = {
@@ -92,9 +98,6 @@ class WorkerConfig:
     model_name: str
     model_paths: Tuple[str, ...]
     denoise_strength: float
-    preprocess_backend: str
-    preprocess_strength: float
-    preprocess_model_path: str
     tta_mode: str
     tta_batch_size: int
     shift_ensemble: str
@@ -105,11 +108,6 @@ class WorkerConfig:
     residual_edge_low: float
     residual_edge_high: float
     base_correction: float
-    cugan_ensemble: bool
-    cugan_model_path: str
-    cugan_alpha: float
-    cugan_global_weight: float
-    cugan_mask_mode: str
     back_projection_iterations: int
     back_projection_strength: float
     back_projection_kernel: str
@@ -205,13 +203,18 @@ def probe_encoder_runtime(
     width: int,
     height: int,
     encode_gpu: int,
+    video_filters: Sequence[str] = (),
 ) -> None:
-    """Open the selected encoder at the real output size before model startup."""
+    """Open the complete filter/encoder graph at the real output size."""
     command = [
         ffmpeg_bin,
         "-hide_banner",
         "-loglevel",
         "error",
+    ]
+    if video_filters:
+        command += ["-init_hw_device", "vulkan=anime4k", "-filter_hw_device", "anime4k"]
+    command += [
         "-f",
         "lavfi",
         "-i",
@@ -221,11 +224,15 @@ def probe_encoder_runtime(
         "-c:v",
         codec,
     ]
+    if video_filters:
+        command += ["-vf", ",".join(video_filters)]
     if codec in {"h264_nvenc", "hevc_nvenc"}:
         command += ["-gpu", str(encode_gpu)]
     command += ["-pix_fmt", pixel_format, "-f", "null", "-"]
     run_checked(command, f"{codec} runtime probe at {width}x{height}/{pixel_format}")
     print(f"[encoder] runtime OK: {codec}, {width}x{height}, {pixel_format}", flush=True)
+    if video_filters:
+        print("[anime4k] complete single-frame filter graph runtime OK", flush=True)
 
 
 def require_libplacebo(ffmpeg_bin: str) -> None:
@@ -438,9 +445,6 @@ def worker_main(
             model,
             device,
             PipelineConfig(
-                preprocess_backend=config.preprocess_backend,
-                preprocess_strength=config.preprocess_strength,
-                preprocess_model_path=config.preprocess_model_path,
                 tta_mode=config.tta_mode,
                 tta_batch_size=config.tta_batch_size,
                 shift_ensemble=config.shift_ensemble,
@@ -451,11 +455,6 @@ def worker_main(
                 residual_edge_low=config.residual_edge_low,
                 residual_edge_high=config.residual_edge_high,
                 base_correction=config.base_correction,
-                cugan_ensemble=config.cugan_ensemble,
-                cugan_model_path=config.cugan_model_path,
-                cugan_alpha=config.cugan_alpha,
-                cugan_global_weight=config.cugan_global_weight,
-                cugan_mask_mode=config.cugan_mask_mode,
                 back_projection_iterations=config.back_projection_iterations,
                 back_projection_strength=config.back_projection_strength,
                 back_projection_kernel=config.back_projection_kernel,
@@ -784,6 +783,10 @@ class RawVideoWriter:
             "-hide_banner",
             "-loglevel",
             "error",
+        ]
+        if video_filters:
+            command += ["-init_hw_device", "vulkan=anime4k", "-filter_hw_device", "anime4k"]
+        command += [
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -991,58 +994,29 @@ def apply_quality_preset(args: argparse.Namespace, argv: Sequence[str]) -> None:
     explicit = {item.split("=", 1)[0] for item in argv if item.startswith("--")}
     presets: Dict[str, Dict[str, object]] = {
         "baseline": {
-            "preprocess": "none",
             "tta": "none",
             "shift_ensemble": "none",
             "residual_mode": "official",
             "base_correction": 0.0,
-            "cugan_ensemble": False,
             "back_projection_iterations": 0,
             "dehalo_strength": 0.0,
             "range_limit": 0.0,
         },
         "safe": {
-            "preprocess": "none",
             "tta": "x8",
             "shift_ensemble": "none",
             "residual_mode": "official",
             "base_correction": 0.0,
-            "cugan_ensemble": False,
             "back_projection_iterations": 1,
             "dehalo_strength": 0.0,
             "range_limit": 0.1,
         },
-        "compressed-anime": {
-            "preprocess": "waifu2x",
-            "tta": "x8",
-            "residual_mode": "adaptive",
-            "back_projection_iterations": 1,
-            "dehalo_strength": 0.15,
-            "range_limit": 0.1,
-        },
-        "blurred-anime": {
-            "tta": "x8",
-            "residual_mode": "adaptive",
-            "back_projection_iterations": 1,
-            "range_limit": 0.1,
-        },
-        "max": {
-            "tta": "x8",
-            "shift_ensemble": "x4",
-            "cugan_ensemble": True,
-            "cugan_mask_mode": "adaptive",
-            "back_projection_iterations": 2,
-            "range_limit": 0.1,
-        },
     }
     option_names = {
-        "preprocess": "--preprocess",
         "tta": "--tta",
         "shift_ensemble": "--shift-ensemble",
         "residual_mode": "--residual-mode",
         "base_correction": "--base-correction",
-        "cugan_ensemble": "--cugan-ensemble",
-        "cugan_mask_mode": "--cugan-mask-mode",
         "back_projection_iterations": "--back-projection-iterations",
         "dehalo_strength": "--dehalo-strength",
         "range_limit": "--range-limit",
@@ -1073,12 +1047,14 @@ def anime4k_filters(args: argparse.Namespace) -> list[str]:
             "Anime4K requires explicit --anime4k-shaders filenames; preset names are not emulated"
         )
     root = Path(args.anime4k_shader_dir).expanduser().resolve()
-    filters = []
+    filters = ["format=yuv444p16le", "hwupload"]
     for name in (item.strip() for item in args.anime4k_shaders.split(",") if item.strip()):
         shader = (root / name).resolve()
         if root not in shader.parents or not shader.is_file():
             raise FileNotFoundError(f"Anime4K shader not found below shader directory: {shader}")
-        filters.append(f"libplacebo=custom_shader_path={shader}:custom_shader_bin=0")
+        shader_path = str(shader).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        filters.append(f"libplacebo=custom_shader_path='{shader_path}'")
+    filters += ["hwdownload", "format=yuv444p16le"]
     return filters
 
 
@@ -1112,23 +1088,12 @@ def validate_args(args: argparse.Namespace) -> None:
     native_kernels = [item.strip() for item in args.native_kernels.split(",") if item.strip()]
     if not native_kernels or any(item not in {"bilinear", "bicubic", "lanczos"} for item in native_kernels):
         raise ValueError("--native-kernels must be a non-empty comma-separated subset of bilinear,bicubic,lanczos")
-    if not 0 <= args.preprocess_strength <= 1:
-        raise ValueError("--preprocess-strength must be between 0 and 1")
     if args.tta_batch_size not in {1, 2, 4, 8}:
         raise ValueError("--tta-batch-size must be 1, 2, 4, or 8")
     if not 0 <= args.back_projection_iterations <= 3:
         raise ValueError("--back-projection-iterations must be between 0 and 3")
     if args.back_projection_strength < 0 or args.back_projection_clamp <= 0:
         raise ValueError("Back-projection strength must be non-negative and clamp positive")
-    if args.preprocess == "realcugan-1x" and args.cugan_ensemble:
-        raise ValueError("Real-CUGAN 1x preprocessing and 4x CUGAN ensemble cannot both be enabled")
-    if args.preprocess == "auto" and not args.preprocess_auto_apply:
-        print("[warning] preprocess=auto is report-only because --preprocess-auto-apply is disabled", flush=True)
-    if args.quality_preset == "blurred-anime" and args.preprocess not in {
-        "restormer-motion",
-        "restormer-defocus",
-    }:
-        raise ValueError("blurred-anime requires explicit Restormer motion or defocus preprocessing")
     if args.descale and args.native_height == 0 and args.native_analysis == "off":
         raise ValueError("--descale requires --native-height or native analysis")
     if args.descale and (args.input_width or args.input_height):
@@ -1144,8 +1109,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--residual-edge-high must be greater than --residual-edge-low")
     if min(args.residual_strength, args.residual_flat_strength, args.residual_edge_strength) < 0:
         raise ValueError("Residual strengths must be non-negative")
-    if not 0 <= args.cugan_global_weight <= 1:
-        raise ValueError("--cugan-global-weight must be between 0 and 1")
     if args.dehalo_radius < 1 or args.range_radius < 1:
         raise ValueError("Dehalo/range radii must be positive")
     if args.dehalo_strength < 0 or args.range_limit < 0:
@@ -1206,8 +1169,7 @@ def process_video(args: argparse.Namespace) -> None:
 
     analysis_rows = []
     native_analysis_elapsed = 0.0
-    effective_preprocess = args.preprocess
-    if args.native_analysis != "off" or args.preprocess == "auto":
+    if args.native_analysis != "off":
         analysis_started = time.monotonic()
         analysis_rows = SourceAnalyzer(args.ffmpeg_bin).analyze(
             input_path, info.width, info.height, start, duration, args.native_samples
@@ -1215,9 +1177,7 @@ def process_video(args: argparse.Namespace) -> None:
         for row in analysis_rows:
             print(f"[analysis] {json.dumps(asdict(row), sort_keys=True)}", flush=True)
         recommendation, reason = SourceAnalyzer.recommend(analysis_rows)
-        print(f"[analysis] preprocess_recommendation={recommendation}, reason={reason}", flush=True)
-        if args.preprocess == "auto":
-            effective_preprocess = recommendation if args.preprocess_auto_apply else "none"
+        print(f"[analysis] degradation_profile={recommendation}, reason={reason}", flush=True)
         native_analysis_elapsed = time.monotonic() - analysis_started
         print(f"[timing] native/degradation_analysis={native_analysis_elapsed:.2f}s", flush=True)
 
@@ -1311,14 +1271,8 @@ def process_video(args: argparse.Namespace) -> None:
         output_width,
         output_height,
         args.encode_gpu,
+        writer_filters,
     )
-
-    if effective_preprocess != "none":
-        raise RuntimeError(
-            f"Selected preprocessing backend {effective_preprocess!r} is not installed and verified in "
-            "this build. Disable it or install an explicitly supported official integration; "
-            "no substitute will be used."
-        )
 
     # Download/resolve the main checkpoint only after all inexpensive source,
     # capability and encoder checks have succeeded.
@@ -1328,9 +1282,6 @@ def process_video(args: argparse.Namespace) -> None:
         model_name=args.model,
         model_paths=model_paths,
         denoise_strength=args.denoise_strength,
-        preprocess_backend=effective_preprocess,
-        preprocess_strength=args.preprocess_strength,
-        preprocess_model_path=args.preprocess_model_path,
         tta_mode=args.tta,
         tta_batch_size=args.tta_batch_size,
         shift_ensemble=args.shift_ensemble,
@@ -1341,32 +1292,33 @@ def process_video(args: argparse.Namespace) -> None:
         residual_edge_low=args.residual_edge_low,
         residual_edge_high=args.residual_edge_high,
         base_correction=args.base_correction,
-        cugan_ensemble=args.cugan_ensemble,
-        cugan_model_path=args.cugan_model_path,
-        cugan_alpha=args.cugan_alpha,
-        cugan_global_weight=args.cugan_global_weight,
-        cugan_mask_mode=args.cugan_mask_mode,
         back_projection_iterations=args.back_projection_iterations,
         back_projection_strength=args.back_projection_strength,
         back_projection_kernel=args.back_projection_kernel,
         back_projection_clamp=args.back_projection_clamp,
         native_scale=native_model_scale,
-        final_scale=args.scale,
+        # Tile workers always return their native model scale.  The parent
+        # stitches that complete 4× frame before one global Lanczos resize.
+        final_scale=native_model_scale if args.tile_size else args.scale,
         tile_size=args.tile_size,
         tile_pad=args.tile_pad,
-        pre_pad=args.pre_pad,
+        pre_pad=0 if args.tile_size else args.pre_pad,
         batch_size=args.batch_size,
         fp16=effective_fp16,
         channels_last=effective_channels_last,
-        dehalo_strength=args.dehalo_strength,
+        dehalo_strength=0.0 if args.tile_size else args.dehalo_strength,
         dehalo_radius=args.dehalo_radius,
-        range_limit=args.range_limit,
+        range_limit=0.0 if args.tile_size else args.range_limit,
         range_radius=args.range_radius,
         overshoot=args.overshoot,
         undershoot=args.undershoot,
     )
     tile_processor = TileProcessor(
-        args.tile_size, args.tile_pad, args.pre_pad, args.scale, args.tile_verify_coverage
+        args.tile_size,
+        args.tile_pad,
+        args.pre_pad,
+        native_model_scale,
+        args.tile_verify_coverage,
     )
 
     mode = "timed test" if args.test_seconds > 0 else "selected/full range"
@@ -1389,11 +1341,11 @@ def process_video(args: argparse.Namespace) -> None:
     shift_count = {"none": 1, "x2": 2, "x4": 4}[args.shift_ensemble]
     print(
         f"[pipeline] model={args.model}, weight={model_paths[0]}, strict_load=True, "
-        f"native_scale={native_model_scale}, final_scale={args.scale:g}, preprocess={effective_preprocess}, "
+        f"native_scale={native_model_scale}, final_scale={args.scale:g}, "
         f"descale={'on' if args.descale else 'off'}, native_kernel={selected_native_kernel}, "
         f"tta={tta_count}, shift={shift_count}, model_calls={tta_count * shift_count}, "
         f"residual={args.residual_mode}, base_correction={args.base_correction:g}, "
-        f"cugan={args.cugan_ensemble}, back_projection={args.back_projection_iterations}, "
+        f"back_projection={args.back_projection_iterations}, "
         f"internal=fp32/fp16-model, raw=rgb48le, encode_pix_fmt={output_pix_fmt}, "
         f"anime4k_shaders={args.anime4k_shaders or 'none'}",
         flush=True,
@@ -1408,12 +1360,13 @@ def process_video(args: argparse.Namespace) -> None:
         )
     else:
         stride = args.tile_size
-        tile_count = len(axis_starts(input_width, args.tile_size)) * len(
-            axis_starts(input_height, args.tile_size)
+        tile_count = len(axis_starts(input_width + 2 * args.pre_pad, args.tile_size)) * len(
+            axis_starts(input_height + 2 * args.pre_pad, args.tile_size)
         )
         print(
             f"[tiles] size={args.tile_size}, tile_pad={args.tile_pad}, pre_pad={args.pre_pad}, "
-            f"stride={stride}, direct_stitch=True, "
+            f"stride={stride}, global_prepad=True, native_stitch_scale={native_model_scale}, "
+            f"full_frame_lanczos={args.scale != native_model_scale}, direct_stitch=True, "
             f"tiles_per_frame={tile_count}, batch_per_gpu={args.batch_size}, "
             f"channels_last={effective_channels_last}",
             flush=True,
@@ -1431,14 +1384,11 @@ def process_video(args: argparse.Namespace) -> None:
         "descale": 0.0,
         "decode": 0.0,
         "inference": 0.0,
-        "preprocess": 0.0,
         "tta": 0.0,
         "shift_ensemble": 0.0,
         "realesrgan": 0.0,
         "residual_control": 0.0,
         "base_correction": 0.0,
-        "realcugan": 0.0,
-        "ensemble_fusion": 0.0,
         "back_projection": 0.0,
         "lanczos": 0.0,
         "tile_crop_stitch": 0.0,
@@ -1544,6 +1494,27 @@ def process_video(args: argparse.Namespace) -> None:
                         timings["tile_crop_stitch"] = timings.get("tile_crop_stitch", 0.0) + (
                             time.monotonic() - stage_started
                         )
+                        if args.scale != native_model_scale:
+                            stage_started = time.monotonic()
+                            output = full_frame_lanczos(
+                                output,
+                                output_width,
+                                output_height,
+                            )
+                            timings["lanczos"] += time.monotonic() - stage_started
+                        stage_started = time.monotonic()
+                        output = full_frame_dehalo(output, args.dehalo_strength, args.dehalo_radius)
+                        timings["dehalo"] += time.monotonic() - stage_started
+                        stage_started = time.monotonic()
+                        output = full_frame_range_limit(
+                            output,
+                            frame.astype(np.float32) / 255.0,
+                            args.range_limit,
+                            args.range_radius,
+                            args.overshoot,
+                            args.undershoot,
+                        )
+                        timings["range_limit"] += time.monotonic() - stage_started
                         stage_started = time.monotonic()
                         writer.write(output)
                         timings["float_to_rgb48"] += time.monotonic() - stage_started
@@ -1629,7 +1600,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scale", type=float, default=2.0, help="Final output scale")
     parser.add_argument(
         "--quality-preset",
-        choices=("baseline", "safe", "compressed-anime", "blurred-anime", "max"),
+        choices=("baseline", "safe"),
         default="safe",
     )
     parser.add_argument(
@@ -1666,25 +1637,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--descale", action=argparse.BooleanOptionalAction, default=False)
 
-    parser.add_argument(
-        "--preprocess",
-        choices=(
-            "none",
-            "auto",
-            "waifu2x",
-            "swinir-jpeg",
-            "scunet",
-            "restormer-motion",
-            "restormer-defocus",
-            "realcugan-1x",
-        ),
-        default="none",
-    )
-    parser.add_argument("--preprocess-strength", type=float, default=1.0)
-    parser.add_argument("--preprocess-model-path", default="")
-    parser.add_argument("--preprocess-auto-apply", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--scunet-model", choices=("psnr", "gan"), default="psnr")
-
     parser.add_argument("--tta", choices=("none", "x8"), default="x8")
     parser.add_argument("--tta-batch-size", type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument("--shift-ensemble", choices=("none", "x2", "x4"), default="none")
@@ -1695,13 +1647,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--residual-edge-low", type=float, default=0.05)
     parser.add_argument("--residual-edge-high", type=float, default=0.20)
     parser.add_argument("--base-correction", type=float, default=0.0)
-
-    parser.add_argument("--cugan-ensemble", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--cugan-model-path", default="")
-    parser.add_argument("--cugan-scale", type=int, choices=(4,), default=4)
-    parser.add_argument("--cugan-alpha", type=float, default=1.0)
-    parser.add_argument("--cugan-global-weight", type=float, default=0.25)
-    parser.add_argument("--cugan-mask-mode", choices=("fixed", "adaptive"), default="adaptive")
 
     parser.add_argument("--back-projection-iterations", type=int, default=1)
     parser.add_argument("--back-projection-strength", type=float, default=0.2)
@@ -1718,9 +1663,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--anime4k", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--anime4k-shader-dir", default="")
-    parser.add_argument(
-        "--anime4k-preset", choices=("none", "line", "line-deblur", "resample-fix", "custom"), default="none"
-    )
     parser.add_argument("--anime4k-strength", type=float, default=1.0)
     parser.add_argument("--anime4k-shaders", default="")
     parser.add_argument(
