@@ -8,7 +8,7 @@ from .basicvsrpp import (
     BasicVSRPlusPlusNet,
 )
 from .pipeline import FrameEnhancementPipeline, PipelineConfig
-from .srvgg_enhanced import EnhancedSRVGGNetCompact, SRVGGComponents
+from .srvgg import SRVGGNetCompact, assert_no_extra_state
 
 __all__ = [
     "BASICVSRPP_TRACK_URLS",
@@ -16,8 +16,8 @@ __all__ = [
     "BasicVSRPPPreprocessor",
     "BasicVSRPPStreamReader",
     "BasicVSRPlusPlusNet",
-    "EnhancedSRVGGNetCompact",
     "FrameEnhancementPipeline",
     "PipelineConfig",
-    "SRVGGComponents",
+    "SRVGGNetCompact",
+    "assert_no_extra_state",
 ]

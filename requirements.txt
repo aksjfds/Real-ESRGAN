@@ -4,4 +4,3 @@
 # BasicVSR++ uses the existing matched torchvision.ops.deform_conv2d build.
 basicsr==1.4.2
 tqdm>=4.66,<5
-pytest>=8,<10
