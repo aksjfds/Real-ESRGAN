@@ -6,17 +6,14 @@ Use POSIX shared memory when there is ample capacity and transparently fall back
 to a persistent file-backed mmap otherwise. Both paths avoid Queue pickling of
 frame/tile arrays.
 
-The repository contains a top-level ``realesrgan.py`` runner while the installed
-official project exposes the ``realesrgan`` package used by ``enhance.srvgg``.
-Keep those two modules under different names: import the official package after
-temporarily removing the repository directory from ``sys.path``, then load the
-local runner as ``_realesrgan_local_runner`` and inject it only into the fast
-runner's ``base`` reference.
+The repository has a top-level ``realesrgan.py`` runner.  Load that adjacent
+file explicitly as the ``realesrgan`` module before importing
+``realesrgan_fast``.  The project now vendors SRVGGNetCompact locally, so no
+separate installable ``realesrgan`` package is required or expected.
 """
 
 from __future__ import annotations
 
-import importlib
 import importlib.util
 import os
 import shutil
@@ -29,64 +26,31 @@ import numpy as np
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parent
-_LOCAL_RUNNER_NAME = "_realesrgan_local_runner"
 
 
-def _resolved_path(entry: str) -> Path:
-    """Resolve one sys.path entry, including the empty current-directory entry."""
-    return Path(entry or os.getcwd()).resolve()
-
-
-def _import_official_realesrgan() -> ModuleType:
-    """Import the installed ``realesrgan`` package without local-file shadowing."""
-    existing = sys.modules.get("realesrgan")
-    if existing is not None and hasattr(existing, "__path__"):
-        return existing
-    if existing is not None:
-        del sys.modules["realesrgan"]
-
-    original_path = list(sys.path)
-    try:
-        sys.path[:] = [
-            entry
-            for entry in original_path
-            if _resolved_path(entry) != _REPOSITORY_ROOT
-        ]
-        importlib.invalidate_caches()
-        package = importlib.import_module("realesrgan")
-    finally:
-        sys.path[:] = original_path
-
-    if not hasattr(package, "__path__"):
-        raise ImportError(
-            "The installed 'realesrgan' import is not a package. "
-            "Reinstall the repository requirements before running the notebook."
-        )
-    try:
-        importlib.import_module("realesrgan.archs.srvgg_arch")
-    except ModuleNotFoundError as error:
-        raise ImportError(
-            "The installed Real-ESRGAN package does not provide "
-            "realesrgan.archs.srvgg_arch. Reinstall requirements."
-        ) from error
-    return package
-
-
-def _load_local_runner() -> ModuleType:
-    """Load the adjacent runner under a private name, never as ``realesrgan``."""
+def _load_local_realesrgan() -> ModuleType:
+    """Load the adjacent CLI/video runner without relying on import search order."""
     module_path = _REPOSITORY_ROOT / "realesrgan.py"
     if not module_path.is_file():
         raise FileNotFoundError(f"Local Real-ESRGAN runner not found: {module_path}")
 
-    spec = importlib.util.spec_from_file_location(_LOCAL_RUNNER_NAME, module_path)
+    spec = importlib.util.spec_from_file_location("realesrgan", module_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Unable to create an import spec for {module_path}")
 
     module = importlib.util.module_from_spec(spec)
-    sys.modules[_LOCAL_RUNNER_NAME] = module
+    # Register before execution so dataclasses and spawned workers can resolve
+    # the defining module while the file is being imported.
+    sys.modules["realesrgan"] = module
     spec.loader.exec_module(module)
 
-    required = ("build_parser", "process_video", "PersistentWorkers", "TileProcessor")
+    required = (
+        "build_parser",
+        "process_video",
+        "PersistentWorkers",
+        "TileProcessor",
+        "WorkerConfig",
+    )
     missing = [name for name in required if not hasattr(module, name)]
     if missing:
         raise ImportError(
@@ -95,16 +59,12 @@ def _load_local_runner() -> ModuleType:
     return module
 
 
-_OFFICIAL_PACKAGE = _import_official_realesrgan()
-_LOCAL_BASE = _load_local_runner()
+_LOCAL_BASE = _load_local_realesrgan()
 
-import realesrgan_fast as fast  # noqa: E402
+import realesrgan_fast as fast  # noqa: E402  (requires local-module bootstrap)
 
-# ``realesrgan_fast`` imports the official package at module import time because
-# that package must retain its public name for enhance.srvgg. Only its runtime
-# dependency is replaced with the adjacent CLI/video runner.
+# Be explicit even though realesrgan_fast imported the same sys.modules entry.
 fast.base = _LOCAL_BASE
-
 
 _original_shared_array_init = fast.SharedArray.__init__
 
