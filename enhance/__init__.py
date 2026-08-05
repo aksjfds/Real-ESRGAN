@@ -2,16 +2,15 @@
 
 import sys
 
-from . import basicvsrpp_stage2 as _basicvsrpp_stage2
+from . import basicvsrpp_stage2_guard as _basicvsrpp_stage2_guard
 
 # Keep the public BasicVSR++ import path stable while routing runtime
-# composition through the quality-preserving stage-two wrapper. The wrapper
-# keeps the original network/checkpoint and stage-one spatial/temporal fusion,
-# then auto-selects only geometry that is at least as strong as the prior
-# 7-frame/512-tile quality baseline.
-sys.modules[f"{__name__}.basicvsrpp"] = _basicvsrpp_stage2
+# composition through the quality-preserving stage-two wrapper and its
+# full-runtime-memory safety guard. The original network/checkpoint and the
+# stage-one spatial/temporal fusion remain unchanged.
+sys.modules[f"{__name__}.basicvsrpp"] = _basicvsrpp_stage2_guard
 
-from .basicvsrpp_stage2 import (
+from .basicvsrpp_stage2_guard import (
     BASICVSRPP_TRACK_URLS,
     BasicVSRPPConfig,
     BasicVSRPPPreprocessor,
