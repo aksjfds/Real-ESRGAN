@@ -1,8 +1,10 @@
 """Quality-oriented runtime wrapper for the BasicVSR++ video preprocessor.
 
 The underlying network, checkpoint loader, and tensor normalization remain in
-``enhance/basicvsrpp.py``. This wrapper only replaces the spatial tile scheduler,
-tile overlap composition, temporal clip composition, and scene-cut score.
+``enhance/basicvsrpp.py``. This wrapper replaces only spatial tile scheduling,
+overlap composition, temporal clip composition, scene-cut scoring, and device
+scheduling. Model topology, checkpoint parameters, clip geometry, and blend
+weights are unchanged.
 """
 
 from __future__ import annotations
@@ -12,6 +14,8 @@ import math
 import sys
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Deque, Optional, Sequence
 
@@ -20,21 +24,15 @@ import numpy as np
 import torch
 
 
-# Load the original implementation under a private module name. ``enhance``
-# aliases ``enhance.basicvsrpp`` to this wrapper in its package initializer, so
-# importing the original by its public name would recurse.
 _LEGACY_PATH = Path(__file__).resolve().with_name("basicvsrpp.py")
 _LEGACY_NAME = "enhance._basicvsrpp_legacy"
 _spec = importlib.util.spec_from_file_location(_LEGACY_NAME, _LEGACY_PATH)
-if _spec is None or _spec.loader is None:  # pragma: no cover - import failure
+if _spec is None or _spec.loader is None:  # pragma: no cover
     raise ImportError(f"Unable to load the BasicVSR++ implementation at {_LEGACY_PATH}")
 _legacy = importlib.util.module_from_spec(_spec)
 sys.modules[_LEGACY_NAME] = _legacy
 _spec.loader.exec_module(_legacy)
 
-# Preserve every public symbol from the original module unless it is replaced
-# below. Existing imports and checkpoint-related utilities therefore keep the
-# same API.
 for _name, _value in vars(_legacy).items():
     if not _name.startswith("_"):
         globals()[_name] = _value
@@ -80,7 +78,165 @@ def _axis_weight(
 
 
 class BasicVSRPPPreprocessor(_legacy.BasicVSRPPPreprocessor):
-    """BasicVSR++ preprocessor with overlap-add spatial tile composition."""
+    """Multi-GPU BasicVSR++ with GPU-resident overlap-add tile composition."""
+
+    def __init__(
+        self,
+        config: object,
+        checkpoint_dir: Optional[Path] = None,
+        model: Optional[torch.nn.Module] = None,
+        gpu_ids: Optional[Sequence[int]] = None,
+    ):
+        super().__init__(config, checkpoint_dir=checkpoint_dir, model=model)
+
+        if model is not None or self.device.type != "cuda":
+            selected = [self.device.index] if self.device.type == "cuda" else []
+        elif gpu_ids is None:
+            selected = list(range(torch.cuda.device_count()))
+        else:
+            selected = [int(gpu_id) for gpu_id in gpu_ids]
+        selected = list(dict.fromkeys(gpu_id for gpu_id in selected if gpu_id is not None))
+        primary = int(self.device.index) if self.device.index is not None else 0
+        if primary in selected:
+            selected.remove(primary)
+        selected.insert(0, primary)
+        for gpu_id in selected:
+            if gpu_id < 0 or gpu_id >= torch.cuda.device_count():
+                raise ValueError(
+                    f"BasicVSR++ requested cuda:{gpu_id}, but {torch.cuda.device_count()} GPU(s) are visible"
+                )
+
+        self._extra_runners: list[_legacy.BasicVSRPPPreprocessor] = []
+        for gpu_id in selected[1:]:
+            replica_config = replace(config, gpu_id=gpu_id)
+            replica = _legacy.BasicVSRPPPreprocessor(
+                replica_config,
+                checkpoint_dir=checkpoint_dir,
+            )
+            self._extra_runners.append(replica)
+        self._runners: list[_legacy.BasicVSRPPPreprocessor] = [self, *self._extra_runners]
+        self._executor = (
+            ThreadPoolExecutor(max_workers=len(self._runners), thread_name_prefix="basicvsrpp-gpu")
+            if len(self._runners) > 1
+            else None
+        )
+        self._device_weight_cache: dict[tuple[object, ...], torch.Tensor] = {}
+        self._closed = False
+
+        self.model_gpu_seconds = 0.0
+        self.gpu_blend_seconds = 0.0
+        self.d2h_seconds = 0.0
+        self.cpu_reduce_seconds = 0.0
+        self.parallel_wall_seconds = 0.0
+        print(
+            "[basicvsrpp] spatial tile devices="
+            + ",".join(f"cuda:{runner.device.index}" for runner in self._runners),
+            flush=True,
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=False)
+        for runner in self._extra_runners:
+            runner.close()
+        print(
+            "[basicvsrpp timing] "
+            f"parallel_wall={self.parallel_wall_seconds:.1f}s, "
+            f"model_gpu_sum={self.model_gpu_seconds:.1f}s, "
+            f"gpu_blend_sum={self.gpu_blend_seconds:.1f}s, "
+            f"d2h={self.d2h_seconds:.1f}s, "
+            f"cpu_reduce={self.cpu_reduce_seconds:.1f}s",
+            flush=True,
+        )
+        super().close()
+
+    def _device_weight(
+        self,
+        runner: _legacy.BasicVSRPPPreprocessor,
+        key: tuple[object, ...],
+        spatial_weight: np.ndarray,
+    ) -> torch.Tensor:
+        cache_key = (runner.device.index, *key)
+        weight = self._device_weight_cache.get(cache_key)
+        if weight is None:
+            weight = torch.from_numpy(spatial_weight).to(
+                runner.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            ).view(1, 1, 1, spatial_weight.shape[0], spatial_weight.shape[1])
+            self._device_weight_cache[cache_key] = weight
+        return weight
+
+    def _run_lane(
+        self,
+        runner: _legacy.BasicVSRPPPreprocessor,
+        clip: torch.Tensor,
+        jobs: Sequence[tuple[object, ...]],
+    ) -> tuple[torch.Tensor, torch.Tensor, float, float, float]:
+        _n, _t, _c, height, width = clip.shape
+        device = runner.device
+        result = torch.zeros(clip.shape, dtype=torch.float32, device=device)
+        weight_sum = torch.zeros((height, width), dtype=torch.float32, device=device)
+        model_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        lane_start = torch.cuda.Event(enable_timing=True)
+        lane_end = torch.cuda.Event(enable_timing=True)
+
+        with torch.cuda.device(device):
+            lane_start.record()
+            for job in jobs:
+                (
+                    tile_index,
+                    y_index,
+                    x_index,
+                    y0,
+                    y1,
+                    x0,
+                    x1,
+                    context_y0,
+                    context_y1,
+                    context_x0,
+                    context_x1,
+                    spatial_weight,
+                ) = job
+                patch = clip[..., context_y0:context_y1, context_x0:context_x1]
+                model_start = torch.cuda.Event(enable_timing=True)
+                model_end = torch.cuda.Event(enable_timing=True)
+                model_start.record()
+                enhanced = runner._run_model(patch)
+                model_end.record()
+                model_events.append((model_start, model_end))
+
+                crop_y0 = y0 - context_y0
+                crop_x0 = x0 - context_x0
+                core_height = y1 - y0
+                core_width = x1 - x0
+                core = enhanced[
+                    ...,
+                    crop_y0 : crop_y0 + core_height,
+                    crop_x0 : crop_x0 + core_width,
+                ]
+                weight = self._device_weight(
+                    runner,
+                    (height, width, tile_index, y_index, x_index),
+                    spatial_weight,
+                )
+                result[..., y0:y1, x0:x1].add_(core.float() * weight)
+                weight_sum[y0:y1, x0:x1].add_(weight[0, 0, 0])
+            lane_end.record()
+            torch.cuda.synchronize(device)
+
+        lane_gpu_seconds = lane_start.elapsed_time(lane_end) / 1000.0
+        model_seconds = sum(start.elapsed_time(end) for start, end in model_events) / 1000.0
+        blend_seconds = max(0.0, lane_gpu_seconds - model_seconds)
+
+        transfer_started = time.monotonic()
+        result_cpu = result.cpu()
+        weight_cpu = weight_sum.cpu()
+        d2h_seconds = time.monotonic() - transfer_started
+        return result_cpu, weight_cpu, model_seconds, blend_seconds, d2h_seconds
 
     def _enhance_tensor(self, clip: torch.Tensor) -> torch.Tensor:
         _n, _t, _c, height, width = clip.shape
@@ -103,35 +259,71 @@ class BasicVSRPPPreprocessor(_legacy.BasicVSRPPPreprocessor):
             for index, (start, end) in enumerate(zip(y_starts, y_ends))
         ]
 
-        result = torch.zeros_like(clip, dtype=torch.float32, device="cpu")
-        weight_sum = torch.zeros((height, width), dtype=torch.float32, device="cpu")
-
+        jobs: list[tuple[object, ...]] = []
+        tile_index = 0
         for y_index, (y0, y1) in enumerate(zip(y_starts, y_ends)):
             context_y0 = max(0, y0 - context)
             context_y1 = min(height, y1 + context)
             for x_index, (x0, x1) in enumerate(zip(x_starts, x_ends)):
                 context_x0 = max(0, x0 - context)
                 context_x1 = min(width, x1 + context)
-                patch = clip[..., context_y0:context_y1, context_x0:context_x1]
-                enhanced = self._run_model(patch).cpu()
-                crop_y0 = y0 - context_y0
-                crop_x0 = x0 - context_x0
-                core_height = y1 - y0
-                core_width = x1 - x0
-                core = enhanced[
-                    ...,
-                    crop_y0 : crop_y0 + core_height,
-                    crop_x0 : crop_x0 + core_width,
-                ]
                 spatial_weight = np.multiply.outer(y_weights[y_index], x_weights[x_index])
-                weight = torch.from_numpy(spatial_weight).view(1, 1, 1, core_height, core_width)
-                result[..., y0:y1, x0:x1] += core.float() * weight
-                weight_sum[y0:y1, x0:x1] += weight[0, 0, 0]
-                self.tiles += 1
+                jobs.append(
+                    (
+                        tile_index,
+                        y_index,
+                        x_index,
+                        y0,
+                        y1,
+                        x0,
+                        x1,
+                        context_y0,
+                        context_y1,
+                        context_x0,
+                        context_x1,
+                        spatial_weight,
+                    )
+                )
+                tile_index += 1
+        self.tiles += len(jobs)
 
+        lanes: list[list[tuple[object, ...]]] = [[] for _ in self._runners]
+        lane_loads = [0 for _ in self._runners]
+        for job in sorted(
+            jobs,
+            key=lambda item: (item[8] - item[7]) * (item[10] - item[9]),
+            reverse=True,
+        ):
+            lane_index = min(range(len(lanes)), key=lane_loads.__getitem__)
+            lanes[lane_index].append(job)
+            lane_loads[lane_index] += (job[8] - job[7]) * (job[10] - job[9])
+
+        wall_started = time.monotonic()
+        if self._executor is None:
+            lane_results = [self._run_lane(self._runners[0], clip, lanes[0])]
+        else:
+            futures = [
+                self._executor.submit(self._run_lane, runner, clip, lane_jobs)
+                for runner, lane_jobs in zip(self._runners, lanes)
+                if lane_jobs
+            ]
+            lane_results = [future.result() for future in futures]
+        self.parallel_wall_seconds += time.monotonic() - wall_started
+
+        reduce_started = time.monotonic()
+        result = torch.zeros(clip.shape, dtype=torch.float32, device="cpu")
+        weight_sum = torch.zeros((height, width), dtype=torch.float32, device="cpu")
+        for partial, partial_weight, model_seconds, blend_seconds, d2h_seconds in lane_results:
+            result.add_(partial)
+            weight_sum.add_(partial_weight)
+            self.model_gpu_seconds += model_seconds
+            self.gpu_blend_seconds += blend_seconds
+            self.d2h_seconds += d2h_seconds
         if not torch.all(weight_sum > 0):
             raise RuntimeError("BasicVSR++ tile blending left uncovered output pixels")
-        return result / weight_sum.view(1, 1, 1, height, width)
+        result.div_(weight_sum.view(1, 1, 1, height, width))
+        self.cpu_reduce_seconds += time.monotonic() - reduce_started
+        return result
 
 
 def scene_difference(previous: np.ndarray, current: np.ndarray) -> float:
@@ -172,8 +364,6 @@ def scene_difference(previous: np.ndarray, current: np.ndarray) -> float:
 def _temporal_weights(length: int) -> np.ndarray:
     if length <= 1:
         return np.ones(length, dtype=np.float32)
-    # The offset Hann window has no zero endpoints, so segment boundaries and
-    # short tail clips remain numerically well-defined after normalization.
     return np.hanning(length + 2)[1:-1].astype(np.float32)
 
 
@@ -244,9 +434,6 @@ class BasicVSRPPStreamReader:
 
     def _finish_segment(self) -> None:
         if self.buffer_frames:
-            # A partial tail is only reprocessed when at least one of its frames
-            # has not yet appeared in a full clip. This avoids unnecessary
-            # duplicate predictions for a fully covered tail.
             if any(index not in self.accumulated for index in self.buffer_indices):
                 self._process_window(self.buffer_frames, self.buffer_indices)
             segment_end = self.buffer_indices[-1] + 1
@@ -299,6 +486,16 @@ __all__ = sorted(
     {
         name
         for name in globals()
-        if not name.startswith("_") and name not in {"cv2", "np", "torch", "math", "sys", "time"}
+        if not name.startswith("_")
+        and name
+        not in {
+            "cv2",
+            "np",
+            "torch",
+            "math",
+            "sys",
+            "time",
+            "ThreadPoolExecutor",
+        }
     }
 )
