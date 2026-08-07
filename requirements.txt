@@ -1,6 +1,11 @@
-# Fast video pipeline dependencies. Keep Kaggle's matched torch/torchvision CUDA build;
-# do not install the legacy
-# torch==2.1.0 pins from the upstream training requirements for this CLI.
+# Fast video pipeline dependencies. Keep AutoDL's matched torch/torchvision CUDA build;
+# do not install APISR's legacy torch/torchvision pins over the environment image.
 # BasicVSR++ uses the existing matched torchvision.ops.deform_conv2d build.
 basicsr==1.4.2
 tqdm>=4.66,<5
+
+# APISR 4x GRL paper-model runtime dependencies. These match the upstream APISR
+# versions while leaving torch/torchvision under the AutoDL environment's control.
+omegaconf==2.3.0
+fairscale==0.4.13
+timm==0.9.7
