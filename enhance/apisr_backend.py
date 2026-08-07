@@ -224,6 +224,16 @@ def install_apisr_backend(base: ModuleType) -> None:
                     flush=True,
                 )
                 args.channels_last = False
+            # GRL is substantially more memory hungry than the original
+            # compact Real-ESRGAN model. Let the AutoDL tuner fall back to
+            # 256px tiles and use a single pipeline slot so OOM recovery has a
+            # genuinely conservative configuration available.
+            runtime = sys.modules.get("enhance.autodl_runtime")
+            if runtime is not None:
+                if hasattr(runtime, "_MIN_QUALITY_TILE"):
+                    runtime._MIN_QUALITY_TILE = 256
+                if hasattr(runtime, "_PIPELINE_DEPTH"):
+                    runtime._PIPELINE_DEPTH = 1
             _ensure_apisr_source()
         original_process_video(args)
 
