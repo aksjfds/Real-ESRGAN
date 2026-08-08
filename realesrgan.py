@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Modular, float-first multi-GPU Real-ESRGAN video enhancement for Kaggle.
+"""Persistent multi-GPU, float-first Real-ESRGAN video enhancement.
 
-The parent process owns video decoding, direct tile stitching, progress reporting and
-encoding.  Exactly one persistent worker (and therefore one model copy) is
-created for every selected GPU.  Workers process fixed-size tiles in batches.
+This is the pure Real-ESRGAN video core used by the Kaggle fast runtime.  It
+handles video I/O, color metadata, model loading, direct tile stitching,
+Lanczos final resize, encoding and audio muxing.  Temporal pre-processing is
+intentionally not part of this Kaggle variant.
 """
 
 from __future__ import annotations
@@ -30,10 +31,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-# BasicSR 1.4.2 imports a module removed by newer torchvision releases.  Kaggle
-# images often contain such a newer torchvision, so provide the one symbol that
-# BasicSR needs before importing it.
-try:  # pragma: no cover - depends on the installed torchvision version
+# BasicSR 1.4.2 imports a module removed by newer torchvision releases.
+try:  # pragma: no cover - depends on installed torchvision
     import torchvision.transforms.functional_tensor  # noqa: F401
 except (ImportError, ModuleNotFoundError):  # pragma: no cover
     import torchvision.transforms.functional as _tv_functional
@@ -43,18 +42,9 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover
     sys.modules["torchvision.transforms.functional_tensor"] = _functional_tensor
 
 from basicsr.archs.rrdbnet_arch import RRDBNet
-from enhance.basicvsrpp import (
-    BasicVSRPPConfig,
-    BasicVSRPPPreprocessor,
-    BasicVSRPPStreamReader,
-)
 from enhance.pipeline import FrameEnhancementPipeline, PipelineConfig
 from enhance.srvgg import SRVGGNetCompact, assert_no_extra_state
-from enhance.tiles import (
-    TileProcessor,
-    axis_starts,
-    full_frame_lanczos,
-)
+from enhance.tiles import TileProcessor, axis_starts, full_frame_lanczos
 
 
 MODEL_URLS = {
@@ -144,12 +134,15 @@ def resolve_color_spec(info: VideoInfo, policy: str, hdr_policy: str) -> ColorSp
             primaries = "bt2020" if space.startswith("bt2020") else ("bt709" if info.height >= 720 else "smpte170m")
         if transfer is None:
             transfer = "bt709" if info.height >= 720 else "smpte170m"
-        if range_value in {"pc", "jpeg", "full"}:
-            range_value = "pc"
-        else:
-            range_value = "tv"
-        chroma = _known_color(info.chroma_location)
-        spec = ColorSpec(range_value, space, primaries, transfer, chroma, inferred=inferred)
+        range_value = "pc" if range_value in {"pc", "jpeg", "full"} else "tv"
+        spec = ColorSpec(
+            range_value,
+            space,
+            primaries,
+            transfer,
+            _known_color(info.chroma_location),
+            inferred=inferred,
+        )
     if spec.is_hdr and hdr_policy == "reject":
         raise ValueError(
             "HDR/BT.2020 input was detected. This Real-ESRGAN pipeline processes nonlinear RGB code values "
@@ -161,14 +154,13 @@ def resolve_color_spec(info: VideoInfo, policy: str, hdr_policy: str) -> ColorSp
 
 
 def color_filter_chain(spec: ColorSpec, output_pix_fmt: str) -> list[str]:
-    filters = [
+    return [
         f"setparams=range=pc:color_primaries={spec.primaries}:color_trc={spec.transfer}:colorspace=gbr",
         f"scale=in_range=pc:out_range={spec.range}:out_color_matrix={spec.scale_matrix}",
         f"format={output_pix_fmt}",
         f"setparams=range={spec.range}:color_primaries={spec.primaries}:"
         f"color_trc={spec.transfer}:colorspace={spec.space}",
     ]
-    return filters
 
 
 def color_output_args(spec: ColorSpec) -> list[str]:
@@ -215,10 +207,7 @@ def run_checked(command: Sequence[str], label: str) -> subprocess.CompletedProce
 
 def require_binary(name: str) -> None:
     if shutil.which(name) is None:
-        raise FileNotFoundError(
-            f"Required executable '{name}' was not found. Kaggle normally includes ffmpeg; "
-            "otherwise install it before running inference."
-        )
+        raise FileNotFoundError(f"Required executable '{name}' was not found.")
 
 
 def require_encoder(ffmpeg_bin: str, encoder: str) -> None:
@@ -242,6 +231,7 @@ def resolve_output_pix_fmt(ffmpeg_bin: str, codec: str, requested: str) -> str:
         "libx265": "yuv420p10le",
         "h264_nvenc": "yuv420p",
         "libx264": "yuv420p",
+        "libsvtav1": "yuv420p10le",
     }
     selected = defaults[codec] if requested == "auto" else requested
     supported = encoder_pixel_formats(ffmpeg_bin, codec)
@@ -252,14 +242,10 @@ def resolve_output_pix_fmt(ffmpeg_bin: str, codec: str, requested: str) -> str:
             f"Encoder {codec} does not advertise explicitly requested pixel format {selected}; "
             f"supported={sorted(supported)}"
         )
-    fallback = "yuv420p"
-    if fallback not in supported:
+    if "yuv420p" not in supported:
         raise RuntimeError(f"Encoder {codec} has no supported automatic 4:2:0 output format")
-    print(
-        f"[warning] {codec} does not advertise {selected}; auto falling back to {fallback}",
-        flush=True,
-    )
-    return fallback
+    print(f"[warning] {codec} does not advertise {selected}; auto falling back to yuv420p", flush=True)
+    return "yuv420p"
 
 
 def probe_encoder_runtime(
@@ -272,11 +258,9 @@ def probe_encoder_runtime(
     video_filters: Sequence[str],
     color_spec: ColorSpec,
 ) -> None:
-    """Open the same RGB48/filter/encoder graph used by the real writer."""
     command = [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
     command += [
-        "-f", "lavfi",
-        "-i", f"color=black:size={width}x{height}:rate=1,format=rgb48le",
+        "-f", "lavfi", "-i", f"color=black:size={width}x{height}:rate=1,format=rgb48le",
         "-frames:v", "1",
     ]
     if video_filters:
@@ -299,7 +283,6 @@ def parse_rate(value: str) -> Fraction:
 
 
 def parse_output_rate(value: str, source_rate: Fraction) -> Fraction:
-    """Resolve an output FPS value while preserving rational rates exactly."""
     normalized = str(value).strip().lower()
     if normalized in {"", "0", "auto", "source", "original"}:
         return source_rate
@@ -313,17 +296,12 @@ def parse_output_rate(value: str, source_rate: Fraction) -> Fraction:
 
 
 def probe_video(path: Path, ffprobe_bin: str) -> VideoInfo:
-    command = [
-        ffprobe_bin,
-        "-v",
-        "error",
-        "-print_format",
-        "json",
-        "-show_streams",
-        "-show_format",
-        str(path),
-    ]
-    data = json.loads(run_checked(command, "ffprobe").stdout)
+    data = json.loads(
+        run_checked(
+            [ffprobe_bin, "-v", "error", "-print_format", "json", "-show_streams", "-show_format", str(path)],
+            "ffprobe",
+        ).stdout
+    )
     video_streams = [item for item in data.get("streams", []) if item.get("codec_type") == "video"]
     if not video_streams:
         raise ValueError(f"No video stream found in {path}")
@@ -333,14 +311,13 @@ def probe_video(path: Path, ffprobe_bin: str) -> VideoInfo:
     if duration_value in {None, "N/A"}:
         raise ValueError("The input has no usable duration metadata.")
     frame_value = stream.get("nb_frames")
-    frames = int(frame_value) if frame_value not in {None, "N/A"} else None
     return VideoInfo(
         width=int(stream["width"]),
         height=int(stream["height"]),
         fps_num=rate.numerator,
         fps_den=rate.denominator,
         duration=float(duration_value),
-        frames=frames,
+        frames=int(frame_value) if frame_value not in {None, "N/A"} else None,
         has_audio=any(item.get("codec_type") == "audio" for item in data.get("streams", [])),
         color_range=_known_color(stream.get("color_range")),
         color_space=_known_color(stream.get("color_space")),
@@ -350,20 +327,14 @@ def probe_video(path: Path, ffprobe_bin: str) -> VideoInfo:
     )
 
 
-def resolve_range(
-    info: VideoInfo,
-    start: float,
-    test_seconds: float,
-    output_rate: Fraction,
-) -> Tuple[float, float, int]:
+def resolve_range(info: VideoInfo, start: float, test_seconds: float, output_rate: Fraction) -> Tuple[float, float, int]:
     if start < 0 or start >= info.duration:
         raise ValueError(f"--start-time must be in [0, {info.duration:.3f}).")
     available = info.duration - start
     duration = min(test_seconds, available) if test_seconds > 0 else available
     if duration <= 0:
         raise ValueError("Selected video range is empty.")
-    expected = max(1, int(round(duration * float(output_rate))))
-    return start, duration, expected
+    return start, duration, max(1, int(round(duration * float(output_rate))))
 
 
 def download_file(url: str, target: Path) -> Path:
@@ -393,7 +364,6 @@ def resolve_model_paths(args: argparse.Namespace) -> Tuple[str, ...]:
                 "Use the standard downloadable pair for DNI."
             )
         return (str(primary),)
-
     urls = MODEL_URLS[args.model]
     if args.model != "realesr-general-x4v3" or args.denoise_strength == 1.0:
         urls = urls[:1]
@@ -411,20 +381,16 @@ def build_model(name: str) -> Tuple[torch.nn.Module, int]:
     if name == "RealESRGAN_x2plus":
         return RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2), 2
     if name == "realesr-animevideov3":
-        return SRVGGNetCompact(
-            num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16, upscale=4, act_type="prelu"
-        ), 4
+        return SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16, upscale=4, act_type="prelu"), 4
     if name == "realesr-general-x4v3":
-        return SRVGGNetCompact(
-            num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type="prelu"
-        ), 4
+        return SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type="prelu"), 4
     raise ValueError(f"Unsupported model: {name}")
 
 
 def torch_load_cpu(path: str) -> Dict[str, object]:
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:  # PyTorch before weights_only was added
+    except TypeError:
         return torch.load(path, map_location="cpu")
 
 
@@ -446,8 +412,7 @@ def load_worker_model(config: WorkerConfig, device: torch.device) -> Tuple[torch
         state = {key: strength * value + (1.0 - strength) * weak_state[key] for key, value in state.items()}
     assert_no_extra_state(model, state)
     print(
-        f"[checkpoint] strict=True OK, model={config.model_name}, "
-        f"keys={len(state)}, path={config.model_paths[0]}",
+        f"[checkpoint] strict=True OK, model={config.model_name}, keys={len(state)}, path={config.model_paths[0]}",
         flush=True,
     )
     model.eval().requires_grad_(False)
@@ -485,11 +450,7 @@ def worker_main(
         pipeline = FrameEnhancementPipeline(
             model,
             device,
-            PipelineConfig(
-                native_scale=native_scale,
-                fp16=config.fp16,
-                channels_last=config.channels_last,
-            ),
+            PipelineConfig(native_scale=native_scale, fp16=config.fp16, channels_last=config.channels_last),
         )
         output_queue.put(("ready", worker_id, str(device)))
         while True:
@@ -499,8 +460,6 @@ def worker_main(
             job_type, job_id, indexed_patches = job
             results = []
             timing_before = pipeline.timing_snapshot()
-            # Full-frame jobs contain at most one frame per GPU.  Tile jobs use
-            # the configured batch size to improve Tensor Core occupancy.
             batch_size = config.batch_size if job_type == "tiles" else 1
             offset = 0
             while offset < len(indexed_patches):
@@ -513,17 +472,15 @@ def worker_main(
                 ):
                     chunk.append(indexed_patches[offset])
                     offset += 1
-                indices = [item[0] for item in chunk]
-                patches = [item[1] for item in chunk]
-                outputs = pipeline.enhance_batch(patches)
-                results.extend(zip(indices, outputs))
+                outputs = pipeline.enhance_batch([item[1] for item in chunk])
+                results.extend(zip([item[0] for item in chunk], outputs))
             timing_after = pipeline.timing_snapshot()
             timing_delta = {
                 name: timing_after.get(name, 0.0) - timing_before.get(name, 0.0)
                 for name in timing_after
             }
             output_queue.put((f"{job_type}_result", worker_id, job_id, results, timing_delta))
-    except Exception as error:  # send failures to the parent instead of hanging it
+    except Exception as error:
         output_queue.put(("error", worker_id, repr(error), traceback.format_exc()))
 
 
@@ -579,17 +536,7 @@ class PersistentWorkers:
         while received < worker_count:
             message = self.output_queue.get()
             if message[0] == "error":
-                if job_type == "frames":
-                    hint = (
-                        "\nFull-frame OOM fallback: use --tile-size 576 --tile-pad 16 --batch-size 2; "
-                        "then try tile-size 256 with batch 16, 8, or 4. Keep FP16 enabled."
-                    )
-                else:
-                    hint = (
-                        "\nTile OOM fallback: lower --batch-size first, then lower --tile-size. "
-                        "Keep FP16 enabled unless diagnosing a numerical issue."
-                    )
-                raise RuntimeError(f"Worker {message[1]} failed: {message[2]}\n{message[3]}{hint}")
+                raise RuntimeError(f"Worker {message[1]} failed: {message[2]}\n{message[3]}")
             if message[0] != f"{job_type}_result" or message[2] != job_id:
                 raise RuntimeError(f"Unexpected worker message: {message[0]}")
             merged.update(message[3])
@@ -642,22 +589,10 @@ class RawVideoReader:
         vf = f"scale={width}:{height}:flags=lanczos,fps={fps_rate}"
         command = [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
         if start > 0:
-            # Input-side seeking is still accurate while transcoding (ffmpeg's
-            # accurate_seek is enabled by default) and avoids decoding minutes
-            # of video before an arbitrary 10-second test range.
             command += ["-ss", f"{start:.6f}"]
         command += ["-i", str(input_path)]
         command += [
-            "-t",
-            f"{duration:.6f}",
-            "-vf",
-            vf,
-            "-an",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
+            "-t", f"{duration:.6f}", "-vf", vf, "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
         ]
         self.width = width
         self.height = height
@@ -698,71 +633,46 @@ class RawVideoWriter:
         preset: str,
         cq: int,
         nvenc_preset: str,
+        svtav1_preset: int,
         encode_gpu: int,
         output_pix_fmt: str,
         video_filters: Sequence[str],
         color_spec: ColorSpec,
     ) -> None:
-        command = [
-            ffmpeg_bin,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-        ]
+        command = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error"]
         command += [
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb48le",
-            "-s:v",
-            f"{width}x{height}",
-            "-r",
-            input_fps_rate,
-            "-i",
-            "pipe:0",
-            "-an",
+            "-f", "rawvideo", "-pix_fmt", "rgb48le", "-s:v", f"{width}x{height}",
+            "-r", input_fps_rate, "-i", "pipe:0", "-an",
         ]
         filters = list(video_filters)
         if output_fps_rate != input_fps_rate:
-            # Raising FPS duplicates already-enhanced frames here instead of
-            # running identical source frames through the model repeatedly.
             filters.append(f"fps={output_fps_rate}")
         if filters:
             command += ["-vf", ",".join(filters)]
         command += ["-c:v", codec]
         if codec in {"libx264", "libx265"}:
             command += ["-preset", preset, "-crf", str(crf)]
+        elif codec == "libsvtav1":
+            command += ["-preset", str(svtav1_preset), "-crf", str(crf)]
         else:
-            # NVENC runs on T4's dedicated encoder block.  CQ is the quality
-            # target; it is intentionally separate from software-codec CRF.
             command += [
-                "-gpu",
-                str(encode_gpu),
-                "-preset",
-                nvenc_preset,
-                "-tune",
-                "hq",
-                "-rc",
-                "vbr",
-                "-cq",
-                str(cq),
-                "-b:v",
-                "0",
-                "-multipass",
-                "fullres",
-                "-spatial_aq",
-                "1",
-                "-temporal_aq",
-                "1",
-                "-rc-lookahead",
-                "32",
-                "-bf",
-                "3",
+                "-gpu", str(encode_gpu),
+                "-preset", nvenc_preset,
+                "-tune", "hq",
+                "-rc", "vbr",
+                "-cq", str(cq),
+                "-b:v", "0",
+                "-multipass", "fullres",
+                "-spatial_aq", "1",
+                "-temporal_aq", "1",
+                "-rc-lookahead", "32",
+                "-bf", "3",
             ]
         command += ["-pix_fmt", output_pix_fmt, *color_output_args(color_spec)]
         if codec in {"libx265", "hevc_nvenc"}:
             command += ["-tag:v", "hvc1"]
+        elif codec == "libsvtav1":
+            command += ["-tag:v", "av01"]
         command.append(str(path))
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -829,53 +739,18 @@ def mux_audio(
     base = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", str(silent_video)]
     if audio_codec == "aac":
         command = base + [
-            "-ss",
-            f"{start:.6f}",
-            "-t",
-            f"{duration:.6f}",
-            "-i",
-            str(input_path),
-            "-filter_complex",
-            f"[1:a:0]atrim=start=0:duration={duration:.6f},asetpts=PTS-STARTPTS[a]",
-            "-map",
-            "0:v:0",
-            "-map",
-            "[a]",
-            "-map_metadata",
-            "1",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            audio_bitrate,
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(output_path),
+            "-ss", f"{start:.6f}", "-t", f"{duration:.6f}", "-i", str(input_path),
+            "-filter_complex", f"[1:a:0]atrim=start=0:duration={duration:.6f},asetpts=PTS-STARTPTS[a]",
+            "-map", "0:v:0", "-map", "[a]", "-map_metadata", "1",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", audio_bitrate,
+            "-shortest", "-movflags", "+faststart", str(output_path),
         ]
     else:
         command = base + [
-            "-ss",
-            f"{start:.6f}",
-            "-t",
-            f"{duration:.6f}",
-            "-i",
-            str(input_path),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-map_metadata",
-            "1",
-            "-c",
-            "copy",
-            "-shortest",
-            "-avoid_negative_ts",
-            "make_zero",
-            "-movflags",
-            "+faststart",
-            str(output_path),
+            "-ss", f"{start:.6f}", "-t", f"{duration:.6f}", "-i", str(input_path),
+            "-map", "0:v:0", "-map", "1:a:0", "-map_metadata", "1",
+            "-c", "copy", "-shortest", "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart", str(output_path),
         ]
     try:
         run_checked(command, "audio mux")
@@ -884,15 +759,8 @@ def mux_audio(
             raise
         print("[audio] stream copy failed; retrying with AAC for MP4 compatibility", flush=True)
         mux_audio(
-            silent_video,
-            input_path,
-            output_path,
-            ffmpeg_bin,
-            start,
-            duration,
-            has_audio,
-            "aac",
-            audio_bitrate,
+            silent_video, input_path, output_path, ffmpeg_bin, start, duration,
+            has_audio, "aac", audio_bitrate,
         )
 
 
@@ -914,16 +782,13 @@ def parse_gpu_ids(value: str) -> List[Optional[int]]:
 
 
 def apply_legacy_args(args: argparse.Namespace, argv: Sequence[str]) -> None:
-    """Map the removed overlap option without changing enhancement defaults."""
     explicit = {item.split("=", 1)[0] for item in argv if item.startswith("--")}
     if args.overlap is not None:
         if "--tile-pad" in explicit:
             raise ValueError("--overlap and --tile-pad cannot be supplied together")
         args.tile_pad = args.overlap
-        print(
-            "[deprecated] --overlap now maps to --tile-pad; no feather blending is performed",
-            flush=True,
-        )
+        print("[deprecated] --overlap now maps to --tile-pad; no feather blending is performed", flush=True)
+
 
 def validate_args(args: argparse.Namespace) -> None:
     if not 0 < args.scale <= 4:
@@ -936,7 +801,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--tile-pad must be less than half of --tile-size")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1.")
-    if not 0 <= args.crf <= 51:
+    if args.video_codec == "libsvtav1":
+        if not 0 <= args.crf <= 63:
+            raise ValueError("--crf must be between 0 and 63 for libsvtav1")
+        if not 0 <= args.svtav1_preset <= 13:
+            raise ValueError("--svtav1-preset must be between 0 and 13")
+    elif not 0 <= args.crf <= 51:
         raise ValueError("--crf must be between 0 and 51.")
     if not 0 <= args.cq <= 51:
         raise ValueError("--cq must be between 0 and 51.")
@@ -946,48 +816,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--denoise-strength must be between 0 and 1.")
     if args.progress_interval <= 0:
         raise ValueError("--progress-interval must be positive.")
-    if args.basicvsrpp:
-        if not torch.cuda.is_available():
-            raise RuntimeError("--basicvsrpp requires CUDA")
-        if args.basicvsrpp_gpu < 0 or args.basicvsrpp_gpu >= torch.cuda.device_count():
-            raise ValueError(
-                f"--basicvsrpp-gpu {args.basicvsrpp_gpu} is invalid; "
-                f"{torch.cuda.device_count()} CUDA device(s) are visible"
-            )
-        if args.basicvsrpp_clip_length < 2:
-            raise ValueError("--basicvsrpp-clip-length must be at least 2")
-        if not 0 <= args.basicvsrpp_clip_overlap < args.basicvsrpp_clip_length / 2:
-            raise ValueError(
-                "--basicvsrpp-clip-overlap must satisfy 0 <= overlap < clip_length/2"
-            )
-        if args.basicvsrpp_tile_size != 0 and (
-            args.basicvsrpp_tile_size < 256 or args.basicvsrpp_tile_size % 4
-        ):
-            raise ValueError(
-                "--basicvsrpp-tile-size must be 0 or at least 256 and divisible by 4"
-            )
-        if args.basicvsrpp_tile_pad < 0 or args.basicvsrpp_tile_pad % 4:
-            raise ValueError("--basicvsrpp-tile-pad must be non-negative and divisible by 4")
-        if (
-            args.basicvsrpp_tile_size
-            and args.basicvsrpp_tile_pad >= args.basicvsrpp_tile_size // 2
-        ):
-            raise ValueError("--basicvsrpp-tile-pad must be less than half of tile size")
-        if not 0.0 <= args.basicvsrpp_strength <= 1.0:
-            raise ValueError("--basicvsrpp-strength must be in [0,1]")
-        if args.basicvsrpp_scene_threshold < 0:
-            raise ValueError("--basicvsrpp-scene-threshold must be non-negative")
 
 
 def log_devices(gpu_ids: Sequence[Optional[int]], fp16: bool) -> None:
     for gpu_id in gpu_ids:
         if gpu_id is None:
-            print(f"[device] CPU, fp16=False", flush=True)
+            print("[device] CPU, fp16=False", flush=True)
         else:
             props = torch.cuda.get_device_properties(gpu_id)
-            memory_gib = props.total_memory / (1024**3)
             print(
-                f"[device] cuda:{gpu_id} {props.name}, memory={memory_gib:.1f} GiB, fp16={fp16}",
+                f"[device] cuda:{gpu_id} {props.name}, memory={props.total_memory / (1024**3):.1f} GiB, fp16={fp16}",
                 flush=True,
             )
 
@@ -998,7 +836,6 @@ def finalize_output_frame(
     output_height: int,
     timings: Dict[str, float],
 ) -> np.ndarray:
-    """Resize the stitched native 4x frame exactly once with Lanczos."""
     stage_started = time.monotonic()
     output = full_frame_lanczos(native_output, output_width, output_height)
     timings["lanczos"] += time.monotonic() - stage_started
@@ -1039,32 +876,21 @@ def process_video(args: argparse.Namespace) -> None:
     native_model_scale = 2 if args.model == "RealESRGAN_x2plus" else 4
     if args.scale > native_model_scale:
         raise ValueError(
-            f"Final scale {args.scale:g} exceeds model-native scale {native_model_scale}; "
-            "post-model enlargement is not allowed"
+            f"Final scale {args.scale:g} exceeds model-native scale {native_model_scale}; post-model enlargement is not allowed"
         )
 
     output_width = int(round(input_width * args.scale))
     output_height = int(round(input_height * args.scale))
     if output_width % 2 or output_height % 2:
         raise ValueError(
-            f"4:2:0 encoding needs even output dimensions, got {output_width}x{output_height}. "
-            "Adjust the selected dimensions or scale."
+            f"4:2:0 encoding needs even output dimensions, got {output_width}x{output_height}."
         )
     probe_encoder_runtime(
-        args.ffmpeg_bin,
-        args.video_codec,
-        output_pix_fmt,
-        output_width,
-        output_height,
-        args.encode_gpu,
-        writer_filters,
-        color_spec,
+        args.ffmpeg_bin, args.video_codec, output_pix_fmt, output_width, output_height,
+        args.encode_gpu, writer_filters, color_spec,
     )
 
-    # Download/resolve the main checkpoint only after all inexpensive source,
-    # capability and encoder checks have succeeded.
     model_paths = resolve_model_paths(args)
-
     config = WorkerConfig(
         model_name=args.model,
         model_paths=model_paths,
@@ -1075,10 +901,7 @@ def process_video(args: argparse.Namespace) -> None:
         channels_last=effective_channels_last,
     )
     tile_processor = TileProcessor(
-        args.tile_size,
-        args.tile_pad,
-        native_model_scale,
-        args.tile_verify_coverage,
+        args.tile_size, args.tile_pad, native_model_scale, args.tile_verify_coverage
     )
 
     mode = "timed test" if args.test_seconds > 0 else "selected/full range"
@@ -1100,8 +923,8 @@ def process_video(args: argparse.Namespace) -> None:
     print(
         f"[pipeline] model={args.model}, weight={model_paths[0]}, strict_load=True, "
         f"native_scale={native_model_scale}, final_scale={args.scale:g}, "
-        f"official_topology=True, fp32_recombine=True, model_calls=1, internal=fp32/fp16-model, "
-        f"raw=rgb48le, encode_pix_fmt={output_pix_fmt}",
+        f"official_topology=True, fp32_recombine=True, model_calls=1, "
+        f"internal=fp32/fp16-model, raw=rgb48le, encode_pix_fmt={output_pix_fmt}",
         flush=True,
     )
     print(
@@ -1110,49 +933,30 @@ def process_video(args: argparse.Namespace) -> None:
         f"transfer={color_spec.transfer}, chroma={color_spec.chroma_location or 'unspecified'}",
         flush=True,
     )
-    if args.basicvsrpp:
-        print(
-            f"[basicvsrpp] enabled, track={args.basicvsrpp_track}, gpu=cuda:{args.basicvsrpp_gpu}, "
-            f"fp16={args.basicvsrpp_fp16}, clip={args.basicvsrpp_clip_length}, "
-            f"overlap={args.basicvsrpp_clip_overlap}, tile={args.basicvsrpp_tile_size}, "
-            f"tile_pad={args.basicvsrpp_tile_pad}, strength={args.basicvsrpp_strength:g}, "
-            f"scene_threshold={args.basicvsrpp_scene_threshold:g}",
-            flush=True,
-        )
-    else:
-        print("[basicvsrpp] disabled", flush=True)
     if args.tile_size == 0:
         print(
-            f"[inference] full-frame mode, parallel_frames={len(gpu_ids)}, "
-            f"channels_last={effective_channels_last}",
+            f"[inference] full-frame mode, parallel_frames={len(gpu_ids)}, channels_last={effective_channels_last}",
             flush=True,
         )
     else:
-        stride = args.tile_size
-        tile_count = len(axis_starts(input_width, args.tile_size)) * len(
-            axis_starts(input_height, args.tile_size)
-        )
+        tile_count = len(axis_starts(input_width, args.tile_size)) * len(axis_starts(input_height, args.tile_size))
         print(
-            f"[tiles] size={args.tile_size}, tile_pad={args.tile_pad}, "
-            f"stride={stride}, native_stitch_scale={native_model_scale}, "
-            f"full_frame_lanczos={args.scale != native_model_scale}, direct_stitch=True, "
-            f"tiles_per_frame={tile_count}, batch_per_gpu={args.batch_size}, "
+            f"[tiles] size={args.tile_size}, tile_pad={args.tile_pad}, stride={args.tile_size}, "
+            f"native_stitch_scale={native_model_scale}, full_frame_lanczos={args.scale != native_model_scale}, "
+            f"direct_stitch=True, tiles_per_frame={tile_count}, batch_per_gpu={args.batch_size}, "
             f"channels_last={effective_channels_last}",
             flush=True,
         )
     log_devices(gpu_ids, effective_fp16)
 
-    reader: Optional[object] = None
-    basicvsrpp_reader: Optional[BasicVSRPPStreamReader] = None
+    reader: Optional[RawVideoReader] = None
     writer: Optional[RawVideoWriter] = None
     workers: Optional[PersistentWorkers] = None
     processed = 0
     started = time.monotonic()
     timings = {
         "model_startup": 0.0,
-        "basicvsrpp_startup": 0.0,
         "decode": 0.0,
-        "basicvsrpp": 0.0,
         "inference": 0.0,
         "realesrgan": 0.0,
         "lanczos": 0.0,
@@ -1167,34 +971,9 @@ def process_video(args: argparse.Namespace) -> None:
         workers = PersistentWorkers(gpu_ids, config)
         timings["model_startup"] += time.monotonic() - stage_started
         reader = RawVideoReader(
-            input_path,
-            args.ffmpeg_bin,
-            input_width,
-            input_height,
-            inference_fps_rate,
-            start,
-            duration,
+            input_path, args.ffmpeg_bin, input_width, input_height,
+            inference_fps_rate, start, duration,
         )
-        if args.basicvsrpp:
-            stage_started = time.monotonic()
-            preprocessor = BasicVSRPPPreprocessor(
-                BasicVSRPPConfig(
-                    track=args.basicvsrpp_track,
-                    model_path=args.basicvsrpp_model_path,
-                    gpu_id=args.basicvsrpp_gpu,
-                    fp16=args.basicvsrpp_fp16,
-                    clip_length=args.basicvsrpp_clip_length,
-                    clip_overlap=args.basicvsrpp_clip_overlap,
-                    tile_size=args.basicvsrpp_tile_size,
-                    tile_pad=args.basicvsrpp_tile_pad,
-                    strength=args.basicvsrpp_strength,
-                    scene_threshold=args.basicvsrpp_scene_threshold,
-                ),
-                checkpoint_dir=Path(__file__).resolve().parent / "weights",
-            )
-            basicvsrpp_reader = BasicVSRPPStreamReader(reader, preprocessor)
-            reader = basicvsrpp_reader
-            timings["basicvsrpp_startup"] += time.monotonic() - stage_started
         writer = RawVideoWriter(
             temporary_video,
             args.ffmpeg_bin,
@@ -1207,6 +986,7 @@ def process_video(args: argparse.Namespace) -> None:
             args.preset,
             args.cq,
             args.nvenc_preset,
+            args.svtav1_preset,
             args.encode_gpu,
             output_pix_fmt,
             writer_filters,
@@ -1231,9 +1011,7 @@ def process_video(args: argparse.Namespace) -> None:
                             if frame is None:
                                 break
                             indexed_frames.append((processed + len(indexed_frames), frame))
-                        read_elapsed = time.monotonic() - stage_started
-                        if basicvsrpp_reader is None:
-                            timings["decode"] += read_elapsed
+                        timings["decode"] += time.monotonic() - stage_started
                         if not indexed_frames:
                             break
                         stage_started = time.monotonic()
@@ -1241,10 +1019,7 @@ def process_video(args: argparse.Namespace) -> None:
                         timings["inference"] += time.monotonic() - stage_started
                         for frame_id, _reference_frame in indexed_frames:
                             output = finalize_output_frame(
-                                frame_outputs[frame_id],
-                                output_width,
-                                output_height,
-                                timings,
+                                frame_outputs[frame_id], output_width, output_height, timings
                             )
                             stage_started = time.monotonic()
                             writer.write(output)
@@ -1258,9 +1033,7 @@ def process_video(args: argparse.Namespace) -> None:
                     while True:
                         stage_started = time.monotonic()
                         frame = reader.read()
-                        read_elapsed = time.monotonic() - stage_started
-                        if basicvsrpp_reader is None:
-                            timings["decode"] += read_elapsed
+                        timings["decode"] += time.monotonic() - stage_started
                         if frame is None:
                             break
                         patches, tile_infos = tile_processor.split(frame)
@@ -1271,15 +1044,8 @@ def process_video(args: argparse.Namespace) -> None:
                         output = tile_processor.stitch(
                             tile_outputs, tile_infos, input_width, input_height
                         )
-                        timings["tile_crop_stitch"] = timings.get("tile_crop_stitch", 0.0) + (
-                            time.monotonic() - stage_started
-                        )
-                        output = finalize_output_frame(
-                            output,
-                            output_width,
-                            output_height,
-                            timings,
-                        )
+                        timings["tile_crop_stitch"] += time.monotonic() - stage_started
+                        output = finalize_output_frame(output, output_width, output_height, timings)
                         stage_started = time.monotonic()
                         writer.write(output)
                         timings["float_to_rgb48"] += time.monotonic() - stage_started
@@ -1289,18 +1055,8 @@ def process_video(args: argparse.Namespace) -> None:
                         progress.set_postfix(fps=f"{processed / elapsed:.3f}", refresh=False)
         finally:
             progress.close()
-        if basicvsrpp_reader is not None:
-            timings["decode"] += basicvsrpp_reader.decode_elapsed
-            timings["basicvsrpp"] += basicvsrpp_reader.preprocessor.elapsed
-            print(
-                f"[basicvsrpp] clips={basicvsrpp_reader.preprocessor.clips}, "
-                f"tiles={basicvsrpp_reader.preprocessor.tiles}, "
-                f"scene_cuts={basicvsrpp_reader.scene_cuts}",
-                flush=True,
-            )
         reader.close()
         reader = None
-        basicvsrpp_reader = None
         stage_started = time.monotonic()
         writer.close()
         timings["encode_flush"] += time.monotonic() - stage_started
@@ -1328,15 +1084,8 @@ def process_video(args: argparse.Namespace) -> None:
     output_frames = int(round(actual_duration * output_fps))
     stage_started = time.monotonic()
     mux_audio(
-        temporary_video,
-        input_path,
-        output_path,
-        args.ffmpeg_bin,
-        start,
-        actual_duration,
-        info.has_audio,
-        args.audio_codec,
-        args.audio_bitrate,
+        temporary_video, input_path, output_path, args.ffmpeg_bin, start,
+        actual_duration, info.has_audio, args.audio_codec, args.audio_bitrate,
     )
     timings["audio_mux"] += time.monotonic() - stage_started
     if temporary_video.exists():
@@ -1344,18 +1093,14 @@ def process_video(args: argparse.Namespace) -> None:
     elapsed = time.monotonic() - started
     print(
         f"[range] actual_start={format_seconds(start)}, actual_end={format_seconds(start + actual_duration)}, "
-        f"processed_inference_frames={processed}, output_frames={output_frames}, "
-        f"output_duration={actual_duration:.3f}s",
+        f"processed_inference_frames={processed}, output_frames={output_frames}, output_duration={actual_duration:.3f}s",
         flush=True,
     )
     print(
         f"[run] wall_end={now_text()}, elapsed={elapsed:.1f}s, average={processed / max(elapsed, 1e-6):.3f} frame/s",
         flush=True,
     )
-    print(
-        "[timing] " + ", ".join(f"{name}={value:.1f}s" for name, value in timings.items()),
-        flush=True,
-    )
+    print("[timing] " + ", ".join(f"{name}={value:.1f}s" for name, value in timings.items()), flush=True)
     size_mib = output_path.stat().st_size / (1024**2)
     bitrate_mbps = output_path.stat().st_size * 8 / max(actual_duration, 1e-6) / 1_000_000
     print(f"[size] {size_mib:.2f} MiB, average_bitrate={bitrate_mbps:.2f} Mb/s", flush=True)
@@ -1374,16 +1119,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--denoise-strength", type=float, default=1.0, help="DNI strength for general-x4v3")
     parser.add_argument("--scale", type=float, default=2.0, help="Final output scale")
     parser.add_argument(
-        "--fps",
-        default="source",
+        "--fps", default="source",
         help="Output FPS: source/auto/0, a number such as 23 or 60, or 24000/1001",
     )
     parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
-        "--tile-size",
-        type=int,
-        default=256,
-        help="0 uses fastest full-frame inference; use tiles only as an OOM fallback",
+        "--tile-size", type=int, default=256,
+        help="0 uses full-frame inference; fast runtime forces an auto-tuned tile path",
     )
     parser.add_argument("--tile-pad", type=int, default=10, help="Model context around each direct-write tile")
     parser.add_argument("--tile-verify-coverage", action=argparse.BooleanOptionalAction, default=False)
@@ -1391,43 +1133,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=4, help="Tiles per inference batch on each GPU")
     parser.add_argument("--gpu-ids", default="0,1", help="Comma-separated IDs, or cpu")
     parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=True)
-
-    parser.add_argument(
-        "--basicvsrpp",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Apply BasicVSR++ NTIRE compressed-video enhancement before Real-ESRGAN",
-    )
-    parser.add_argument(
-        "--basicvsrpp-track",
-        type=int,
-        choices=(1, 2, 3),
-        default=1,
-        help="NTIRE 2021 compressed-video checkpoint; track 1 is fidelity-oriented",
-    )
-    parser.add_argument("--basicvsrpp-model-path", default="", help="Optional local BasicVSR++ checkpoint")
-    parser.add_argument("--basicvsrpp-gpu", type=int, default=0)
-    parser.add_argument("--basicvsrpp-fp16", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--basicvsrpp-clip-length", type=int, default=7)
-    parser.add_argument("--basicvsrpp-clip-overlap", type=int, default=2)
-    parser.add_argument(
-        "--basicvsrpp-tile-size",
-        type=int,
-        default=256,
-        help="0 processes a full frame; 256 is the safer T4 default",
-    )
-    parser.add_argument("--basicvsrpp-tile-pad", type=int, default=32)
-    parser.add_argument("--basicvsrpp-strength", type=float, default=1.0)
-    parser.add_argument(
-        "--basicvsrpp-scene-threshold",
-        type=float,
-        default=0.30,
-        help="Reset temporal clips at scene cuts; 0 disables cut detection",
-    )
-
     parser.add_argument(
         "--video-codec",
-        choices=("libx264", "libx265", "h264_nvenc", "hevc_nvenc"),
+        choices=("libx264", "libx265", "h264_nvenc", "hevc_nvenc", "libsvtav1"),
         default="hevc_nvenc",
     )
     parser.add_argument("--crf", type=int, default=18, help="Lower is higher video quality/larger file")
@@ -1438,6 +1146,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cq", type=int, default=18, help="NVENC quality target; lower is higher quality")
     parser.add_argument("--nvenc-preset", choices=tuple(f"p{i}" for i in range(1, 8)), default="p7")
+    parser.add_argument(
+        "--svtav1-preset", type=int, default=6,
+        help="SVT-AV1 speed/efficiency preset, 0-13; higher is faster",
+    )
     parser.add_argument("--encode-gpu", type=int, default=0)
     parser.add_argument(
         "--output-pix-fmt",
@@ -1445,15 +1157,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument(
-        "--color-policy",
-        choices=("preserve", "bt709"),
-        default="preserve",
+        "--color-policy", choices=("preserve", "bt709"), default="preserve",
         help="Preserve/infer source SDR metadata, or force BT.709 limited-range output",
     )
     parser.add_argument(
-        "--hdr-policy",
-        choices=("reject", "passthrough"),
-        default="reject",
+        "--hdr-policy", choices=("reject", "passthrough"), default="reject",
         help="Reject HDR by default because the SR model is not HDR-linear",
     )
     parser.add_argument("--audio-codec", choices=("aac", "copy"), default="aac")
