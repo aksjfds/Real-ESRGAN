@@ -1,6 +1,7 @@
 """Internal loader for the v4.2 core used by the v4.3 top-level entry."""
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 _core_path = Path(__file__).resolve().with_name("realesrgan_core.py")
@@ -20,12 +21,13 @@ install_apisr_backend(sys.modules[__name__])
 
 
 # AutoDL's single-GPU runtime historically injects ``gpu_ids=(gpu_id,)`` into
-# BasicVSRPPPreprocessor.  The current dependency-light BasicVSR++ port accepts
-# only ``config``, ``checkpoint_dir`` and ``model`` and already selects its CUDA
-# device from ``config.gpu_id``.  Profiles B/C are the only paths that construct
-# BasicVSR++, so profile A hid this signature mismatch.  Keep the AutoDL runtime
-# contract intact here and consume/validate the legacy keyword before delegating
-# to the actual preprocessor.
+# BasicVSRPPPreprocessor. The dependency-light BasicVSR++ port already selects
+# its CUDA device from ``config.gpu_id``, so consume/validate that legacy
+# keyword here. For APISR + BasicVSR++ we also use a conservative execution
+# configuration: torchvision deform_conv2d has had Float/Half mixed-precision
+# compatibility failures in some builds, while profile C's 512px/9-frame path
+# has a much larger activation footprint. Force the temporal preprocessor to
+# FP32 and 256px tiles; APISR GRL itself is already intentionally FP32.
 _OriginalBasicVSRPPPreprocessor = BasicVSRPPPreprocessor
 
 
@@ -45,6 +47,14 @@ class APISRBasicVSRPPPreprocessor(_OriginalBasicVSRPPPreprocessor):
                     f"runtime requested cuda:{resolved[0]}, "
                     f"config requested cuda:{configured_gpu}"
                 )
+
+        if bool(getattr(config, "fp16", False)) or int(getattr(config, "tile_size", 256)) > 256:
+            config = replace(config, fp16=False, tile_size=256)
+            print(
+                "[basicvsrpp] APISR compatibility mode: fp16=False, tile_size=256",
+                flush=True,
+            )
+
         super().__init__(config, *args, **kwargs)
 
 
