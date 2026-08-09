@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Multi-GPU Real-ESRGAN video inference runtime.
+"""Full-frame multi-GPU Real-ESRGAN video inference runtime.
 
-The model always runs at its native scale. When the requested output scale is
-smaller (for example AnimeVideo-v3 native x4 -> final x2), the runtime first
-reconstructs the complete native-resolution frame and then performs one
-full-frame Lanczos4 resize. No per-patch bicubic resize is used.
+The runtime is intentionally quality-first: every source frame is inferred as a
+complete frame. CUDA workers automatically use FP16 + channels-last; CPU workers
+use FP32. Models always run at native scale, and any requested final scale is
+applied once to the completed native-resolution frame with Lanczos4.
 """
 
 from __future__ import annotations
@@ -42,7 +42,6 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover
 
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from .models.srvgg_arch import SRVGGNetCompact
-from . import autotune
 
 
 MODEL_URLS = {
@@ -63,7 +62,6 @@ MODEL_URLS = {
     ),
     "realesr-general-x4v3": (
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
-        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth",
     ),
 }
 
@@ -103,24 +101,9 @@ class VideoInfo:
 
 
 @dataclass(frozen=True)
-class TileInfo:
-    index: int
-    x0: int
-    y0: int
-    x1: int
-    y1: int
-
-
-@dataclass(frozen=True)
 class WorkerConfig:
     model_name: str
     model_paths: Tuple[str, ...]
-    denoise_strength: float
-    scale: float
-    tile_size: int
-    batch_size: int
-    fp16: bool
-    channels_last: bool
 
 
 def format_seconds(value: float) -> str:
@@ -168,17 +151,20 @@ def _stream_bit_depth(stream: dict) -> Tuple[int, str]:
     pix_fmt = str(stream.get("pix_fmt") or "unknown").lower()
     raw_value = str(stream.get("bits_per_raw_sample") or "").strip()
     raw_bits = int(raw_value) if raw_value.isdigit() and int(raw_value) > 0 else 0
+
     if "p010" in pix_fmt:
         bits = 10
     else:
         match = re.search(r"(?:p|gray|rgb|bgr)(9|10|12|14|16)(?:le|be)$", pix_fmt)
         bits = int(match.group(1)) if match else raw_bits or 8
+
     if bits <= 8:
         return 8, pix_fmt
     if bits == 10:
         return 10, pix_fmt
     raise RuntimeError(
-        f"Source pixel format {pix_fmt!r} reports {bits}-bit samples; only 8-bit and 10-bit are supported."
+        f"Source pixel format {pix_fmt!r} reports {bits}-bit samples; "
+        "only 8-bit and 10-bit are supported."
     )
 
 
@@ -197,11 +183,13 @@ def probe_video(path: Path, ffprobe_bin: str) -> VideoInfo:
     video_streams = [item for item in data.get("streams", []) if item.get("codec_type") == "video"]
     if not video_streams:
         raise ValueError(f"No video stream found in {path}")
+
     stream = video_streams[0]
     rate = parse_rate(stream.get("avg_frame_rate") or stream.get("r_frame_rate"))
     duration_value = stream.get("duration") or data.get("format", {}).get("duration")
     if duration_value in {None, "N/A"}:
         raise ValueError("The input has no usable duration metadata.")
+
     frame_value = stream.get("nb_frames")
     frames = int(frame_value) if frame_value not in {None, "N/A"} else None
     bit_depth, pix_fmt = _stream_bit_depth(stream)
@@ -216,18 +204,6 @@ def probe_video(path: Path, ffprobe_bin: str) -> VideoInfo:
         pix_fmt=pix_fmt,
         bit_depth=bit_depth,
     )
-
-
-def choose_input_size(info: VideoInfo, width: int, height: int) -> Tuple[int, int]:
-    if width == 0 and height == 0:
-        return info.width, info.height
-    if width == 0:
-        width = round(info.width * height / info.height)
-    elif height == 0:
-        height = round(info.height * width / info.width)
-    if width < 2 or height < 2:
-        raise ValueError("Input width and height must be zero or at least 2 pixels.")
-    return width, height
 
 
 def resolve_range(
@@ -266,33 +242,47 @@ def resolve_model_paths(args: argparse.Namespace) -> Tuple[str, ...]:
         primary = Path(args.model_path).expanduser().resolve()
         if not primary.is_file():
             raise FileNotFoundError(f"Model weight not found: {primary}")
-        if args.model == "realesr-general-x4v3" and args.denoise_strength != 1.0:
-            raise ValueError("A custom realesr-general-x4v3 weight can only use --denoise-strength 1.")
         return (str(primary),)
 
     urls = MODEL_URLS[args.model]
-    if args.model != "realesr-general-x4v3" or args.denoise_strength == 1.0:
-        urls = urls[:1]
     weight_dir = Path(__file__).resolve().parent / "weights"
     return tuple(str(download_file(url, weight_dir / url.rsplit("/", 1)[-1])) for url in urls)
 
 
 def build_model(name: str) -> Tuple[torch.nn.Module, int]:
     if name == "RealESRGAN_x4plus":
-        return RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4), 4
+        return RRDBNet(
+            num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4
+        ), 4
     if name == "RealESRNet_x4plus":
-        return RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4), 4
+        return RRDBNet(
+            num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4
+        ), 4
     if name == "RealESRGAN_x4plus_anime_6B":
-        return RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4), 4
+        return RRDBNet(
+            num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4
+        ), 4
     if name == "RealESRGAN_x2plus":
-        return RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2), 2
+        return RRDBNet(
+            num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2
+        ), 2
     if name == "realesr-animevideov3":
         return SRVGGNetCompact(
-            num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16, upscale=4, act_type="prelu"
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=64,
+            num_conv=16,
+            upscale=4,
+            act_type="prelu",
         ), 4
     if name == "realesr-general-x4v3":
         return SRVGGNetCompact(
-            num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type="prelu"
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=64,
+            num_conv=32,
+            upscale=4,
+            act_type="prelu",
         ), 4
     raise ValueError(f"Unsupported model: {name}")
 
@@ -317,18 +307,16 @@ def checkpoint_state(path: str) -> Dict[str, torch.Tensor]:
     raise KeyError(f"No params or params_ema found in {path}")
 
 
-def load_worker_model(config: WorkerConfig, device: torch.device) -> Tuple[torch.nn.Module, int]:
+def load_worker_model(
+    config: WorkerConfig,
+    device: torch.device,
+) -> Tuple[torch.nn.Module, int]:
     model, native_scale = build_model(config.model_name)
-    state = checkpoint_state(config.model_paths[0])
-    if len(config.model_paths) == 2:
-        weak_state = checkpoint_state(config.model_paths[1])
-        strength = config.denoise_strength
-        state = {key: strength * value + (1.0 - strength) * weak_state[key] for key, value in state.items()}
-    model.load_state_dict(state, strict=True)
+    model.load_state_dict(checkpoint_state(config.model_paths[0]), strict=True)
     model.eval().requires_grad_(False)
-    if config.fp16 and device.type == "cuda":
+
+    if device.type == "cuda":
         model.half()
-    if config.channels_last and device.type == "cuda":
         model.to(device=device, memory_format=torch.channels_last)
     else:
         model.to(device)
@@ -340,11 +328,11 @@ def _is_uint16(frame: np.ndarray) -> bool:
 
 
 def _full_frame_lanczos(frame: np.ndarray, width: int, height: int) -> np.ndarray:
-    """Resize a completed native-scale frame once with Lanczos4."""
     if frame.shape[1] == width and frame.shape[0] == height:
         return frame
     if frame.dtype.kind != "u" or frame.dtype.itemsize not in {1, 2}:
         raise RuntimeError(f"Unsupported inference frame dtype for resize: {frame.dtype}")
+
     max_value = float(np.iinfo(frame.dtype).max)
     resized = cv2.resize(
         frame.astype(np.float32, copy=False),
@@ -356,32 +344,25 @@ def _full_frame_lanczos(frame: np.ndarray, width: int, height: int) -> np.ndarra
     return resized.astype(frame.dtype)
 
 
-def infer_image_batch(
+def infer_frame(
     model: torch.nn.Module,
-    patches: Sequence[np.ndarray],
+    frame: np.ndarray,
     device: torch.device,
-    fp16: bool,
-    native_scale: int,
-    output_scale: float,
-    channels_last: bool,
-) -> List[np.ndarray]:
-    """Run the model at native scale; never resize individual patches."""
-    del native_scale, output_scale
-    is_10bit = _is_uint16(patches[0])
+) -> np.ndarray:
+    is_10bit = _is_uint16(frame)
 
     if is_10bit:
-        rgb = np.stack(patches).astype(np.float32, copy=False)
-        tensor = torch.from_numpy(rgb).permute(0, 3, 1, 2).to(device, non_blocking=True)
+        rgb = frame.astype(np.float32, copy=False)
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(device, non_blocking=True)
         tensor.div_(65535.0)
-        if fp16 and device.type == "cuda":
+        if device.type == "cuda":
             tensor = tensor.half()
     else:
-        rgb = np.stack(patches)
-        tensor = torch.from_numpy(rgb).permute(0, 3, 1, 2).to(device, non_blocking=True)
-        tensor = tensor.half() if fp16 and device.type == "cuda" else tensor.float()
+        tensor = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0).to(device, non_blocking=True)
+        tensor = tensor.half() if device.type == "cuda" else tensor.float()
         tensor.div_(255.0)
 
-    if channels_last and device.type == "cuda":
+    if device.type == "cuda":
         tensor = tensor.contiguous(memory_format=torch.channels_last)
 
     with torch.inference_mode():
@@ -392,10 +373,10 @@ def infer_image_batch(
         else:
             output = output.mul_(255.0).round_().byte()
 
-    array = output.permute(0, 2, 3, 1).contiguous().cpu().numpy()
+    array = output[0].permute(1, 2, 0).contiguous().cpu().numpy()
     if is_10bit:
         array = array.astype(np.uint16)
-    return list(array)
+    return array
 
 
 def worker_main(
@@ -415,32 +396,16 @@ def worker_main(
             torch.backends.cudnn.benchmark = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cuda.matmul.allow_tf32 = True
-        model, native_scale = load_worker_model(config, device)
+
+        model, _native_scale = load_worker_model(config, device)
         output_queue.put(("ready", worker_id, str(device)))
+
         while True:
             job = input_queue.get()
             if job is None:
                 break
-            job_type, job_id, indexed_patches = job
-            results = []
-            batch_size = config.batch_size if job_type == "tiles" else 1
-            for offset in range(0, len(indexed_patches), batch_size):
-                chunk = indexed_patches[offset : offset + batch_size]
-                if not chunk:
-                    continue
-                indices = [item[0] for item in chunk]
-                patches = [item[1] for item in chunk]
-                outputs = infer_image_batch(
-                    model,
-                    patches,
-                    device,
-                    config.fp16,
-                    native_scale,
-                    config.scale,
-                    config.channels_last,
-                )
-                results.extend(zip(indices, outputs))
-            output_queue.put((f"{job_type}_result", worker_id, job_id, results))
+            frame_id, frame = job
+            output_queue.put(("result", worker_id, frame_id, infer_frame(model, frame, device)))
     except Exception as error:
         output_queue.put(("error", worker_id, repr(error), traceback.format_exc()))
 
@@ -451,14 +416,22 @@ class PersistentWorkers:
         self.output_queue = self.context.Queue()
         self.input_queues = [self.context.Queue(maxsize=1) for _ in gpu_ids]
         self.processes = []
+
         for worker_id, gpu_id in enumerate(gpu_ids):
             process = self.context.Process(
                 target=worker_main,
-                args=(worker_id, gpu_id, self.input_queues[worker_id], self.output_queue, asdict(config)),
+                args=(
+                    worker_id,
+                    gpu_id,
+                    self.input_queues[worker_id],
+                    self.output_queue,
+                    asdict(config),
+                ),
                 daemon=True,
             )
             process.start()
             self.processes.append(process)
+
         try:
             self._wait_until_ready(len(gpu_ids))
         except Exception:
@@ -477,44 +450,34 @@ class PersistentWorkers:
             except queue.Empty as error:
                 raise TimeoutError("Timed out while loading models on workers.") from error
             if message[0] == "error":
-                raise RuntimeError(f"Worker {message[1]} failed during startup: {message[2]}\n{message[3]}")
+                raise RuntimeError(
+                    f"Worker {message[1]} failed during startup: {message[2]}\n{message[3]}"
+                )
             if message[0] == "ready":
                 ready += 1
 
-    def _infer_distributed(
-        self,
-        job_type: str,
-        job_id: int,
-        indexed_images: Sequence[Tuple[int, np.ndarray]],
-    ) -> Dict[int, np.ndarray]:
-        worker_count = len(self.processes)
-        for worker_id, input_queue in enumerate(self.input_queues):
-            input_queue.put((job_type, job_id, indexed_images[worker_id::worker_count]))
-        merged: Dict[int, np.ndarray] = {}
-        received = 0
-        while received < worker_count:
-            message = self.output_queue.get()
-            if message[0] == "error":
-                raise RuntimeError(f"Worker {message[1]} failed: {message[2]}\n{message[3]}")
-            if message[0] != f"{job_type}_result" or message[2] != job_id:
-                raise RuntimeError(f"Unexpected worker message: {message[0]}")
-            merged.update(message[3])
-            received += 1
-        if len(merged) != len(indexed_images):
-            raise RuntimeError(f"Expected {len(indexed_images)} outputs, received {len(merged)}.")
-        return merged
-
-    def infer_tiles(self, frame_id: int, patches: Sequence[np.ndarray]) -> Dict[int, np.ndarray]:
-        return self._infer_distributed("tiles", frame_id, list(enumerate(patches)))
-
     def infer_frames(
         self,
-        batch_id: int,
         indexed_frames: Sequence[Tuple[int, np.ndarray]],
     ) -> Dict[int, np.ndarray]:
         if len(indexed_frames) > len(self.processes):
             raise ValueError("Full-frame batches may contain at most one frame per worker.")
-        return self._infer_distributed("frames", batch_id, indexed_frames)
+
+        active = 0
+        for worker_id, item in enumerate(indexed_frames):
+            self.input_queues[worker_id].put(item)
+            active += 1
+
+        merged: Dict[int, np.ndarray] = {}
+        while len(merged) < active:
+            message = self.output_queue.get()
+            if message[0] == "error":
+                raise RuntimeError(f"Worker {message[1]} failed: {message[2]}\n{message[3]}")
+            if message[0] != "result":
+                raise RuntimeError(f"Unexpected worker message: {message[0]}")
+            merged[message[2]] = message[3]
+
+        return merged
 
     def close(self) -> None:
         for input_queue in self.input_queues:
@@ -549,20 +512,28 @@ class RawVideoReader:
         self.pixel_format = "rgb48le" if bit_depth == 10 else "rgb24"
         self.dtype = np.dtype("<u2") if bit_depth == 10 else np.dtype(np.uint8)
         self.frame_bytes = width * height * 3 * self.dtype.itemsize
-        vf = f"scale={width}:{height}:flags=lanczos,fps={fps_rate}"
+
         command = [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
         if start > 0:
             command += ["-ss", f"{start:.6f}"]
         command += ["-i", str(input_path)]
         command += [
-            "-t", f"{duration:.6f}",
-            "-vf", vf,
+            "-t",
+            f"{duration:.6f}",
+            "-vf",
+            f"fps={fps_rate}",
             "-an",
-            "-f", "rawvideo",
-            "-pix_fmt", self.pixel_format,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            self.pixel_format,
             "pipe:1",
         ]
-        self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
     def read(self) -> Optional[np.ndarray]:
         assert self.process.stdout is not None
@@ -570,7 +541,9 @@ class RawVideoReader:
         if not data:
             return None
         if len(data) != self.frame_bytes:
-            raise RuntimeError(f"ffmpeg returned a partial raw frame ({len(data)}/{self.frame_bytes} bytes).")
+            raise RuntimeError(
+                f"ffmpeg returned a partial raw frame ({len(data)}/{self.frame_bytes} bytes)."
+            )
         return np.frombuffer(data, dtype=self.dtype).reshape(self.height, self.width, 3)
 
     def close(self) -> None:
@@ -582,92 +555,10 @@ class RawVideoReader:
             self.process.stderr.close()
         return_code = self.process.wait()
         if return_code != 0:
-            raise RuntimeError(f"ffmpeg decode failed (exit {return_code}):\n{stderr.decode(errors='replace')}")
-
-
-def axis_starts(length: int, tile_size: int, overlap: int) -> List[int]:
-    if length <= tile_size:
-        return [0]
-    return list(range(0, length, tile_size - overlap))
-
-
-def split_tiles(frame: np.ndarray, tile_size: int, overlap: int) -> Tuple[List[np.ndarray], List[TileInfo]]:
-    height, width = frame.shape[:2]
-    patches: List[np.ndarray] = []
-    infos: List[TileInfo] = []
-    index = 0
-    for y0 in axis_starts(height, tile_size, overlap):
-        for x0 in axis_starts(width, tile_size, overlap):
-            y1 = min(y0 + tile_size, height)
-            x1 = min(x0 + tile_size, width)
-            patch = frame[y0:y1, x0:x1]
-            pad_bottom = tile_size - patch.shape[0]
-            pad_right = tile_size - patch.shape[1]
-            if pad_bottom or pad_right:
-                border = cv2.BORDER_REFLECT_101 if min(patch.shape[:2]) > 1 else cv2.BORDER_REPLICATE
-                patch = cv2.copyMakeBorder(patch, 0, pad_bottom, 0, pad_right, border)
-            patches.append(np.ascontiguousarray(patch))
-            infos.append(TileInfo(index, x0, y0, x1, y1))
-            index += 1
-    return patches, infos
-
-
-def feather_axis(length: int, fade: int, fade_start: bool, fade_end: bool) -> np.ndarray:
-    weights = np.ones(length, dtype=np.float32)
-    fade = min(fade, length // 2)
-    if fade > 0:
-        ramp = np.linspace(0.0, 1.0, fade, endpoint=False, dtype=np.float32)
-        if fade_start:
-            weights[:fade] = ramp
-        if fade_end:
-            weights[-fade:] = ramp[::-1]
-    return weights
-
-
-def blend_tiles(
-    outputs: Dict[int, np.ndarray],
-    infos: Sequence[TileInfo],
-    input_width: int,
-    input_height: int,
-    scale: float,
-    overlap: int,
-) -> np.ndarray:
-    """Blend model-native tile outputs before any final resize."""
-    if not outputs:
-        raise RuntimeError("Tile fusion received no model outputs.")
-    sample = next(iter(outputs.values()))
-    output_dtype = sample.dtype
-    max_value = float(np.iinfo(output_dtype).max)
-    output_width = int(round(input_width * scale))
-    output_height = int(round(input_height * scale))
-    accumulator = np.zeros((output_height, output_width, 3), dtype=np.float32)
-    weight_sum = np.zeros((output_height, output_width, 1), dtype=np.float32)
-    fade = max(1, int(round(overlap * scale))) if overlap else 0
-
-    for info in infos:
-        ox0 = int(round(info.x0 * scale))
-        oy0 = int(round(info.y0 * scale))
-        ox1 = int(round(info.x1 * scale))
-        oy1 = int(round(info.y1 * scale))
-        height = oy1 - oy0
-        width = ox1 - ox0
-        tile = outputs[info.index]
-        if tile.shape[0] < height or tile.shape[1] < width:
-            tile = cv2.resize(tile, (width, height), interpolation=cv2.INTER_LANCZOS4)
-        else:
-            tile = tile[:height, :width]
-        wx = feather_axis(width, fade, info.x0 > 0, info.x1 < input_width)
-        wy = feather_axis(height, fade, info.y0 > 0, info.y1 < input_height)
-        weight = (wy[:, None] * wx[None, :])[:, :, None]
-        accumulator[oy0:oy1, ox0:ox1] += tile.astype(np.float32) * weight
-        weight_sum[oy0:oy1, ox0:ox1] += weight
-
-    if np.any(weight_sum <= 0):
-        raise RuntimeError("Tile fusion produced uncovered output pixels.")
-    np.divide(accumulator, weight_sum, out=accumulator)
-    np.rint(accumulator, out=accumulator)
-    np.clip(accumulator, 0, max_value, out=accumulator)
-    return accumulator.astype(output_dtype)
+            raise RuntimeError(
+                f"ffmpeg decode failed (exit {return_code}):\n"
+                f"{stderr.decode(errors='replace')}"
+            )
 
 
 def mux_audio(
@@ -684,37 +575,67 @@ def mux_audio(
     if not has_audio:
         silent_video.replace(output_path)
         return
-    base = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", str(silent_video)]
+
+    base = [
+        ffmpeg_bin,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(silent_video),
+    ]
     if audio_codec == "aac":
         command = base + [
-            "-ss", f"{start:.6f}",
-            "-t", f"{duration:.6f}",
-            "-i", str(input_path),
-            "-filter_complex", f"[1:a:0]atrim=start=0:duration={duration:.6f},asetpts=PTS-STARTPTS[a]",
-            "-map", "0:v:0",
-            "-map", "[a]",
-            "-map_metadata", "1",
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", audio_bitrate,
+            "-ss",
+            f"{start:.6f}",
+            "-t",
+            f"{duration:.6f}",
+            "-i",
+            str(input_path),
+            "-filter_complex",
+            f"[1:a:0]atrim=start=0:duration={duration:.6f},asetpts=PTS-STARTPTS[a]",
+            "-map",
+            "0:v:0",
+            "-map",
+            "[a]",
+            "-map_metadata",
+            "1",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            audio_bitrate,
             "-shortest",
-            "-movflags", "+faststart",
+            "-movflags",
+            "+faststart",
             str(output_path),
         ]
     else:
         command = base + [
-            "-ss", f"{start:.6f}",
-            "-t", f"{duration:.6f}",
-            "-i", str(input_path),
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-map_metadata", "1",
-            "-c", "copy",
+            "-ss",
+            f"{start:.6f}",
+            "-t",
+            f"{duration:.6f}",
+            "-i",
+            str(input_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-map_metadata",
+            "1",
+            "-c",
+            "copy",
             "-shortest",
-            "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-movflags",
+            "+faststart",
             str(output_path),
         ]
+
     try:
         run_checked(command, "audio mux")
     except RuntimeError:
@@ -741,10 +662,12 @@ def parse_gpu_ids(value: str) -> List[Optional[int]]:
         ids = [int(item.strip()) for item in value.split(",") if item.strip()]
     except ValueError as error:
         raise ValueError("--gpu-ids must be 'cpu' or comma-separated IDs such as 0,1.") from error
+
     if not ids or len(ids) != len(set(ids)) or min(ids) < 0:
         raise ValueError("--gpu-ids must contain unique, non-negative GPU numbers.")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable. Use --gpu-ids cpu for compatibility.")
+
     count = torch.cuda.device_count()
     if max(ids) >= count:
         raise ValueError(f"Requested GPU {max(ids)}, but only {count} CUDA device(s) are visible.")
@@ -754,21 +677,6 @@ def parse_gpu_ids(value: str) -> List[Optional[int]]:
 def validate_args(args: argparse.Namespace) -> None:
     if args.scale <= 0:
         raise ValueError("--scale must be positive.")
-    if args.batch_size < 1:
-        raise ValueError("--batch-size must be at least 1.")
-    if args.overlap < 0:
-        raise ValueError("--overlap must be non-negative.")
-    if not 0 <= args.denoise_strength <= 1:
-        raise ValueError("--denoise-strength must be between 0 and 1.")
-    if not args.full_frame:
-        if args.tile_size < 64 or args.tile_size % 4:
-            raise ValueError("--tile-size must be at least 64 and divisible by 4.")
-        if args.overlap >= args.tile_size // 2:
-            raise ValueError("--overlap must be less than half of --tile-size.")
-        if args.max_tile_size < 512:
-            raise ValueError("--max-tile-size must be at least 512.")
-        if args.max_batch_size < 1:
-            raise ValueError("--max-batch-size must be at least 1.")
 
 
 def _output_pixel_format(codec: str, bit_depth: int) -> str:
@@ -777,15 +685,16 @@ def _output_pixel_format(codec: str, bit_depth: int) -> str:
     return "p010le" if codec.endswith("_nvenc") else "yuv420p10le"
 
 
-def _device_text(gpu_ids: Sequence[Optional[int]], fp16: bool) -> str:
+def _device_text(gpu_ids: Sequence[Optional[int]]) -> str:
     if gpu_ids == [None]:
         return "CPU | FP32"
+
     parts = []
     for gpu_id in gpu_ids:
         assert gpu_id is not None
         props = torch.cuda.get_device_properties(gpu_id)
         parts.append(f"cuda:{gpu_id} {props.name} {props.total_memory / 2**30:.1f}GiB")
-    return "; ".join(parts) + (" | FP16" if fp16 else " | FP32")
+    return "; ".join(parts) + " | FP16 + channels_last"
 
 
 def process_video(args: argparse.Namespace) -> None:
@@ -802,6 +711,7 @@ def process_video(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Input video not found: {input_path}")
     if input_path == output_path:
         raise ValueError("Input and output paths must be different.")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_video = output_path.with_name(output_path.stem + ".video_only.tmp.mp4")
 
@@ -809,72 +719,34 @@ def process_video(args: argparse.Namespace) -> None:
     source_rate = Fraction(info.fps_num, info.fps_den)
     output_rate = parse_output_rate(args.fps, source_rate)
     inference_rate = min(source_rate, output_rate)
+
     output_fps = float(output_rate)
     output_fps_rate = f"{output_rate.numerator}/{output_rate.denominator}"
     inference_fps = float(inference_rate)
     inference_fps_rate = f"{inference_rate.numerator}/{inference_rate.denominator}"
-    input_width, input_height = choose_input_size(info, args.input_width, args.input_height)
+
+    input_width = info.width
+    input_height = info.height
     output_width = int(round(input_width * args.scale))
     output_height = int(round(input_height * args.scale))
     if output_width % 2 or output_height % 2:
         raise ValueError(f"4:2:0 output needs even dimensions, got {output_width}x{output_height}.")
 
     start, duration, expected_frames = resolve_range(
-        info, args.start_time, args.test_seconds, inference_rate
+        info,
+        args.start_time,
+        args.test_seconds,
+        inference_rate,
     )
     expected_output_frames = max(1, int(round(duration * output_fps)))
     end = start + duration
+
     gpu_ids = parse_gpu_ids(args.gpu_ids)
-    effective_fp16 = args.fp16 and gpu_ids != [None]
-    effective_channels_last = args.channels_last and gpu_ids != [None]
     model_paths = resolve_model_paths(args)
     native_scale = _model_native_scale(args.model)
-
-    requested_config = WorkerConfig(
-        model_name=args.model,
-        model_paths=model_paths,
-        denoise_strength=args.denoise_strength,
-        scale=args.scale,
-        tile_size=args.tile_size,
-        batch_size=args.batch_size,
-        fp16=effective_fp16,
-        channels_last=effective_channels_last,
-    )
-
-    tune_result = None
-    cuda_gpu_ids = [int(gpu_id) for gpu_id in gpu_ids if gpu_id is not None]
-    if args.full_frame:
-        args.tile_size = 0
-        args.batch_size = 1
-    elif cuda_gpu_ids:
-        tune_gpu = min(
-            cuda_gpu_ids,
-            key=lambda gpu_id: torch.cuda.get_device_properties(gpu_id).total_memory,
-        )
-        tune_result = autotune.select_parameters(
-            config_dict=asdict(requested_config),
-            gpu_id=tune_gpu,
-            width=input_width,
-            height=input_height,
-            gpu_count=len(cuda_gpu_ids),
-            overlap=args.overlap,
-            max_tile_size=args.max_tile_size,
-            max_batch_size=args.max_batch_size,
-            requested_tile=args.tile_size,
-            requested_batch=args.batch_size,
-        )
-        args.tile_size = tune_result.tile_size
-        args.batch_size = tune_result.batch_size
-
     config = WorkerConfig(
         model_name=args.model,
         model_paths=model_paths,
-        denoise_strength=args.denoise_strength,
-        scale=args.scale,
-        tile_size=args.tile_size,
-        batch_size=args.batch_size,
-        fp16=effective_fp16,
-        channels_last=effective_channels_last,
     )
 
     mode = "test" if args.test_seconds > 0 else "full/selected range"
@@ -886,43 +758,26 @@ def process_video(args: argparse.Namespace) -> None:
     )
     print(
         f"Output  : {output_width}x{output_height} | {output_fps:.3f} fps | "
-        f"{info.bit_depth}-bit ({_output_pixel_format(args.video_codec, info.bit_depth)}) | {args.video_codec}",
+        f"{info.bit_depth}-bit ({_output_pixel_format(args.video_codec, info.bit_depth)}) | "
+        f"{args.video_codec}",
         flush=True,
     )
     print(
         f"Range   : {mode} | {format_seconds(start)} -> {format_seconds(end)} | "
-        f"{duration:.3f}s | {expected_frames} inference / {expected_output_frames} output frames",
+        f"{duration:.3f}s | {expected_frames} inference / "
+        f"{expected_output_frames} output frames",
         flush=True,
     )
     if float(args.scale) == float(native_scale):
         resample_text = f"native={native_scale}x"
     else:
         resample_text = (
-            f"native={native_scale}x -> final={args.scale:g}x | resample=full-frame Lanczos4"
+            f"native={native_scale}x -> final={args.scale:g}x | "
+            "resample=full-frame Lanczos4"
         )
-    print(
-        f"Model   : {args.model} | {resample_text} | channels_last={effective_channels_last}",
-        flush=True,
-    )
-    print(f"GPU     : {_device_text(gpu_ids, effective_fp16)}", flush=True)
-    if args.full_frame:
-        print(
-            f"Mode    : FULL_FRAME=True | full-frame | parallel_frames={len(gpu_ids)}",
-            flush=True,
-        )
-    elif tune_result is not None:
-        print(
-            f"Mode    : FULL_FRAME=False | auto tile={tune_result.tile_size} | "
-            f"batch={tune_result.batch_size} | estimate={tune_result.estimated_seconds:.3f}s/frame | "
-            f"tested={tune_result.tested}, OOM={tune_result.rejected_oom} | "
-            f"search={tune_result.search_seconds:.1f}s",
-            flush=True,
-        )
-    else:
-        print(
-            f"Mode    : FULL_FRAME=False | CPU fallback tile={args.tile_size} | batch={args.batch_size}",
-            flush=True,
-        )
+    print(f"Model   : {args.model} | {resample_text}", flush=True)
+    print(f"GPU     : {_device_text(gpu_ids)}", flush=True)
+    print(f"Mode    : fixed full-frame | parallel_frames={len(gpu_ids)}", flush=True)
     print(flush=True)
 
     reader: Optional[RawVideoReader] = None
@@ -934,7 +789,6 @@ def process_video(args: argparse.Namespace) -> None:
         "model_startup": 0.0,
         "decode": 0.0,
         "inference": 0.0,
-        "blend": 0.0,
         "resize": 0.0,
         "write": 0.0,
         "encode_flush": 0.0,
@@ -946,6 +800,7 @@ def process_video(args: argparse.Namespace) -> None:
         stage_started = time.monotonic()
         workers = PersistentWorkers(gpu_ids, config)
         timings["model_startup"] += time.monotonic() - stage_started
+
         reader = RawVideoReader(
             input_path,
             args.ffmpeg_bin,
@@ -970,6 +825,7 @@ def process_video(args: argparse.Namespace) -> None:
             args.nvenc_preset,
             args.encode_gpu,
         )
+
         progress = tqdm(
             total=expected_frames,
             desc="Real-ESRGAN",
@@ -979,83 +835,49 @@ def process_video(args: argparse.Namespace) -> None:
             file=sys.stdout,
         )
         try:
-            if args.tile_size == 0:
-                batch_id = 0
-                while True:
-                    indexed_frames = []
-                    stage_started = time.monotonic()
-                    for _ in gpu_ids:
-                        frame = reader.read()
-                        if frame is None:
-                            break
-                        indexed_frames.append((processed + len(indexed_frames), frame))
-                    timings["decode"] += time.monotonic() - stage_started
-                    if not indexed_frames:
-                        break
+            while True:
+                indexed_frames: List[Tuple[int, np.ndarray]] = []
 
-                    stage_started = time.monotonic()
-                    frame_outputs = workers.infer_frames(batch_id, indexed_frames)
-                    timings["inference"] += time.monotonic() - stage_started
-
-                    stage_started = time.monotonic()
-                    resized_outputs: Dict[int, np.ndarray] = {}
-                    for frame_id, _frame in indexed_frames:
-                        resized_outputs[frame_id] = _full_frame_lanczos(
-                            frame_outputs[frame_id], output_width, output_height
-                        )
-                    timings["resize"] += time.monotonic() - stage_started
-
-                    stage_started = time.monotonic()
-                    for frame_id, _frame in indexed_frames:
-                        writer.write(resized_outputs[frame_id])
-                    timings["write"] += time.monotonic() - stage_started
-
-                    processed += len(indexed_frames)
-                    batch_id += 1
-                    progress.update(len(indexed_frames))
-                    elapsed_now = max(time.monotonic() - started, 1e-6)
-                    progress.set_postfix(fps=f"{processed / elapsed_now:.3f}", refresh=False)
-            else:
-                while True:
-                    stage_started = time.monotonic()
+                stage_started = time.monotonic()
+                for _ in gpu_ids:
                     frame = reader.read()
-                    timings["decode"] += time.monotonic() - stage_started
                     if frame is None:
                         break
+                    indexed_frames.append((processed + len(indexed_frames), frame))
+                timings["decode"] += time.monotonic() - stage_started
 
-                    patches, tile_infos = split_tiles(frame, args.tile_size, args.overlap)
-                    stage_started = time.monotonic()
-                    tile_outputs = workers.infer_tiles(processed, patches)
-                    timings["inference"] += time.monotonic() - stage_started
+                if not indexed_frames:
+                    break
 
-                    stage_started = time.monotonic()
-                    native_output = blend_tiles(
-                        tile_outputs,
-                        tile_infos,
-                        input_width,
-                        input_height,
-                        native_scale,
-                        args.overlap,
+                stage_started = time.monotonic()
+                frame_outputs = workers.infer_frames(indexed_frames)
+                timings["inference"] += time.monotonic() - stage_started
+
+                stage_started = time.monotonic()
+                resized_outputs: Dict[int, np.ndarray] = {}
+                for frame_id, _frame in indexed_frames:
+                    resized_outputs[frame_id] = _full_frame_lanczos(
+                        frame_outputs[frame_id],
+                        output_width,
+                        output_height,
                     )
-                    timings["blend"] += time.monotonic() - stage_started
+                timings["resize"] += time.monotonic() - stage_started
 
-                    stage_started = time.monotonic()
-                    output = _full_frame_lanczos(native_output, output_width, output_height)
-                    timings["resize"] += time.monotonic() - stage_started
+                stage_started = time.monotonic()
+                for frame_id, _frame in indexed_frames:
+                    writer.write(resized_outputs[frame_id])
+                timings["write"] += time.monotonic() - stage_started
 
-                    stage_started = time.monotonic()
-                    writer.write(output)
-                    timings["write"] += time.monotonic() - stage_started
-
-                    processed += 1
-                    progress.update(1)
-                    elapsed_now = max(time.monotonic() - started, 1e-6)
-                    progress.set_postfix(fps=f"{processed / elapsed_now:.3f}", refresh=False)
+                processed += len(indexed_frames)
+                progress.update(len(indexed_frames))
+                elapsed_now = max(time.monotonic() - started, 1e-6)
+                progress.set_postfix(fps=f"{processed / elapsed_now:.3f}", refresh=False)
         finally:
             progress.close()
 
         reader.close()
         reader = None
+
         stage_started = time.monotonic()
         writer.close()
         timings["encode_flush"] += time.monotonic() - stage_started
@@ -1092,12 +914,15 @@ def process_video(args: argparse.Namespace) -> None:
         args.audio_bitrate,
     )
     timings["audio_mux"] += time.monotonic() - stage_started
+
     if temporary_video.exists():
         temporary_video.unlink()
 
     elapsed = time.monotonic() - started
     size_mib = output_path.stat().st_size / (1024**2)
-    bitrate_mbps = output_path.stat().st_size * 8 / max(actual_duration, 1e-6) / 1_000_000
+    bitrate_mbps = (
+        output_path.stat().st_size * 8 / max(actual_duration, 1e-6) / 1_000_000
+    )
     average_fps = processed / max(elapsed, 1e-6)
     encode_time = timings["write"] + timings["encode_flush"]
 
@@ -1109,10 +934,11 @@ def process_video(args: argparse.Namespace) -> None:
     )
     print(f"Speed   : {average_fps:.3f} frame/s | processing={elapsed:.1f}s", flush=True)
     print(
-        f"Timing  : model={timings['model_startup']:.1f}s | decode={timings['decode']:.1f}s | "
-        f"inference={timings['inference']:.1f}s | blend={timings['blend']:.1f}s | "
-        f"resize={timings['resize']:.1f}s | encode={encode_time:.1f}s | "
-        f"audio={timings['audio_mux']:.1f}s",
+        f"Timing  : model={timings['model_startup']:.1f}s | "
+        f"decode={timings['decode']:.1f}s | "
+        f"inference={timings['inference']:.1f}s | "
+        f"resize={timings['resize']:.1f}s | "
+        f"encode={encode_time:.1f}s | audio={timings['audio_mux']:.1f}s",
         flush=True,
     )
     print(f"File    : {size_mib:.2f} MiB | {bitrate_mbps:.2f} Mb/s", flush=True)
@@ -1121,50 +947,29 @@ def process_video(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Persistent multi-GPU Real-ESRGAN video inference.",
+        description="Full-frame multi-GPU Real-ESRGAN video inference.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--input", required=True, help="Input video path")
     parser.add_argument("--output", required=True, help="Output MP4 path")
     parser.add_argument("--model", choices=tuple(MODEL_URLS), default="realesr-animevideov3")
     parser.add_argument("--model-path", default="", help="Optional local .pth override")
-    parser.add_argument("--denoise-strength", type=float, default=1.0, help="DNI strength for general-x4v3")
     parser.add_argument("--scale", type=float, default=2.0, help="Final output scale")
     parser.add_argument(
         "--fps",
         default="source",
         help="Output FPS: source/auto/0, number, or rational rate such as 24000/1001",
     )
-    parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--input-width", type=int, default=0, help="0 keeps source/aspect-derived width")
-    parser.add_argument("--input-height", type=int, default=0, help="0 keeps source/aspect-derived height")
-    parser.add_argument(
-        "--full-frame",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="True uses quality-first full-frame inference; False enables automatic tile+batch tuning",
-    )
-    parser.add_argument(
-        "--tile-size",
-        type=int,
-        default=512,
-        help="Fallback/additional tile candidate used when --no-full-frame",
-    )
-    parser.add_argument("--max-tile-size", type=int, default=1536)
-    parser.add_argument("--overlap", type=int, default=32)
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=4,
-        help="Fallback/additional batch candidate used when --no-full-frame",
-    )
-    parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--gpu-ids", default="0,1", help="Comma-separated IDs, or cpu")
-    parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--audio-codec", choices=("aac", "copy"), default="aac")
     parser.add_argument("--audio-bitrate", default="192k")
     parser.add_argument("--start-time", type=float, default=0.0, help="Source start in seconds")
-    parser.add_argument("--test-seconds", type=float, default=0.0, help="0 processes to end; use 10 for a test")
+    parser.add_argument(
+        "--test-seconds",
+        type=float,
+        default=0.0,
+        help="0 processes to end; use 10 for a test",
+    )
     parser.add_argument("--ffmpeg-bin", default="ffmpeg")
     parser.add_argument("--ffprobe-bin", default="ffprobe")
     return parser
