@@ -1,4 +1,4 @@
-"""AV1 FFmpeg encoders."""
+"""AV1 FFmpeg encoders with automatic 8-bit/10-bit output."""
 
 from __future__ import annotations
 
@@ -108,12 +108,6 @@ def _codec_args(
 
 
 def _libaom_tile_args(width: int, height: int) -> tuple[list[str], str]:
-    """Increase libaom parallelism without changing CRF or cpu-used.
-
-    FFmpeg/libaom may use a single tile up through 4K. Multiple tiles allow
-    row-mt and the encoder thread pool to utilize more CPU cores. Keep the tile
-    count conservative to limit the coding-efficiency penalty.
-    """
     if width >= 3840 or height >= 2160:
         return ["-tiles", "2x2"], "2x2"
     if width >= 1920 or height >= 1080:
@@ -121,10 +115,19 @@ def _libaom_tile_args(width: int, height: int) -> tuple[list[str], str]:
     return [], "1x1"
 
 
-class RawVideoWriter:
-    """RGB24 FFmpeg writer for CPU/NVENC AV1.
+def _frame_pixel_formats(frame: np.ndarray, codec: str) -> tuple[str, str]:
+    if frame.dtype.kind == "u" and frame.dtype.itemsize == 1:
+        return "rgb24", "yuv420p"
+    if frame.dtype.kind == "u" and frame.dtype.itemsize == 2:
+        output_pix_fmt = "p010le" if codec == "av1_nvenc" else "yuv420p10le"
+        return "rgb48le", output_pix_fmt
+    raise RuntimeError(f"Unsupported inference frame dtype for encoding: {frame.dtype}")
 
-    libaom-av1 uses a small background queue so GPU inference can overlap CPU
+
+class RawVideoWriter:
+    """AV1 writer that selects 8-bit or 10-bit output from the first frame.
+
+    libaom-av1 keeps the asynchronous queue so GPU inference can overlap CPU
     encoding instead of blocking on every frame written to FFmpeg stdin.
     """
 
@@ -147,39 +150,18 @@ class RawVideoWriter:
         if codec not in CODECS:
             raise RuntimeError(f"Non-AV1 codec reached AV1 writer: {codec}")
 
-        command = [
-            ffmpeg_bin,
-            "-y",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-s:v", f"{width}x{height}",
-            "-r", input_fps_rate,
-            "-i", "pipe:0",
-            "-an",
-        ]
-        if output_fps_rate != input_fps_rate:
-            command += ["-vf", f"fps={output_fps_rate}"]
-
-        command += ["-c:v", codec]
-        command += _codec_args(
-            codec,
-            crf,
-            cq,
-            nvenc_preset,
-            encode_gpu,
-            _SVTAV1_PRESET,
-            _AOM_CPU_USED,
-        )
-
-        tile_name = "n/a"
-        if codec == "libaom-av1":
-            tile_args, tile_name = _libaom_tile_args(width, height)
-            command += tile_args
-
-        command += ["-pix_fmt", "yuv420p", "-tag:v", "av01", str(path)]
-        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.path = path
+        self.ffmpeg_bin = ffmpeg_bin
+        self.width = width
+        self.height = height
+        self.input_fps_rate = input_fps_rate
+        self.output_fps_rate = output_fps_rate
+        self.codec = codec
+        self.crf = crf
+        self.cq = cq
+        self.nvenc_preset = nvenc_preset
+        self.encode_gpu = encode_gpu
+        self.process: Optional[subprocess.Popen] = None
 
         self._queue: Optional[queue.Queue[Optional[np.ndarray]]] = None
         self._thread: Optional[threading.Thread] = None
@@ -194,14 +176,56 @@ class RawVideoWriter:
                 daemon=True,
             )
             self._thread.start()
+            _tile_args, tile_name = _libaom_tile_args(width, height)
             print(
                 f"[encoder] libaom parallelism: row-mt=1, tiles={tile_name}, "
                 f"async_queue={_AOM_QUEUE_DEPTH}",
                 flush=True,
             )
 
+    def _start(self, frame: np.ndarray) -> None:
+        if self.process is not None:
+            return
+
+        raw_pix_fmt, output_pix_fmt = _frame_pixel_formats(frame, self.codec)
+        command = [
+            self.ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-f", "rawvideo",
+            "-pix_fmt", raw_pix_fmt,
+            "-s:v", f"{self.width}x{self.height}",
+            "-r", self.input_fps_rate,
+            "-i", "pipe:0",
+            "-an",
+        ]
+        if self.output_fps_rate != self.input_fps_rate:
+            command += ["-vf", f"fps={self.output_fps_rate}"]
+
+        command += ["-c:v", self.codec]
+        command += _codec_args(
+            self.codec,
+            self.crf,
+            self.cq,
+            self.nvenc_preset,
+            self.encode_gpu,
+            _SVTAV1_PRESET,
+            _AOM_CPU_USED,
+        )
+        if self.codec == "libaom-av1":
+            tile_args, _tile_name = _libaom_tile_args(self.width, self.height)
+            command += tile_args
+
+        command += ["-pix_fmt", output_pix_fmt, "-tag:v", "av01", str(self.path)]
+        print(
+            f"[encoder] pixel format: {raw_pix_fmt} -> {output_pix_fmt} ({self.codec})",
+            flush=True,
+        )
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
     def _write_frame_sync(self, frame: np.ndarray) -> None:
-        assert self.process.stdin is not None
+        assert self.process is not None and self.process.stdin is not None
         self.process.stdin.write(memoryview(frame).cast("B"))
 
     def _write_loop(self) -> None:
@@ -227,10 +251,12 @@ class RawVideoWriter:
             raise RuntimeError("cannot write to a closed AV1 encoder")
 
         frame = np.ascontiguousarray(frame)
+        self._start(frame)
         if self._queue is None:
             try:
                 self._write_frame_sync(frame)
             except BrokenPipeError as error:
+                assert self.process is not None
                 detail = self.process.stderr.read().decode(errors="replace") if self.process.stderr else ""
                 raise RuntimeError(f"ffmpeg encoder closed its input early:\n{detail}") from error
             return
@@ -258,6 +284,8 @@ class RawVideoWriter:
                         break
             self._thread.join()
 
+        if self.process is None:
+            return
         if self.process.stdin is not None:
             try:
                 self.process.stdin.close()
