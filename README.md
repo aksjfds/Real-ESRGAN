@@ -13,11 +13,11 @@
 - `realesrgan.ipynb`：Kaggle Notebook。
 - `inference/runtime.py`：视频探测/解码、8/10-bit 精度保持、模型加载与单帧 full-frame 推理等基础能力。
 - `inference/basicvsrpp.py`：BasicVSR++ NTIRE Track 1 同分辨率视频恢复、时序 clip、场景切换保护与显存自适应分块。
+- `inference/checkpoint_parts.py`：将仓库内 BasicVSR++ checkpoint 分片临时合并、校验后交给 PyTorch 加载。
 - `inference/pipeline.py`：基础 full-frame SR、共享内存、顺序输出、Lanczos/编码流水线。
 - `inference/balanced_pipeline.py`：B/C 多 GPU 负载均衡；BasicVSR++ clip 并行后让全部 GPU 回到 full-frame SR。
 - `inference/models/`：`SRVGGNetCompact` 等推理模型结构。
-- `inference/weights/`：推理权重目录；BasicVSR++ checkpoint 固定目标路径由 Git LFS 管理。
-- `tools/vendor_basicvsrpp.sh`：从 OpenMMLab 下载并通过 Git LFS 暂存 BasicVSR++ Track 1 checkpoint。
+- `inference/weights/`：Real-ESRGAN 权重与 BasicVSR++ Track 1 的两个仓库分片。
 - `encode/runtime.py`：编码后端选择和 CLI 参数。
 - `encode/hevc.py`：H.264/HEVC 编码实现。
 - `encode/av1.py`：AV1 编码实现。
@@ -37,11 +37,12 @@ BasicVSR++ 输出与输入保持相同分辨率和整数位深：8-bit 输入返
 
 ## BasicVSR++ 权重
 
-固定文件名：
+官方 NTIRE 2021 Compressed Video Enhancement Track 1 checkpoint 已拆成两个普通 Git 文件放在 `inference/weights/`：
 
-`inference/weights/basicvsr_plusplus_c128n25_ntire_decompress_track1_20210223-7b2eba02.pth`
+- `basicvsr_plusplus_c128n25_ntire_decompress_track1_20210223-7b2eba02.pth.part01`
+- `basicvsr_plusplus_c128n25_ntire_decompress_track1_20210223-7b2eba02.pth.part02`
 
-该文件按 `.gitattributes` 使用 Git LFS 跟踪。可执行 `tools/vendor_basicvsrpp.sh` 下载官方 OpenMMLab checkpoint 并暂存到 LFS；在 LFS 对象尚未提交到仓库时，运行时仍保留原有的官方下载 fallback。
+B/C 启动时，`inference/checkpoint_parts.py` 会按顺序将两个分片写入系统临时目录中的完整 `.pth`，计算 SHA256 并要求前缀为 `7b2eba02`；加载期间各 BasicVSR++ 实例复用同一个临时文件，进程退出时自动删除。正常推理不再依赖运行时联网下载，也不需要 Git LFS。
 
 ## 推理策略
 
