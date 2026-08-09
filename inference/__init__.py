@@ -1,5 +1,5 @@
-"""Real-ESRGAN inference package."""
+"""Real-ESRGAN inference package.
 
-from .models import SRVGGNetCompact
-
-__all__ = ["SRVGGNetCompact"]
+Keep package initialization intentionally lightweight. The runtime installs the
+BasicSR/torchvision compatibility shim before importing model definitions.
+"""
