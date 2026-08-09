@@ -1,57 +1,84 @@
 #!/usr/bin/env python3
-"""Encoding-capability wrapper for the master/2.7 Real-ESRGAN runtime.
+"""Encoding extension for the master/2.7 Real-ESRGAN runtime.
 
-The underlying inference implementation remains ``realesrgan.py``. This entry
-only extends FFmpeg output support so the same inference path can encode:
+Legacy codecs already supported by master/2.7 are delegated directly to the
+original ``realesrgan.py`` entry point so their inference, multiprocessing and
+FFmpeg behavior remain byte-for-byte on the original code path.
 
-* CPU HEVC: libx265
-* GPU HEVC: hevc_nvenc
-* CPU AV1:  libsvtav1, with libaom-av1 fallback when SVT-AV1 is unavailable
-* GPU AV1:  av1_nvenc
+Only AV1 codecs use this extension layer:
 
-H.264 options from the 2.7 runtime remain available for compatibility.
+* CPU AV1: libsvtav1, with libaom-av1 fallback when SVT-AV1 is unavailable
+* GPU AV1: av1_nvenc
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
 
 
-def _load_base_runtime() -> ModuleType:
-    """Load the root ``realesrgan.py`` explicitly, not the ``realesrgan`` package.
+LEGACY_CODECS = {"libx264", "libx265", "h264_nvenc", "hevc_nvenc"}
+AV1_CODECS = {"libsvtav1", "libaom-av1", "av1_nvenc"}
+AV1_ONLY_OPTIONS = {"--svtav1-preset", "--aom-cpu-used"}
 
-    This repository contains both ``realesrgan.py`` and a ``realesrgan/`` package.
-    A normal ``import realesrgan`` can therefore resolve to the package, which does
-    not expose the video-runtime functions used by this wrapper.
-    """
-    module_name = "_master_realesrgan_runtime"
-    existing = sys.modules.get(module_name)
-    if existing is not None:
-        return existing
+
+def _argument_value(argv: list[str], option: str, default: str = "") -> str:
+    try:
+        index = argv.index(option)
+    except ValueError:
+        return default
+    if index + 1 >= len(argv):
+        return default
+    return argv[index + 1]
+
+
+def _strip_av1_only_options(argv: list[str]) -> list[str]:
+    """Remove wrapper-only options before delegating to master/2.7."""
+    result: list[str] = []
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item in AV1_ONLY_OPTIONS:
+            index += 2
+            continue
+        if any(item.startswith(option + "=") for option in AV1_ONLY_OPTIONS):
+            index += 1
+            continue
+        result.append(item)
+        index += 1
+    return result
+
+
+def _delegate_legacy_codec() -> None:
+    """Run legacy codecs through the untouched 2.7 executable path."""
+    argv = sys.argv[1:]
+    requested = _argument_value(argv, "--video-codec", "hevc_nvenc")
+    if requested not in LEGACY_CODECS:
+        return
 
     runtime_path = Path(__file__).resolve().with_name("realesrgan.py")
-    spec = importlib.util.spec_from_file_location(module_name, runtime_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load Real-ESRGAN runtime from {runtime_path}")
-    module = importlib.util.module_from_spec(spec)
-    # Register before execution so multiprocessing/dataclasses can resolve the
-    # module by name when spawned workers import/pickle runtime symbols.
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    delegated = _strip_av1_only_options(argv)
+    command = [sys.executable, str(runtime_path), *delegated]
+    print(
+        f"[encoder] legacy codec {requested}: delegating to master/2.7 realesrgan.py",
+        flush=True,
+    )
+    os.execv(sys.executable, command)
 
 
-base = _load_base_runtime()
+# IMPORTANT: do this before importing the AV1 compatibility runtime. HEVC/H.264
+# therefore never execute any wrapper monkey-patching or synthetic module code.
+_delegate_legacy_codec()
+
+
+import _master_realesrgan_runtime as base  # noqa: E402
+
 
 _SVTAV1_PRESET = 6
 _AOM_CPU_USED = 6
-
-
 _ORIGINAL_REQUIRE_ENCODER = base.require_encoder
 _ORIGINAL_VALIDATE_ARGS = base.validate_args
 
@@ -65,7 +92,6 @@ def _encoder_available(ffmpeg_bin: str, encoder: str) -> bool:
 
 
 def _resolve_requested_encoder(ffmpeg_bin: str, requested: str) -> str:
-    """Resolve environment-sensitive encoder aliases before video inference."""
     if requested == "libsvtav1" and not _encoder_available(ffmpeg_bin, requested):
         if _encoder_available(ffmpeg_bin, "libaom-av1"):
             print(
@@ -83,14 +109,13 @@ def _resolve_requested_encoder(ffmpeg_bin: str, requested: str) -> str:
 
 
 def _require_encoder(ffmpeg_bin: str, encoder: str) -> None:
-    """Keep the base encoder check but provide codec-specific diagnostics."""
     try:
         _ORIGINAL_REQUIRE_ENCODER(ffmpeg_bin, encoder)
     except RuntimeError as error:
         if encoder == "libsvtav1":
             raise RuntimeError(
                 "FFmpeg does not provide libsvtav1. Use an FFmpeg build configured "
-                "with --enable-libsvtav1, or use libaom-av1/libx265."
+                "with --enable-libsvtav1, or use libaom-av1."
             ) from error
         if encoder == "libaom-av1":
             raise RuntimeError(
@@ -100,30 +125,24 @@ def _require_encoder(ffmpeg_bin: str, encoder: str) -> None:
         if encoder == "av1_nvenc":
             raise RuntimeError(
                 "FFmpeg does not provide av1_nvenc. Use an FFmpeg build with NVENC AV1 "
-                "support and an AV1-capable NVIDIA GPU, or select CPU AV1/HEVC."
+                "support and an AV1-capable NVIDIA GPU."
             ) from error
         raise
 
 
-def _codec_args(
+def _av1_codec_args(
     codec: str,
     crf: int,
-    preset: str,
     cq: int,
     nvenc_preset: str,
     encode_gpu: int,
     svtav1_preset: int,
     aom_cpu_used: int,
 ) -> list[str]:
-    if codec in {"libx264", "libx265"}:
-        return ["-preset", preset, "-crf", str(crf)]
-
     if codec == "libsvtav1":
         return ["-preset", str(svtav1_preset), "-crf", str(crf)]
 
     if codec == "libaom-av1":
-        # Constant-quality AV1. -b:v 0 selects unconstrained constant quality;
-        # cpu-used controls the documented quality/speed tradeoff (0..8).
         return [
             "-crf", str(crf),
             "-b:v", "0",
@@ -131,39 +150,25 @@ def _codec_args(
             "-row-mt", "1",
         ]
 
-    if codec not in {"h264_nvenc", "hevc_nvenc", "av1_nvenc"}:
-        raise ValueError(f"Unsupported video encoder: {codec}")
+    if codec == "av1_nvenc":
+        return [
+            "-gpu", str(encode_gpu),
+            "-preset", nvenc_preset,
+            "-tune", "hq",
+            "-rc", "vbr",
+            "-cq", str(cq),
+            "-b:v", "0",
+            "-multipass", "fullres",
+            "-spatial_aq", "1",
+            "-temporal_aq", "1",
+            "-rc-lookahead", "32",
+        ]
 
-    # Keep the exact NVENC option spelling used by master/2.7. Older FFmpeg
-    # builds expose spatial_aq/temporal_aq but may not accept the newer aliases
-    # spatial-aq/temporal-aq.
-    args = [
-        "-gpu", str(encode_gpu),
-        "-preset", nvenc_preset,
-        "-tune", "hq",
-        "-rc", "vbr",
-        "-cq", str(cq),
-        "-b:v", "0",
-        "-multipass", "fullres",
-        "-spatial_aq", "1",
-        "-temporal_aq", "1",
-        "-rc-lookahead", "32",
-    ]
-    if codec in {"h264_nvenc", "hevc_nvenc"}:
-        args += ["-bf", "3"]
-    return args
-
-
-def _codec_tag(codec: str) -> list[str]:
-    if codec in {"libx265", "hevc_nvenc"}:
-        return ["-tag:v", "hvc1"]
-    if codec in {"libsvtav1", "libaom-av1", "av1_nvenc"}:
-        return ["-tag:v", "av01"]
-    return []
+    raise ValueError(f"Unsupported AV1 encoder: {codec}")
 
 
 class RawVideoWriter:
-    """2.7 RGB24 writer extended with separate software/NVENC AV1 paths."""
+    """AV1-only writer; legacy codecs never reach this class."""
 
     def __init__(
         self,
@@ -180,42 +185,38 @@ class RawVideoWriter:
         nvenc_preset: str,
         encode_gpu: int,
     ) -> None:
+        del preset
+        if codec not in AV1_CODECS:
+            raise RuntimeError(
+                f"Legacy codec {codec} unexpectedly reached the AV1 writer"
+            )
+
         command = [
             ffmpeg_bin,
             "-y",
             "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s:v",
-            f"{width}x{height}",
-            "-r",
-            input_fps_rate,
-            "-i",
-            "pipe:0",
+            "-loglevel", "error",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s:v", f"{width}x{height}",
+            "-r", input_fps_rate,
+            "-i", "pipe:0",
             "-an",
         ]
         if output_fps_rate != input_fps_rate:
             command += ["-vf", f"fps={output_fps_rate}"]
 
         command += ["-c:v", codec]
-        command += _codec_args(
+        command += _av1_codec_args(
             codec,
             crf,
-            preset,
             cq,
             nvenc_preset,
             encode_gpu,
             _SVTAV1_PRESET,
             _AOM_CPU_USED,
         )
-        # Preserve master/2.7 output semantics: 8-bit YUV 4:2:0.
-        command += ["-pix_fmt", "yuv420p"]
-        command += _codec_tag(codec)
-        command.append(str(path))
+        command += ["-pix_fmt", "yuv420p", "-tag:v", "av01", str(path)]
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -249,33 +250,26 @@ class RawVideoWriter:
 
 
 def _probe_encoder_runtime(args: argparse.Namespace) -> None:
-    """Verify the selected encoder can actually initialize before model inference."""
     command = [
         args.ffmpeg_bin,
         "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        "color=black:size=128x128:rate=1,format=rgb24",
-        "-frames:v",
-        "1",
-        "-c:v",
-        args.video_codec,
+        "-loglevel", "error",
+        "-f", "lavfi",
+        "-i", "color=black:size=128x128:rate=1,format=rgb24",
+        "-frames:v", "1",
+        "-c:v", args.video_codec,
+        *_av1_codec_args(
+            args.video_codec,
+            args.crf,
+            args.cq,
+            args.nvenc_preset,
+            args.encode_gpu,
+            args.svtav1_preset,
+            args.aom_cpu_used,
+        ),
+        "-pix_fmt", "yuv420p",
+        "-f", "null", "-",
     ]
-    command += _codec_args(
-        args.video_codec,
-        args.crf,
-        args.preset,
-        args.cq,
-        args.nvenc_preset,
-        args.encode_gpu,
-        args.svtav1_preset,
-        args.aom_cpu_used,
-    )
-    command += ["-pix_fmt", "yuv420p", "-f", "null", "-"]
-
     result = subprocess.run(
         command,
         stdout=subprocess.PIPE,
@@ -299,7 +293,6 @@ def _probe_encoder_runtime(args: argparse.Namespace) -> None:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    """Reuse 2.7 validation while widening AV1 quality ranges."""
     original_crf = int(args.crf)
     original_cq = int(args.cq)
 
@@ -313,15 +306,14 @@ def validate_args(args: argparse.Namespace) -> None:
         args.crf = original_crf
         args.cq = original_cq
 
-    if args.video_codec in {"libsvtav1", "libaom-av1"}:
-        if not 0 <= original_crf <= 63:
-            raise ValueError("--crf must be between 0 and 63 for CPU AV1")
+    if args.video_codec in {"libsvtav1", "libaom-av1"} and not 0 <= original_crf <= 63:
+        raise ValueError("--crf must be between 0 and 63 for CPU AV1")
+    if args.video_codec == "av1_nvenc" and not 0 <= original_cq <= 63:
+        raise ValueError("--cq must be between 0 and 63 for av1_nvenc")
     if not 0 <= args.svtav1_preset <= 13:
         raise ValueError("--svtav1-preset must be between 0 and 13")
     if not 0 <= args.aom_cpu_used <= 8:
         raise ValueError("--aom-cpu-used must be between 0 and 8")
-    if args.video_codec == "av1_nvenc" and not 0 <= original_cq <= 63:
-        raise ValueError("--cq must be between 0 and 63 for av1_nvenc")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -338,9 +330,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "av1_nvenc",
             )
             action.help = (
-                "Video encoder: CPU HEVC=libx265, GPU HEVC=hevc_nvenc, "
-                "CPU AV1=libsvtav1/libaom-av1, GPU AV1=av1_nvenc. "
-                "Requesting libsvtav1 automatically falls back to libaom-av1 if needed."
+                "Legacy HEVC/H.264 codecs delegate to master/2.7; "
+                "CPU AV1=libsvtav1/libaom-av1, GPU AV1=av1_nvenc"
             )
             break
     parser.add_argument(
@@ -358,7 +349,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# Patch only encoding-facing globals used by base.process_video().
 base.require_encoder = _require_encoder
 base.RawVideoWriter = RawVideoWriter
 base.validate_args = validate_args
@@ -369,10 +359,13 @@ def main() -> None:
     args = build_parser().parse_args()
     validate_args(args)
 
+    if args.video_codec not in AV1_CODECS:
+        raise RuntimeError(
+            f"Legacy codec {args.video_codec} should have been delegated before AV1 setup"
+        )
+
     base.require_binary(args.ffmpeg_bin)
     args.video_codec = _resolve_requested_encoder(args.ffmpeg_bin, args.video_codec)
-    # Validate again after environment-driven fallback so codec-specific limits
-    # are applied to the actual encoder that will run.
     validate_args(args)
 
     _SVTAV1_PRESET = int(args.svtav1_preset)
