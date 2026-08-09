@@ -47,7 +47,7 @@ def main() -> None:
             install_autotune(source.width, source.height)
         except Exception as error:
             print(
-                f"[basicvsrpp-autotune] source probe unavailable ({error}); using hardware-only search",
+                f"[autotuner] source probe unavailable ({error}); using hardware-only search",
                 flush=True,
             )
             install_autotune()
