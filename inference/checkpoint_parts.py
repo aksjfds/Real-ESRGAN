@@ -13,15 +13,24 @@ _MODEL_NAME = "basicvsr_plusplus_c128n25_ntire_decompress_track1_20210223-7b2eba
 _EXPECTED_SHA256_PREFIX = "7b2eba02"
 _LOCK = threading.Lock()
 _MERGED_PATH: Path | None = None
+_COMPAT_PATH: Path | None = None
 
 
 def _cleanup() -> None:
-    global _MERGED_PATH
-    path = _MERGED_PATH
+    global _MERGED_PATH, _COMPAT_PATH
+    compat = _COMPAT_PATH
+    merged = _MERGED_PATH
+    _COMPAT_PATH = None
     _MERGED_PATH = None
-    if path is not None:
+    if compat is not None:
         try:
-            path.unlink(missing_ok=True)
+            if compat.is_symlink():
+                compat.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if merged is not None:
+        try:
+            merged.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -48,6 +57,30 @@ def _parts(checkpoint_dir: Path) -> list[Path]:
     return parts
 
 
+def _ensure_compat_link(checkpoint_dir: Path, merged: Path) -> Path:
+    """Expose the old full-checkpoint pathname as a temporary symlink.
+
+    The balanced multi-GPU reader passes that pathname to secondary BasicVSR++
+    instances. Keeping the compatibility link avoids a second merge while the
+    repository itself continues to contain only split parts.
+    """
+
+    global _COMPAT_PATH
+    compat = checkpoint_dir / _MODEL_NAME
+    if compat.exists() and not compat.is_symlink():
+        return compat
+    if os.path.lexists(compat):
+        compat.unlink()
+    try:
+        compat.symlink_to(merged)
+    except OSError as error:
+        raise RuntimeError(
+            f"Unable to create temporary BasicVSR++ checkpoint link: {compat} -> {merged}"
+        ) from error
+    _COMPAT_PATH = compat
+    return compat
+
+
 def resolve_checkpoint(checkpoint_dir: Path) -> Path:
     """Merge ordered repository parts into one temporary verified checkpoint."""
 
@@ -55,7 +88,12 @@ def resolve_checkpoint(checkpoint_dir: Path) -> Path:
     checkpoint_dir = Path(checkpoint_dir).resolve()
     with _LOCK:
         if _MERGED_PATH is not None and _MERGED_PATH.is_file():
+            _ensure_compat_link(checkpoint_dir, _MERGED_PATH)
             return _MERGED_PATH
+
+        compat = checkpoint_dir / _MODEL_NAME
+        if compat.is_file() and not compat.is_symlink():
+            return compat
 
         parts = _parts(checkpoint_dir)
         fd, temporary_name = tempfile.mkstemp(
@@ -82,6 +120,7 @@ def resolve_checkpoint(checkpoint_dir: Path) -> Path:
                     f"sha256={sha256}, expected prefix={_EXPECTED_SHA256_PREFIX}"
                 )
             _MERGED_PATH = temporary
+            _ensure_compat_link(checkpoint_dir, temporary)
             print(
                 f"[basicvsrpp] joined {len(parts)} bundled checkpoint parts | sha256={sha256[:12]}...",
                 flush=True,
@@ -89,4 +128,5 @@ def resolve_checkpoint(checkpoint_dir: Path) -> Path:
             return temporary
         except Exception:
             temporary.unlink(missing_ok=True)
+            _MERGED_PATH = None
             raise
