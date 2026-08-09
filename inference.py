@@ -9,29 +9,35 @@ from pathlib import Path
 from encode import runtime as encode_runtime
 from inference import balanced_pipeline as inference_pipeline
 from inference import runtime as inference_runtime
+from inference.source_profiles import PROFILE_CHOICES, SOURCE_PROFILES
 
 
 def main() -> None:
     parser = inference_runtime.build_parser()
     parser.add_argument(
         "--source-profile",
-        choices=("A", "B", "C"),
+        choices=PROFILE_CHOICES,
         default="A",
         help=(
-            "A=BasicVSR++ off; B=light NTIRE compressed-video restoration; "
-            "C=stronger restoration for visibly compressed/noisy sources"
+            "A=BasicVSR++ off; B=25%%; C=50%%; D=75%%; "
+            "E=100%% full-strength NTIRE compressed-video restoration"
         ),
     )
     encode_runtime.extend_parser(parser)
     args = parser.parse_args()
     encode_runtime.prepare_runtime(inference_runtime, args)
 
+    # Keep the CLI as the single public entry while allowing the pipeline to
+    # share the extended A-E profile table without duplicating configuration.
+    inference_pipeline.base_pipeline.SOURCE_PROFILES = SOURCE_PROFILES
+
     if args.source_profile != "A":
-        # B/C always use the checkpoint parts bundled in inference/weights.
+        # B-E always use the checkpoint parts bundled in inference/weights.
         from inference import basicvsrpp
         from inference.basicvsrpp_autotune import install_autotune
         from inference.checkpoint_parts import resolve_checkpoint
 
+        basicvsrpp.SOURCE_PROFILES = SOURCE_PROFILES
         basicvsrpp.download_checkpoint = resolve_checkpoint
         try:
             source = inference_runtime.probe_video(
