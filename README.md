@@ -1,12 +1,13 @@
 # Real-ESRGAN 动画视频推理
 
-仓库只保留一套以画质优先的 full-frame 视频推理流程，并按职责拆分为推理与编码两部分。
+仓库只保留一套以画质优先的 full-frame 视频推理流程，并按职责拆分为推理、流水线调度与编码。
 
 ## 结构
 
 - `inference.py`：统一命令行入口。
 - `realesrgan.ipynb`：Kaggle Notebook。
-- `inference/runtime.py`：视频探测/解码、8/10-bit 精度保持、full-frame 多 GPU 推理、原生倍率输出、全帧 Lanczos4 缩放、进度与音频封装。
+- `inference/runtime.py`：视频探测/解码、8/10-bit 精度保持、模型加载与单帧 full-frame 推理等基础能力。
+- `inference/pipeline.py`：多 GPU full-frame 流水线、共享内存帧传输、输出顺序控制以及 Lanczos/编码并行。
 - `inference/models/`：`SRVGGNetCompact` 等推理模型结构。
 - `inference/weights/`：随仓库提供的推理权重。
 - `encode/runtime.py`：编码后端选择和 CLI 参数。
@@ -16,7 +17,7 @@
 
 ## 推理策略
 
-推理固定使用 full-frame，不再包含 tile、batch 自动调参或 tile 融合逻辑。
+推理固定使用 full-frame，不包含 tile、batch 自动调参或 tile 融合逻辑。
 
 - CUDA：自动使用 FP16 + channels-last。
 - CPU：自动使用 FP32。
@@ -24,6 +25,15 @@
 - 模型始终输出原生倍率。
 - 当目标倍率小于模型原生倍率时，完整帧推理结束后仅做一次全帧 Lanczos4 缩放。
 - 8-bit 源输出 8-bit；10-bit 源使用高精度 RGB 推理并输出 10-bit。
+
+## 流水线
+
+当前公开入口使用 `inference/pipeline.py`：
+
+- 输入帧和模型原生倍率输出都通过共享内存传递，`multiprocessing.Queue` 只传递 frame ID / worker ID 等小型元数据。
+- 某张 GPU 完成一帧后会立即接收下一帧，不再等待其它 GPU、Lanczos 缩放和视频编码全部完成。
+- 上一帧的全帧 Lanczos4 与 FFmpeg/NVENC 写入在独立输出线程执行，与后续 GPU 推理重叠。
+- 输出仍按原始帧顺序写入视频。
 
 ## 编码
 
