@@ -6,8 +6,8 @@
 
 - `inference.py`：统一命令行入口。
 - `realesrgan.ipynb`：Kaggle Notebook。
-- `inference/runtime.py`：视频探测/解码、8/10-bit 精度保持、Real-ESRGAN、多 GPU worker、tile、融合、进度与音频封装。
-- `inference/autotune.py`：在实际 GPU 上测试 full-frame / tile / batch，并选择预计整帧最快的安全组合。
+- `inference/runtime.py`：视频探测/解码、8/10-bit 精度保持、Real-ESRGAN、多 GPU worker、原生倍率重建、全帧 Lanczos4 缩放、进度与音频封装。
+- `inference/autotune.py`：`FULL_FRAME=False` 时，在实际 GPU 上自动寻找质量安全的 tile + batch 最快组合。
 - `inference/models/`：`SRVGGNetCompact` 等推理模型结构。
 - `inference/weights/`：随仓库提供的推理权重。
 - `encode/runtime.py`：编码后端选择和 CLI 参数。
@@ -15,15 +15,29 @@
 - `encode/av1.py`：AV1 编码实现，包括 `libsvtav1`、`libaom-av1`、`av1_nvenc`。
 - `requirements.txt`：运行依赖。
 
-## 自动调参
+## 推理模式
 
-Notebook 默认启用 `AUTO_TILE` 和 `AUTO_BATCH`。
+Notebook 只使用一个 `FULL_FRAME` 参数控制推理方式：
 
-- 自动测试 full-frame 与不小于 512 的 tile，避免为了速度主动选择过小 tile。
-- tiled 候选会继续测试不同 batch，并自动过滤 OOM 组合。
-- 评分按 master 当前多 GPU 分配方式估算整帧耗时，而不是简单选择最大 tile 或最大 batch。
-- 若 full-frame 能运行并且预计最快，也会直接选择 full-frame。
-- 关闭自动选项后仍可使用 `TILE_SIZE` / `BATCH_SIZE` 手动指定。
+- `FULL_FRAME=True`：画质优先，固定整帧推理，不进行 tile / batch 自动搜索。
+- `FULL_FRAME=False`：启用自动 tile + batch 搜索；tile 不会主动选择小于 512 的值，并自动过滤 OOM 组合。
+- `MAX_TILE_SIZE` / `MAX_BATCH_SIZE` 控制自动搜索上限；`TILE_SIZE` / `BATCH_SIZE` 作为额外候选和 CPU 回退值。
+
+## 输出缩放
+
+模型始终运行其原生倍率。以 AnimeVideo-v3 的 `SCALE=2` 为例：
+
+```text
+AnimeVideo-v3 原生 x4
+        ↓
+完整 x4 帧（tile 模式先在 x4 完成融合）
+        ↓
+一次全帧 Lanczos4
+        ↓
+最终 x2
+```
+
+不再在 worker 内对每个 frame/tile 使用 bicubic 从 x4 缩回 x2，从而避免逐 tile 重采样造成额外的线条软化和边界差异。
 
 ## 编码
 
