@@ -6,6 +6,7 @@ from __future__ import annotations
 import multiprocessing as mp
 
 from encode import runtime as encode_runtime
+from inference import pipeline as inference_pipeline
 from inference import runtime as inference_runtime
 
 
@@ -14,7 +15,7 @@ def main() -> None:
     encode_runtime.extend_parser(parser)
     args = parser.parse_args()
     encode_runtime.prepare_runtime(inference_runtime, args)
-    inference_runtime.process_video(args)
+    inference_pipeline.process_video(args)
 
 
 if __name__ == "__main__":
