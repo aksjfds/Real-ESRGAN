@@ -6,9 +6,11 @@
 
 - `inference.py`：统一命令行入口。
 - `realesrgan.ipynb`：Kaggle Notebook。
-- `inference/runtime.py`：Real-ESRGAN 视频推理、多 GPU worker、tile、解码、音频封装等核心逻辑。
-- `inference/models/`：`SRVGGNetCompact` 等推理所需模型结构。
-- `encode/runtime.py`：AV1 编码扩展；原有 H.264/HEVC 仍直接使用推理核心中的 writer。
+- `inference/runtime.py`：视频解码、Real-ESRGAN 模型、多 GPU worker、tile、融合、进度与音频封装。
+- `inference/models/`：`SRVGGNetCompact` 等推理模型结构。
+- `encode/runtime.py`：编码后端选择和 CLI 参数。
+- `encode/hevc.py`：H.264/HEVC 编码实现，包括 `libx264`、`libx265`、`h264_nvenc`、`hevc_nvenc`。
+- `encode/av1.py`：AV1 编码实现，包括 `libsvtav1`、`libaom-av1`、`av1_nvenc`。
 - `requirements.txt`：运行依赖。
 
 ## 编码
@@ -19,8 +21,9 @@
 - GPU HEVC：`hevc_nvenc`
 - CPU AV1：`libsvtav1`，缺失时自动尝试 `libaom-av1`
 - GPU AV1：`av1_nvenc`（需要 FFmpeg、驱动和 GPU 都支持 AV1 NVENC）
+- 兼容 H.264：`libx264` / `h264_nvenc`
 
-H.264 的 `libx264` / `h264_nvenc` 仍保留兼容。
+推理目录不包含具体视频编码器实现；所有 codec 参数、encoder 检测和视频 writer 都集中在 `encode/`。
 
 ## 使用
 

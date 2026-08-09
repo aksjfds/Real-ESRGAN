@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Fast multi-GPU Real-ESRGAN video upscaling for Kaggle.
+"""Fast multi-GPU Real-ESRGAN video inference for Kaggle.
 
-The parent process owns video decoding, overlap blending, progress reporting and
-encoding.  Exactly one persistent worker (and therefore one model copy) is
-created for every selected GPU.  Workers process fixed-size tiles in batches.
+The parent process owns video decoding, overlap blending and progress reporting.
+Concrete video encoder implementations are injected by the root ``inference.py``
+entry point from the ``encode`` package.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple, Type
 
 import cv2
 import numpy as np
@@ -32,9 +32,6 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-# BasicSR 1.4.2 imports a module removed by newer torchvision releases.  Kaggle
-# images often contain such a newer torchvision, so provide the one symbol that
-# BasicSR needs before importing it.
 try:  # pragma: no cover - depends on the installed torchvision version
     import torchvision.transforms.functional_tensor  # noqa: F401
 except (ImportError, ModuleNotFoundError):  # pragma: no cover
@@ -45,7 +42,7 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover
     sys.modules["torchvision.transforms.functional_tensor"] = _functional_tensor
 
 from basicsr.archs.rrdbnet_arch import RRDBNet
-from realesrgan.archs.srvgg_arch import SRVGGNetCompact
+from .models.srvgg_arch import SRVGGNetCompact
 
 
 MODEL_URLS = {
@@ -71,6 +68,24 @@ MODEL_URLS = {
 }
 
 
+class VideoWriter(Protocol):
+    def write(self, frame: np.ndarray) -> None: ...
+    def close(self) -> None: ...
+
+
+_RequireEncoder = Callable[[str, str], None]
+_WriterType = Type[VideoWriter]
+_require_encoder: Optional[_RequireEncoder] = None
+_writer_type: Optional[_WriterType] = None
+
+
+def set_encoding_backend(require_encoder_fn: _RequireEncoder, writer_type: _WriterType) -> None:
+    """Install a concrete encoding backend supplied by ``encode``."""
+    global _require_encoder, _writer_type
+    _require_encoder = require_encoder_fn
+    _writer_type = writer_type
+
+
 @dataclass(frozen=True)
 class VideoInfo:
     width: int
@@ -84,6 +99,7 @@ class VideoInfo:
     @property
     def fps(self) -> float:
         return self.fps_num / self.fps_den
+
 
 @dataclass(frozen=True)
 class TileInfo:
@@ -133,12 +149,6 @@ def require_binary(name: str) -> None:
         )
 
 
-def require_encoder(ffmpeg_bin: str, encoder: str) -> None:
-    result = run_checked([ffmpeg_bin, "-hide_banner", "-encoders"], "ffmpeg encoder probe")
-    if encoder not in (result.stdout + result.stderr):
-        raise RuntimeError(f"ffmpeg does not provide the requested video encoder: {encoder}")
-
-
 def parse_rate(value: str) -> Fraction:
     if not value or value in {"0/0", "N/A"}:
         raise ValueError(f"Invalid video frame rate: {value!r}")
@@ -149,7 +159,6 @@ def parse_rate(value: str) -> Fraction:
 
 
 def parse_output_rate(value: str, source_rate: Fraction) -> Fraction:
-    """Resolve an output FPS value while preserving rational rates exactly."""
     normalized = str(value).strip().lower()
     if normalized in {"", "0", "auto", "source", "original"}:
         return source_rate
@@ -281,7 +290,7 @@ def build_model(name: str) -> Tuple[torch.nn.Module, int]:
 def torch_load_cpu(path: str) -> Dict[str, object]:
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:  # PyTorch before weights_only was added
+    except TypeError:
         return torch.load(path, map_location="cpu")
 
 
@@ -321,7 +330,6 @@ def infer_image_batch(
     output_scale: float,
     channels_last: bool,
 ) -> List[np.ndarray]:
-    # The raw pipeline is RGB end-to-end, matching the model's training order.
     input_height, input_width = patches[0].shape[:2]
     rgb = np.stack(patches)
     tensor = torch.from_numpy(rgb).permute(0, 3, 1, 2).to(device, non_blocking=True)
@@ -367,8 +375,6 @@ def worker_main(
                 break
             job_type, job_id, indexed_patches = job
             results = []
-            # Full-frame jobs contain at most one frame per GPU.  Tile jobs use
-            # the configured batch size to improve Tensor Core occupancy.
             batch_size = config.batch_size if job_type == "tiles" else 1
             for offset in range(0, len(indexed_patches), batch_size):
                 chunk = indexed_patches[offset : offset + batch_size]
@@ -385,7 +391,7 @@ def worker_main(
                 )
                 results.extend(zip(indices, outputs))
             output_queue.put((f"{job_type}_result", worker_id, job_id, results))
-    except Exception as error:  # send failures to the parent instead of hanging it
+    except Exception as error:
         output_queue.put(("error", worker_id, repr(error), traceback.format_exc()))
 
 
@@ -500,9 +506,6 @@ class RawVideoReader:
         vf = f"scale={width}:{height}:flags=lanczos,fps={fps_rate}"
         command = [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
         if start > 0:
-            # Input-side seeking is still accurate while transcoding (ffmpeg's
-            # accurate_seek is enabled by default) and avoids decoding minutes
-            # of video before an arbitrary 10-second test range.
             command += ["-ss", f"{start:.6f}"]
         command += ["-i", str(input_path)]
         command += [
@@ -542,106 +545,10 @@ class RawVideoReader:
             raise RuntimeError(f"ffmpeg decode failed (exit {return_code}):\n{stderr.decode(errors='replace')}")
 
 
-class RawVideoWriter:
-    def __init__(
-        self,
-        path: Path,
-        ffmpeg_bin: str,
-        width: int,
-        height: int,
-        input_fps_rate: str,
-        output_fps_rate: str,
-        codec: str,
-        crf: int,
-        preset: str,
-        cq: int,
-        nvenc_preset: str,
-        encode_gpu: int,
-    ) -> None:
-        command = [
-            ffmpeg_bin,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s:v",
-            f"{width}x{height}",
-            "-r",
-            input_fps_rate,
-            "-i",
-            "pipe:0",
-            "-an",
-        ]
-        if output_fps_rate != input_fps_rate:
-            # Raising FPS duplicates already-enhanced frames here instead of
-            # running identical source frames through the model repeatedly.
-            command += ["-vf", f"fps={output_fps_rate}"]
-        command += ["-c:v", codec]
-        if codec in {"libx264", "libx265"}:
-            command += ["-preset", preset, "-crf", str(crf)]
-        else:
-            # NVENC runs on T4's dedicated encoder block.  CQ is the quality
-            # target; it is intentionally separate from software-codec CRF.
-            command += [
-                "-gpu",
-                str(encode_gpu),
-                "-preset",
-                nvenc_preset,
-                "-tune",
-                "hq",
-                "-rc",
-                "vbr",
-                "-cq",
-                str(cq),
-                "-b:v",
-                "0",
-                "-multipass",
-                "fullres",
-                "-spatial_aq",
-                "1",
-                "-temporal_aq",
-                "1",
-                "-rc-lookahead",
-                "32",
-                "-bf",
-                "3",
-            ]
-        command += ["-pix_fmt", "yuv420p"]
-        if codec in {"libx265", "hevc_nvenc"}:
-            command += ["-tag:v", "hvc1"]
-        command.append(str(path))
-        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    def write(self, frame: np.ndarray) -> None:
-        assert self.process.stdin is not None
-        try:
-            self.process.stdin.write(memoryview(np.ascontiguousarray(frame)).cast("B"))
-        except BrokenPipeError as error:
-            detail = self.process.stderr.read().decode(errors="replace") if self.process.stderr else ""
-            raise RuntimeError(f"ffmpeg encoder closed its input early:\n{detail}") from error
-
-    def close(self) -> None:
-        if self.process.stdin is not None:
-            self.process.stdin.close()
-        stderr = self.process.stderr.read() if self.process.stderr is not None else b""
-        if self.process.stderr is not None:
-            self.process.stderr.close()
-        return_code = self.process.wait()
-        if return_code != 0:
-            raise RuntimeError(f"ffmpeg encode failed (exit {return_code}):\n{stderr.decode(errors='replace')}")
-
-
 def axis_starts(length: int, tile_size: int, overlap: int) -> List[int]:
     if length <= tile_size:
         return [0]
     stride = tile_size - overlap
-    # Let the final tile be smaller and reflect-pad it to tile_size.  Moving a
-    # full-size final tile back to the frame edge can create an almost complete
-    # duplicate tile when a dimension is only slightly larger than tile_size.
     return list(range(0, length, stride))
 
 
@@ -710,8 +617,6 @@ def blend_tiles(
         weight_sum[oy0:oy1, ox0:ox1] += weight
     if np.any(weight_sum <= 0):
         raise RuntimeError("Tile fusion produced uncovered output pixels; check tile/overlap settings.")
-    # Keep the large full-frame operations in-place to avoid several extra
-    # 95 MiB temporaries at 4K (and roughly 380 MiB each at 8K).
     np.divide(accumulator, weight_sum, out=accumulator)
     np.rint(accumulator, out=accumulator)
     np.clip(accumulator, 0, 255, out=accumulator)
@@ -757,52 +662,32 @@ def mux_audio(
     base = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", str(silent_video)]
     if audio_codec == "aac":
         command = base + [
-            "-ss",
-            f"{start:.6f}",
-            "-t",
-            f"{duration:.6f}",
-            "-i",
-            str(input_path),
-            "-filter_complex",
-            f"[1:a:0]atrim=start=0:duration={duration:.6f},asetpts=PTS-STARTPTS[a]",
-            "-map",
-            "0:v:0",
-            "-map",
-            "[a]",
-            "-map_metadata",
-            "1",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            audio_bitrate,
+            "-ss", f"{start:.6f}",
+            "-t", f"{duration:.6f}",
+            "-i", str(input_path),
+            "-filter_complex", f"[1:a:0]atrim=start=0:duration={duration:.6f},asetpts=PTS-STARTPTS[a]",
+            "-map", "0:v:0",
+            "-map", "[a]",
+            "-map_metadata", "1",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", audio_bitrate,
             "-shortest",
-            "-movflags",
-            "+faststart",
+            "-movflags", "+faststart",
             str(output_path),
         ]
     else:
         command = base + [
-            "-ss",
-            f"{start:.6f}",
-            "-t",
-            f"{duration:.6f}",
-            "-i",
-            str(input_path),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-map_metadata",
-            "1",
-            "-c",
-            "copy",
+            "-ss", f"{start:.6f}",
+            "-t", f"{duration:.6f}",
+            "-i", str(input_path),
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-map_metadata", "1",
+            "-c", "copy",
             "-shortest",
-            "-avoid_negative_ts",
-            "make_zero",
-            "-movflags",
-            "+faststart",
+            "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart",
             str(output_path),
         ]
     try:
@@ -853,12 +738,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--overlap must be non-negative and less than half of --tile-size.")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1.")
-    if not 0 <= args.crf <= 51:
-        raise ValueError("--crf must be between 0 and 51.")
-    if not 0 <= args.cq <= 51:
-        raise ValueError("--cq must be between 0 and 51.")
-    if args.encode_gpu < 0:
-        raise ValueError("--encode-gpu must be non-negative.")
     if not 0 <= args.denoise_strength <= 1:
         raise ValueError("--denoise-strength must be between 0 and 1.")
     if args.progress_interval <= 0:
@@ -868,7 +747,7 @@ def validate_args(args: argparse.Namespace) -> None:
 def log_devices(gpu_ids: Sequence[Optional[int]], fp16: bool) -> None:
     for gpu_id in gpu_ids:
         if gpu_id is None:
-            print(f"[device] CPU, fp16=False", flush=True)
+            print("[device] CPU, fp16=False", flush=True)
         else:
             props = torch.cuda.get_device_properties(gpu_id)
             memory_gib = props.total_memory / (1024**3)
@@ -879,9 +758,12 @@ def log_devices(gpu_ids: Sequence[Optional[int]], fp16: bool) -> None:
 
 
 def process_video(args: argparse.Namespace) -> None:
+    if _require_encoder is None or _writer_type is None:
+        raise RuntimeError("Encoding backend is not configured. Run through root inference.py.")
+
     require_binary(args.ffmpeg_bin)
     require_binary(args.ffprobe_bin)
-    require_encoder(args.ffmpeg_bin, args.video_codec)
+    _require_encoder(args.ffmpeg_bin, args.video_codec)
     input_path = Path(args.input).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
     if not input_path.is_file():
@@ -961,7 +843,7 @@ def process_video(args: argparse.Namespace) -> None:
     log_devices(gpu_ids, effective_fp16)
 
     reader: Optional[RawVideoReader] = None
-    writer: Optional[RawVideoWriter] = None
+    writer: Optional[VideoWriter] = None
     workers: Optional[PersistentWorkers] = None
     processed = 0
     started = time.monotonic()
@@ -988,7 +870,7 @@ def process_video(args: argparse.Namespace) -> None:
             start,
             duration,
         )
-        writer = RawVideoWriter(
+        writer = _writer_type(
             temporary_video,
             args.ffmpeg_bin,
             output_width,
@@ -1156,20 +1038,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=4, help="Tiles per inference batch on each GPU")
     parser.add_argument("--gpu-ids", default="0,1", help="Comma-separated IDs, or cpu")
     parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument(
-        "--video-codec",
-        choices=("libx264", "libx265", "h264_nvenc", "hevc_nvenc"),
-        default="hevc_nvenc",
-    )
-    parser.add_argument("--crf", type=int, default=18, help="Lower is higher video quality/larger file")
-    parser.add_argument(
-        "--preset",
-        choices=("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower"),
-        default="medium",
-    )
-    parser.add_argument("--cq", type=int, default=18, help="NVENC quality target; lower is higher quality")
-    parser.add_argument("--nvenc-preset", choices=tuple(f"p{i}" for i in range(1, 8)), default="p7")
-    parser.add_argument("--encode-gpu", type=int, default=0)
     parser.add_argument("--audio-codec", choices=("aac", "copy"), default="aac")
     parser.add_argument("--audio-bitrate", default="192k")
     parser.add_argument("--start-time", type=float, default=0.0, help="Arbitrary source start in seconds")
@@ -1178,14 +1046,3 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ffmpeg-bin", default="ffmpeg")
     parser.add_argument("--ffprobe-bin", default="ffprobe")
     return parser
-
-
-def main() -> None:
-    args = build_parser().parse_args()
-    validate_args(args)
-    process_video(args)
-
-
-if __name__ == "__main__":
-    mp.freeze_support()
-    main()
