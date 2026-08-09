@@ -1,11 +1,16 @@
-"""Runtime autotuning for BasicVSR++ without changing restoration semantics."""
+"""Quality-constrained throughput autotuning for BasicVSR++.
+
+The tuner never weakens restoration settings to gain speed. It only searches
+execution parameters that preserve the selected source profile semantics, then
+chooses the configuration with the highest measured effective-frame throughput.
+"""
 
 from __future__ import annotations
 
 import json
 import math
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import replace
 from pathlib import Path
 from typing import Deque, Optional, Sequence
@@ -16,7 +21,7 @@ import torch
 from . import basicvsrpp as bvsr
 
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _MIB = 1024 * 1024
 _GIB = 1024 * _MIB
 _INSTALLED = False
@@ -27,13 +32,12 @@ _ORIGINAL_STREAM_READER = bvsr.BasicVSRPPStreamReader
 
 
 def _cache_path() -> Path:
-    return Path.home() / ".cache" / "realesrgan" / "basicvsrpp-autotune-v1.json"
+    return Path.home() / ".cache" / "realesrgan" / "basicvsrpp-autotune-v2.json"
 
 
 def _load_cache() -> dict[str, dict[str, object]]:
-    path = _cache_path()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(_cache_path().read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -44,22 +48,37 @@ def _save_cache(data: dict[str, dict[str, object]]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         temporary.replace(path)
     except OSError:
         pass
 
 
+def _round4(value: int) -> int:
+    return max(256, ((int(value) + 3) // 4) * 4)
+
+
 def _tile_candidates(base: int, width: int, height: int) -> list[int]:
+    """Return all useful tile sizes, including source-specific topology breaks."""
     limit = 1536
     if width > 0 and height > 0:
         limit = min(limit, max(width, height))
-    values = [base, 640, 768, 896, 1024, 1152, 1280, 1536]
-    return sorted({value for value in values if value >= base and (value <= limit or value == base)})
+
+    values = {base, 640, 768, 896, 1024, 1152, 1280, 1536}
+    if width > 0 and height > 0:
+        for dimension in (width, height):
+            for count in range(1, 5):
+                values.add(_round4(math.ceil(dimension / count)))
+        values.add(_round4(min(width, height)))
+
+    return sorted(value for value in values if base <= value <= limit)
 
 
 def _clip_candidates(base: int) -> list[int]:
-    return [value for value in range(base, min(15, base + 6) + 1, 2)]
+    return list(range(base, min(15, base + 6) + 1, 2))
 
 
 def _batch_candidates(total_bytes: int) -> list[int]:
@@ -84,81 +103,111 @@ def _cache_key(preprocessor: "AutoTunedBasicVSRPPPreprocessor", free_bytes: int,
             str(preprocessor.config.clip_length),
             str(preprocessor.config.clip_overlap),
             str(preprocessor.config.tile_pad),
+            str(preprocessor.config.scene_threshold),
             "fp16" if preprocessor.config.fp16 else "fp32",
         )
     )
 
 
-def _estimated_tiles(tile_size: int) -> int:
-    if _SOURCE_WIDTH <= 0 or _SOURCE_HEIGHT <= 0:
-        return 1
-    return max(1, math.ceil(_SOURCE_WIDTH / tile_size) * math.ceil(_SOURCE_HEIGHT / tile_size))
+def _source_shape(tile_size: int) -> tuple[int, int]:
+    if _SOURCE_WIDTH > 0 and _SOURCE_HEIGHT > 0:
+        return _SOURCE_HEIGHT, _SOURCE_WIDTH
+    return tile_size, tile_size
 
 
-def _probe_shape(tile_size: int, pad: int) -> tuple[int, int]:
-    height = tile_size if _SOURCE_HEIGHT <= 0 else min(tile_size, _SOURCE_HEIGHT)
-    width = tile_size if _SOURCE_WIDTH <= 0 else min(tile_size, _SOURCE_WIDTH)
-    return max(256, height + 2 * pad), max(256, width + 2 * pad)
+def _tile_layout(tile_size: int, pad: int) -> Counter[tuple[int, int]]:
+    """Count the actual padded patch shapes produced by a full source frame."""
+    height, width = _source_shape(tile_size)
+    layout: Counter[tuple[int, int]] = Counter()
+    for y0 in range(0, height, tile_size):
+        y1 = min(y0 + tile_size, height)
+        for x0 in range(0, width, tile_size):
+            x1 = min(x0 + tile_size, width)
+            patch_h = max(256, (y1 - y0) + 2 * pad)
+            patch_w = max(256, (x1 - x0) + 2 * pad)
+            layout[(_round4(patch_h), _round4(patch_w))] += 1
+    return layout
 
 
 class AutoTunedBasicVSRPPPreprocessor(_ORIGINAL_PREPROCESSOR):
-    """BasicVSR++ preprocessor that benchmarks safe tile/clip/batch choices once."""
+    """Search execution parameters for fastest quality-preserving restoration."""
 
     def __init__(self, config, checkpoint_dir: Path):
         self.clip_batch = 1
         self.autotune_score = 0.0
         self.autotune_peak_mib = 0.0
+        self._profile_clip_floor = int(config.clip_length)
+        self._profile_strength = float(config.strength)
+        self._profile_overlap = int(config.clip_overlap)
+        self._profile_tile_pad = int(config.tile_pad)
+        self._profile_scene_threshold = float(config.scene_threshold)
         super().__init__(config, checkpoint_dir)
         self._autotune()
 
+    def _quality_guard(self, tile_size: int, clip_length: int, clip_batch: int) -> None:
+        if tile_size < int(self.config.tile_size):
+            raise RuntimeError("autotune must not reduce the BasicVSR++ tile baseline")
+        if clip_length < self._profile_clip_floor:
+            raise RuntimeError("autotune must not reduce the profile clip baseline")
+        if clip_batch < 1:
+            raise RuntimeError("clip batch must be positive")
+        if float(self.config.strength) != self._profile_strength:
+            raise RuntimeError("autotune changed BasicVSR++ strength")
+        if int(self.config.clip_overlap) != self._profile_overlap:
+            raise RuntimeError("autotune changed clip overlap")
+        if int(self.config.tile_pad) != self._profile_tile_pad:
+            raise RuntimeError("autotune changed tile padding")
+        if float(self.config.scene_threshold) != self._profile_scene_threshold:
+            raise RuntimeError("autotune changed scene-cut threshold")
+
     def _apply_choice(self, tile_size: int, clip_length: int, clip_batch: int, *, cached: bool) -> None:
+        self._quality_guard(tile_size, clip_length, clip_batch)
         self.config = replace(self.config, tile_size=int(tile_size), clip_length=int(clip_length))
         self.tile_size = int(tile_size)
-        self.clip_batch = max(1, int(clip_batch))
+        self.clip_batch = int(clip_batch)
         origin = "cache" if cached else "benchmark"
         print(
             f"[basicvsrpp-autotune] cuda:{self.config.gpu_id} {origin} selected "
-            f"tile={self.tile_size} clip={self.config.clip_length} batch={self.clip_batch}",
+            f"tile={self.tile_size} clip={self.config.clip_length} batch={self.clip_batch} "
+            f"throughput={self.autotune_score:.4f} effective-fps",
             flush=True,
         )
 
-    def _probe(self, tile_size: int, clip_length: int, clip_batch: int) -> Optional[dict[str, float]]:
-        pad = int(self.config.tile_pad)
-        probe_h, probe_w = _probe_shape(tile_size, pad)
-        emitted = max(1, clip_length - 2 * int(self.config.clip_overlap))
-        tiles = _estimated_tiles(tile_size)
-        device = self.device
+    def _headroom(self, total_bytes: int) -> int:
+        return max(2 * _GIB, int(total_bytes * 0.20))
 
+    def _probe_patch(
+        self,
+        patch_h: int,
+        patch_w: int,
+        clip_length: int,
+        clip_batch: int,
+    ) -> Optional[dict[str, float]]:
+        device = self.device
         torch.cuda.set_device(device)
         torch.cuda.empty_cache()
         free_before, total = torch.cuda.mem_get_info(device)
-        baseline_reserved = torch.cuda.memory_reserved(device)
-        headroom = max(2 * _GIB, int(total * 0.20))
+        headroom = self._headroom(total)
         if free_before <= headroom:
             return None
 
-        seed = torch.zeros((1, 1, 3, probe_h, probe_w), dtype=torch.float32)
-        clip = seed.expand(clip_batch, clip_length, -1, -1, -1)
+        seed = torch.zeros((clip_batch, clip_length, 3, patch_h, patch_w), dtype=torch.float32)
         output = None
         try:
             torch.cuda.reset_peak_memory_stats(device)
             torch.cuda.synchronize(device)
             started = time.perf_counter()
-            output = self._run_model(clip).cpu()
+            output = self._run_model(seed).cpu()
             torch.cuda.synchronize(device)
             elapsed = max(time.perf_counter() - started, 1e-6)
             peak_reserved = torch.cuda.max_memory_reserved(device)
             peak_allocated = torch.cuda.max_memory_allocated(device)
-            extra_reserved = max(0, peak_reserved - baseline_reserved)
-            safe = free_before - extra_reserved >= headroom
-            score = (clip_batch * emitted) / (elapsed * tiles)
+            free_after, _ = torch.cuda.mem_get_info(device)
+            safe = free_after >= headroom
             return {
-                "score": float(score) if safe else 0.0,
-                "elapsed": float(elapsed),
+                "elapsed": elapsed,
                 "peak_reserved": float(peak_reserved),
                 "peak_allocated": float(peak_allocated),
-                "free_before": float(free_before),
-                "total": float(total),
                 "safe": 1.0 if safe else 0.0,
             }
         except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
@@ -168,9 +217,86 @@ class AutoTunedBasicVSRPPPreprocessor(_ORIGINAL_PREPROCESSOR):
             return None
         finally:
             del output
-            del clip
             del seed
             torch.cuda.empty_cache()
+
+    def _screen_tile(self, tile_size: int, clip_length: int) -> Optional[dict[str, float]]:
+        pad = int(self.config.tile_pad)
+        emitted = max(1, clip_length - 2 * int(self.config.clip_overlap))
+        layout = _tile_layout(tile_size, pad)
+        total_elapsed = 0.0
+        peak_reserved = 0.0
+        for (patch_h, patch_w), count in layout.items():
+            result = self._probe_patch(patch_h, patch_w, clip_length, 1)
+            if result is None or result["safe"] < 0.5:
+                return None
+            total_elapsed += result["elapsed"] * count
+            peak_reserved = max(peak_reserved, result["peak_reserved"])
+        score = emitted / max(total_elapsed, 1e-6)
+        return {
+            "score": float(score),
+            "elapsed": float(total_elapsed),
+            "peak_reserved": float(peak_reserved),
+            "tiles": float(sum(layout.values())),
+        }
+
+    def _probe_full_frame(
+        self,
+        tile_size: int,
+        clip_length: int,
+        clip_batch: int,
+    ) -> Optional[dict[str, float]]:
+        self._quality_guard(tile_size, clip_length, clip_batch)
+        device = self.device
+        torch.cuda.set_device(device)
+        torch.cuda.empty_cache()
+        free_before, total = torch.cuda.mem_get_info(device)
+        headroom = self._headroom(total)
+        if free_before <= headroom:
+            return None
+
+        height, width = _source_shape(tile_size)
+        clip = torch.zeros((clip_batch, clip_length, 3, height, width), dtype=torch.float32)
+        output = None
+        old_tiles = self.tiles
+        try:
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize(device)
+            started = time.perf_counter()
+            output = self._enhance_with_tile(clip, tile_size)
+            torch.cuda.synchronize(device)
+            elapsed = max(time.perf_counter() - started, 1e-6)
+            peak_reserved = torch.cuda.max_memory_reserved(device)
+            peak_allocated = torch.cuda.max_memory_allocated(device)
+            free_after, _ = torch.cuda.mem_get_info(device)
+            emitted = max(1, clip_length - 2 * int(self.config.clip_overlap))
+            score = (clip_batch * emitted) / elapsed
+            safe = free_after >= headroom
+            return {
+                "score": float(score) if safe else 0.0,
+                "elapsed": float(elapsed),
+                "peak_reserved": float(peak_reserved),
+                "peak_allocated": float(peak_allocated),
+                "safe": 1.0 if safe else 0.0,
+            }
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
+            message = str(error).lower()
+            if not isinstance(error, torch.cuda.OutOfMemoryError) and "out of memory" not in message:
+                raise
+            return None
+        finally:
+            self.tiles = old_tiles
+            del output
+            del clip
+            torch.cuda.empty_cache()
+
+    def _warm_candidate(self, tile_size: int, clip_length: int, clip_batch: int) -> None:
+        pad = int(self.config.tile_pad)
+        layout = _tile_layout(tile_size, pad)
+        if not layout:
+            return
+        patch_h, patch_w = max(layout, key=lambda shape: shape[0] * shape[1])
+        self._probe_patch(patch_h, patch_w, clip_length, clip_batch)
 
     def _autotune(self) -> None:
         device = self.device
@@ -184,101 +310,118 @@ class AutoTunedBasicVSRPPPreprocessor(_ORIGINAL_PREPROCESSOR):
                 tile = int(cached["tile_size"])
                 clip = int(cached["clip_length"])
                 batch = int(cached["clip_batch"])
-                if tile >= self.config.tile_size and clip >= self.config.clip_length and batch >= 1:
-                    self._apply_choice(tile, clip, batch, cached=True)
-                    return
-            except (KeyError, TypeError, ValueError):
+                self.autotune_score = float(cached.get("effective_fps", cached.get("score", 0.0)))
+                self.autotune_peak_mib = float(cached.get("peak_mib", 0.0))
+                self._quality_guard(tile, clip, batch)
+                self._apply_choice(tile, clip, batch, cached=True)
+                return
+            except (KeyError, TypeError, ValueError, RuntimeError):
                 pass
 
         base_tile = int(self.config.tile_size)
         base_clip = int(self.config.clip_length)
+        print(
+            f"[basicvsrpp-autotune] cuda:{self.config.gpu_id} quality-constrained throughput search "
+            f"| free={free_bytes / _GIB:.2f} GiB total={total_bytes / _GIB:.2f} GiB",
+            flush=True,
+        )
+
+        screened: list[tuple[float, int, float]] = []
+        for tile in _tile_candidates(base_tile, _SOURCE_WIDTH, _SOURCE_HEIGHT):
+            result = self._screen_tile(tile, base_clip)
+            if result is None:
+                print(f"[basicvsrpp-autotune] screen tile={tile} unavailable/OOM", flush=True)
+                continue
+            print(
+                f"[basicvsrpp-autotune] screen tile={tile} clip={base_clip} batch=1 "
+                f"est={result['score']:.4f} effective-fps tiles={int(result['tiles'])} "
+                f"peak={result['peak_reserved'] / _GIB:.2f} GiB",
+                flush=True,
+            )
+            screened.append((result["score"], tile, result["peak_reserved"]))
+
+        if not screened:
+            print("[basicvsrpp-autotune] no safe candidate; keeping profile defaults", flush=True)
+            self._apply_choice(base_tile, base_clip, 1, cached=False)
+            return
+
+        screened.sort(reverse=True)
+        validation_tiles = {base_tile}
+        validation_tiles.update(tile for _score, tile, _peak in screened[:3])
+
         best_tile = base_tile
         best_clip = base_clip
         best_batch = 1
         best_score = -1.0
         best_peak = 0.0
 
-        print(
-            f"[basicvsrpp-autotune] cuda:{self.config.gpu_id} searching "
-            f"tile/clip/batch | free={free_bytes / _GIB:.2f} GiB total={total_bytes / _GIB:.2f} GiB",
-            flush=True,
-        )
-
-        warm = self._probe(base_tile, base_clip, 1)
-        if warm is None:
-            print("[basicvsrpp-autotune] baseline probe unavailable; keeping profile defaults", flush=True)
-            self._apply_choice(base_tile, base_clip, 1, cached=False)
-            return
-
-        no_gain = 0
-        for tile in _tile_candidates(base_tile, _SOURCE_WIDTH, _SOURCE_HEIGHT):
-            result = self._probe(tile, base_clip, 1)
+        for tile in sorted(validation_tiles):
+            result = self._probe_full_frame(tile, base_clip, 1)
             if result is None or result["safe"] < 0.5:
-                if tile > best_tile:
-                    break
                 continue
             score = result["score"]
             print(
-                f"[basicvsrpp-autotune] probe tile={tile} clip={base_clip} batch=1 "
-                f"score={score:.4f} peak={result['peak_reserved'] / _GIB:.2f} GiB",
+                f"[basicvsrpp-autotune] full tile={tile} clip={base_clip} batch=1 "
+                f"fps={score:.4f} peak={result['peak_reserved'] / _GIB:.2f} GiB",
                 flush=True,
             )
-            if score > best_score * 1.02:
+            if score > best_score:
                 best_score = score
                 best_tile = tile
                 best_peak = result["peak_reserved"]
-                no_gain = 0
-            elif tile > best_tile:
-                no_gain += 1
-                if no_gain >= 2:
-                    break
+
+        if best_score < 0:
+            self._apply_choice(base_tile, base_clip, 1, cached=False)
+            return
 
         for clip_length in _clip_candidates(base_clip):
-            result = self._probe(best_tile, clip_length, 1)
+            if clip_length == base_clip:
+                continue
+            self._warm_candidate(best_tile, clip_length, 1)
+            result = self._probe_full_frame(best_tile, clip_length, 1)
             if result is None or result["safe"] < 0.5:
-                break
+                continue
             score = result["score"]
             print(
-                f"[basicvsrpp-autotune] probe tile={best_tile} clip={clip_length} batch=1 "
-                f"score={score:.4f} peak={result['peak_reserved'] / _GIB:.2f} GiB",
+                f"[basicvsrpp-autotune] full tile={best_tile} clip={clip_length} batch=1 "
+                f"fps={score:.4f} peak={result['peak_reserved'] / _GIB:.2f} GiB",
                 flush=True,
             )
-            if score > best_score * 1.02:
+            if score > best_score * 1.01:
                 best_score = score
                 best_clip = clip_length
                 best_peak = result["peak_reserved"]
 
-        local_tiles = sorted({base_tile, best_tile, max(base_tile, best_tile - 256), min(1536, best_tile + 256)})
-        for tile in local_tiles:
-            if tile < base_tile:
+        tile_recheck = {best_tile, base_tile}
+        tile_recheck.update(tile for _score, tile, _peak in screened[:3])
+        for tile in sorted(tile_recheck):
+            if tile == best_tile and best_clip == base_clip:
                 continue
-            if _SOURCE_WIDTH > 0 and _SOURCE_HEIGHT > 0 and tile > max(_SOURCE_WIDTH, _SOURCE_HEIGHT):
-                continue
-            result = self._probe(tile, best_clip, 1)
+            self._warm_candidate(tile, best_clip, 1)
+            result = self._probe_full_frame(tile, best_clip, 1)
             if result is None or result["safe"] < 0.5:
                 continue
             score = result["score"]
-            if score > best_score * 1.02:
+            if score > best_score * 1.01:
                 best_score = score
                 best_tile = tile
                 best_peak = result["peak_reserved"]
 
         for batch in _batch_candidates(total_bytes)[1:]:
-            result = self._probe(best_tile, best_clip, batch)
+            self._warm_candidate(best_tile, best_clip, batch)
+            result = self._probe_full_frame(best_tile, best_clip, batch)
             if result is None or result["safe"] < 0.5:
-                break
+                continue
             score = result["score"]
             print(
-                f"[basicvsrpp-autotune] probe tile={best_tile} clip={best_clip} batch={batch} "
-                f"score={score:.4f} peak={result['peak_reserved'] / _GIB:.2f} GiB",
+                f"[basicvsrpp-autotune] full tile={best_tile} clip={best_clip} batch={batch} "
+                f"fps={score:.4f} peak={result['peak_reserved'] / _GIB:.2f} GiB",
                 flush=True,
             )
-            if score > best_score * 1.03:
+            if score > best_score * 1.02:
                 best_score = score
                 best_batch = batch
                 best_peak = result["peak_reserved"]
-            else:
-                break
 
         self.autotune_score = max(0.0, best_score)
         self.autotune_peak_mib = best_peak / _MIB
@@ -287,13 +430,12 @@ class AutoTunedBasicVSRPPPreprocessor(_ORIGINAL_PREPROCESSOR):
             "tile_size": best_tile,
             "clip_length": best_clip,
             "clip_batch": best_batch,
-            "score": self.autotune_score,
+            "effective_fps": self.autotune_score,
             "peak_mib": self.autotune_peak_mib,
         }
         _save_cache(cache)
 
     def enhance_clips(self, clips: Sequence[Sequence[np.ndarray]]) -> list[list[np.ndarray]]:
-        """Enhance independent clips in the model's N dimension when shapes match."""
         if not clips:
             return []
         if len(clips) == 1:
@@ -329,6 +471,13 @@ class AutoTunedBasicVSRPPPreprocessor(_ORIGINAL_PREPROCESSOR):
             [bvsr.float_rgb_to_dtype(frame, first_dtype) for frame in clip]
             for clip in mixed
         ]
+
+    def release_unused_cache_if_tight(self) -> None:
+        device = self.device
+        torch.cuda.set_device(device)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        if free_bytes < self._headroom(total_bytes):
+            torch.cuda.empty_cache()
 
 
 class AutoTunedBasicVSRPPStreamReader:
@@ -415,8 +564,7 @@ class AutoTunedBasicVSRPPStreamReader:
         for task, enhanced in zip(tasks, enhanced_groups):
             _frames, emit_start, emit_end = task
             self.output.extend(enhanced[emit_start:emit_end])
-        torch.cuda.set_device(int(self.preprocessor.config.gpu_id))
-        torch.cuda.empty_cache()
+        self.preprocessor.release_unused_cache_if_tight()
 
     def read(self) -> Optional[np.ndarray]:
         while not self.output:
@@ -436,7 +584,6 @@ class AutoTunedBasicVSRPPStreamReader:
 
 
 def _balanced_fill_output(self) -> None:
-    """Replacement for balanced_pipeline._fill_output with per-GPU clip batches."""
     groups = []
     exhausted = False
     for preprocessor in self.preprocessors:
@@ -461,10 +608,7 @@ def _balanced_fill_output(self) -> None:
             return preprocessor.enhance_clips([task[0] for task in tasks])
         return [preprocessor.enhance_clip(task[0]) for task in tasks]
 
-    futures = [
-        self.executor.submit(run_group, preprocessor, tasks)
-        for preprocessor, tasks in groups
-    ]
+    futures = [self.executor.submit(run_group, preprocessor, tasks) for preprocessor, tasks in groups]
     for (_preprocessor, tasks), future in zip(groups, futures):
         enhanced_groups = future.result()
         for task, enhanced in zip(tasks, enhanced_groups):
@@ -473,14 +617,14 @@ def _balanced_fill_output(self) -> None:
 
     for preprocessor, _tasks in groups:
         try:
-            torch.cuda.set_device(int(preprocessor.config.gpu_id))
-            torch.cuda.empty_cache()
+            if hasattr(preprocessor, "release_unused_cache_if_tight"):
+                preprocessor.release_unused_cache_if_tight()
         except Exception:
             pass
 
 
 def install_autotune(source_width: int = 0, source_height: int = 0) -> None:
-    """Install the autotuned preprocessor/stream into both base and balanced pipelines."""
+    """Install BasicVSR++ autotuning without changing Real-ESRGAN execution."""
     global _INSTALLED, _SOURCE_WIDTH, _SOURCE_HEIGHT
     _SOURCE_WIDTH = max(0, int(source_width))
     _SOURCE_HEIGHT = max(0, int(source_height))
