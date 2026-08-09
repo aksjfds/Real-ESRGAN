@@ -1,4 +1,4 @@
-"""Pipelined full-frame execution with shared-memory frame transport."""
+"""Pipelined full-frame execution with optional BasicVSR++ preprocessing."""
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -19,6 +19,12 @@ import torch
 from tqdm import tqdm
 
 from . import runtime as base
+from .basicvsrpp import (
+    SOURCE_PROFILES,
+    BasicVSRPPConfig,
+    BasicVSRPPPreprocessor,
+    BasicVSRPPStreamReader,
+)
 
 _TIMEOUT = 300.0
 
@@ -110,10 +116,17 @@ class SharedWorkers:
                 p = self.context.Process(
                     target=_worker,
                     args=(
-                        worker_id, gpu_id, self.input_queues[worker_id], self.result_queue,
-                        self.output_slots[worker_id], asdict(config),
-                        self.input_shms[worker_id].name, self.output_shms[worker_id].name,
-                        input_shape, output_shape, self.dtype.str,
+                        worker_id,
+                        gpu_id,
+                        self.input_queues[worker_id],
+                        self.result_queue,
+                        self.output_slots[worker_id],
+                        asdict(config),
+                        self.input_shms[worker_id].name,
+                        self.output_shms[worker_id].name,
+                        input_shape,
+                        output_shape,
+                        self.dtype.str,
                     ),
                     daemon=True,
                 )
@@ -202,12 +215,71 @@ class SharedWorkers:
                 pass
 
 
+class AsyncFrameReader:
+    """Bounded in-process prefetch so BasicVSR++ can overlap downstream SR/encode."""
+
+    def __init__(self, reader, depth: int):
+        self.reader = reader
+        self.queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=max(1, depth))
+        self.stop_event = threading.Event()
+        self.error: Optional[BaseException] = None
+        self.traceback_text = ""
+        self.closed = False
+        self.thread = threading.Thread(target=self._run, name="basicvsrpp-prefetch", daemon=True)
+        self.thread.start()
+
+    def _put(self, frame: Optional[np.ndarray]) -> bool:
+        while not self.stop_event.is_set():
+            try:
+                self.queue.put(frame, timeout=0.25)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                frame = self.reader.read()
+                if frame is None:
+                    self._put(None)
+                    return
+                if not self._put(frame):
+                    return
+        except Exception as error:
+            self.error = error
+            self.traceback_text = traceback.format_exc()
+            self._put(None)
+        finally:
+            try:
+                self.reader.close()
+            except Exception as error:
+                if self.error is None:
+                    self.error = error
+                    self.traceback_text = traceback.format_exc()
+
+    def read(self) -> Optional[np.ndarray]:
+        frame = self.queue.get()
+        if frame is None:
+            if self.error is not None:
+                raise RuntimeError(
+                    f"BasicVSR++ prefetch failed: {self.error!r}\n{self.traceback_text}"
+                ) from self.error
+            return None
+        return frame
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.stop_event.set()
+        self.thread.join(timeout=30)
+
+
 def _resize(frame: np.ndarray, width: int, height: int) -> np.ndarray:
     if frame.shape[1] == width and frame.shape[0] == height:
         return np.ascontiguousarray(frame)
-    return np.ascontiguousarray(
-        cv2.resize(frame, (width, height), interpolation=cv2.INTER_LANCZOS4)
-    )
+    return np.ascontiguousarray(cv2.resize(frame, (width, height), interpolation=cv2.INTER_LANCZOS4))
 
 
 class OutputPump:
@@ -285,6 +357,23 @@ def _result(msg: tuple) -> Tuple[int, int, float]:
     return int(msg[1]), int(msg[2]), float(msg[3])
 
 
+def _profile_settings(args, gpu_ids: Sequence[Optional[int]]) -> tuple[str, dict, Sequence[Optional[int]], Optional[int]]:
+    profile_name = str(getattr(args, "source_profile", "A")).upper()
+    if profile_name not in SOURCE_PROFILES:
+        raise ValueError(f"Unknown --source-profile {profile_name!r}; choose A, B or C")
+    profile = SOURCE_PROFILES[profile_name]
+    if profile_name == "A":
+        return profile_name, profile, gpu_ids, None
+    if any(gpu is None for gpu in gpu_ids):
+        raise RuntimeError("BasicVSR++ profiles B/C require CUDA")
+    basic_gpu = int(gpu_ids[0])  # type: ignore[arg-type]
+    # With >=2 GPUs, isolate the temporal-restoration stage on GPU0 and let the
+    # remaining device(s) run full-frame SR. This avoids competing model
+    # activations and turns the two heavy stages into a true pipeline.
+    sr_gpu_ids = gpu_ids[1:] if len(gpu_ids) >= 2 else gpu_ids
+    return profile_name, profile, sr_gpu_ids, basic_gpu
+
+
 def process_video(args) -> None:
     if base._require_encoder is None or base._writer_type is None:
         raise RuntimeError("Encoding backend is not configured. Run through root inference.py.")
@@ -316,7 +405,8 @@ def process_video(args) -> None:
     start, duration, expected = base.resolve_range(info, args.start_time, args.test_seconds, inference_rate)
     expected_output = max(1, int(round(duration * output_fps)))
     end = start + duration
-    gpu_ids = base.parse_gpu_ids(args.gpu_ids)
+    requested_gpu_ids = base.parse_gpu_ids(args.gpu_ids)
+    profile_name, profile, sr_gpu_ids, basic_gpu = _profile_settings(args, requested_gpu_ids)
     native_scale = base._model_native_scale(args.model)
     config = base.WorkerConfig(args.model, base.resolve_model_paths(args))
     dtype = np.dtype("<u2") if info.bit_depth == 10 else np.dtype(np.uint8)
@@ -330,26 +420,40 @@ def process_video(args) -> None:
     print(f"Range   : {mode} | {base.format_seconds(start)} -> {base.format_seconds(end)} | {duration:.3f}s | {expected} inference / {expected_output} output frames", flush=True)
     scale_text = f"native={native_scale}x" if float(args.scale) == float(native_scale) else f"native={native_scale}x -> final={args.scale:g}x | resample=full-frame Lanczos4"
     print(f"Model   : {args.model} | {scale_text}", flush=True)
-    print(f"GPU     : {base._device_text(gpu_ids)}", flush=True)
-    print(f"Mode    : pipelined full-frame | parallel_frames={len(gpu_ids)} | IPC=shared-memory", flush=True)
+    if profile_name == "A":
+        print("Denoise : A | BasicVSR++ off", flush=True)
+    else:
+        allocation = (
+            f"dedicated cuda:{basic_gpu} -> SR {','.join('cuda:'+str(x) for x in sr_gpu_ids)}"
+            if len(requested_gpu_ids) >= 2
+            else f"shared cuda:{basic_gpu} (single-GPU serialized feed)"
+        )
+        print(
+            f"Denoise : {profile_name} | BasicVSR++ NTIRE Track 1 | strength={profile['strength']:.2f} | "
+            f"clip={profile['clip_length']} | tile=512(auto fallback) | {allocation}",
+            flush=True,
+        )
+    print(f"GPU     : SR={base._device_text(sr_gpu_ids)}", flush=True)
+    print(f"Mode    : pipelined full-frame | parallel_frames={len(sr_gpu_ids)} | IPC=shared-memory", flush=True)
     print(flush=True)
 
-    reader = writer = workers = pump = progress = None
+    reader = raw_reader = writer = workers = pump = progress = None
+    basic_stream: Optional[BasicVSRPPStreamReader] = None
     started = time.monotonic()
     next_frame = next_output = 0
     eof = False
     active: set[int] = set()
     pending: Dict[int, int] = {}
-    gpu_work = decode_time = model_time = flush_time = audio_time = 0.0
+    gpu_work = feed_wait = model_time = denoise_startup = flush_time = audio_time = 0.0
     clean = False
 
     def submit(worker_id: int) -> bool:
-        nonlocal eof, next_frame, decode_time
+        nonlocal eof, next_frame, feed_wait
         if eof:
             return False
         t = time.monotonic()
         frame = reader.read()
-        decode_time += time.monotonic() - t
+        feed_wait += time.monotonic() - t
         if frame is None:
             eof = True
             return False
@@ -359,12 +463,63 @@ def process_video(args) -> None:
         return True
 
     try:
-        reader = base.RawVideoReader(input_path, args.ffmpeg_bin, in_w, in_h, inference_rate_text, start, duration, info.bit_depth)
-        writer = base._writer_type(temp_video, args.ffmpeg_bin, out_w, out_h, inference_rate_text, output_rate_text, args.video_codec, args.crf, args.preset, args.cq, args.nvenc_preset, args.encode_gpu)
+        writer = base._writer_type(
+            temp_video,
+            args.ffmpeg_bin,
+            out_w,
+            out_h,
+            inference_rate_text,
+            output_rate_text,
+            args.video_codec,
+            args.crf,
+            args.preset,
+            args.cq,
+            args.nvenc_preset,
+            args.encode_gpu,
+        )
         t = time.monotonic()
-        workers = SharedWorkers(gpu_ids, config, input_shape, native_shape, dtype)
+        workers = SharedWorkers(sr_gpu_ids, config, input_shape, native_shape, dtype)
         model_time = time.monotonic() - t
+
+        raw_reader = base.RawVideoReader(
+            input_path,
+            args.ffmpeg_bin,
+            in_w,
+            in_h,
+            inference_rate_text,
+            start,
+            duration,
+            info.bit_depth,
+        )
+        if profile_name == "A":
+            reader = raw_reader
+            raw_reader = None
+        else:
+            t = time.monotonic()
+            preprocessor = BasicVSRPPPreprocessor(
+                BasicVSRPPConfig(
+                    gpu_id=int(basic_gpu),
+                    strength=float(profile["strength"]),
+                    clip_length=int(profile["clip_length"]),
+                    clip_overlap=2,
+                    tile_size=512,
+                    tile_pad=32,
+                    fp16=True,
+                    scene_threshold=0.30,
+                ),
+                checkpoint_dir=Path(__file__).resolve().parent / "weights",
+            )
+            denoise_startup = time.monotonic() - t
+            basic_stream = BasicVSRPPStreamReader(raw_reader, preprocessor)
+            raw_reader = None
+            if len(requested_gpu_ids) >= 2:
+                reader = AsyncFrameReader(basic_stream, depth=int(profile["clip_length"]))
+            else:
+                reader = basic_stream
+
         print(f"Pipeline: shared_memory={workers.memory_mib:.0f} MiB | GPU inference overlaps resize/encode", flush=True)
+        if profile_name != "A" and len(requested_gpu_ids) >= 2:
+            print("Pipeline: BasicVSR++ producer overlaps full-frame SR through bounded host prefetch", flush=True)
         print(flush=True)
         progress = tqdm(total=expected, desc="Real-ESRGAN", unit="frame", dynamic_ncols=True, mininterval=1.0, file=sys.stdout)
         pump = OutputPump(workers, writer, out_w, out_h, progress, started)
@@ -395,21 +550,36 @@ def process_video(args) -> None:
         if pending:
             raise RuntimeError(f"Pipeline ended with {len(pending)} out-of-order frame(s).")
         pump.finish()
-        reader.close(); reader = None
-        t = time.monotonic(); writer.close(); flush_time = time.monotonic() - t; writer = None
+        reader.close()
+        reader = None
+        t = time.monotonic()
+        writer.close()
+        flush_time = time.monotonic() - t
+        writer = None
         clean = True
     finally:
         if pump is not None:
-            try: pump.stop()
-            except Exception: pass
+            try:
+                pump.stop()
+            except Exception:
+                pass
         if progress is not None:
             progress.close()
         if reader is not None:
-            try: reader.close()
-            except Exception: pass
+            try:
+                reader.close()
+            except Exception:
+                pass
+        if raw_reader is not None:
+            try:
+                raw_reader.close()
+            except Exception:
+                pass
         if writer is not None:
-            try: writer.close()
-            except Exception: pass
+            try:
+                writer.close()
+            except Exception:
+                pass
         if workers is not None:
             workers.close()
 
@@ -418,7 +588,17 @@ def process_video(args) -> None:
         raise RuntimeError("No complete video was encoded.")
     actual_duration = processed / inference_fps
     t = time.monotonic()
-    base.mux_audio(temp_video, input_path, output_path, args.ffmpeg_bin, start, actual_duration, info.has_audio, args.audio_codec, args.audio_bitrate)
+    base.mux_audio(
+        temp_video,
+        input_path,
+        output_path,
+        args.ffmpeg_bin,
+        start,
+        actual_duration,
+        info.has_audio,
+        args.audio_codec,
+        args.audio_bitrate,
+    )
     audio_time = time.monotonic() - t
     if temp_video.exists():
         temp_video.unlink()
@@ -431,6 +611,24 @@ def process_video(args) -> None:
     print("\n=== Completed ===", flush=True)
     print(f"Frames  : {processed} | {base.format_seconds(start)} -> {base.format_seconds(start + actual_duration)} | duration={actual_duration:.3f}s", flush=True)
     print(f"Speed   : {fps:.3f} frame/s | processing={elapsed:.1f}s", flush=True)
-    print(f"Timing  : model={model_time:.1f}s | decode={decode_time:.1f}s | gpu_avg={gpu_avg:.3f}s/frame | resize={pump.resize_seconds:.1f}s | write={pump.write_seconds:.1f}s | flush={flush_time:.1f}s | audio={audio_time:.1f}s", flush=True)
+    if basic_stream is None:
+        print(
+            f"Timing  : model={model_time:.1f}s | decode={feed_wait:.1f}s | gpu_avg={gpu_avg:.3f}s/frame | "
+            f"resize={pump.resize_seconds:.1f}s | write={pump.write_seconds:.1f}s | flush={flush_time:.1f}s | audio={audio_time:.1f}s",
+            flush=True,
+        )
+    else:
+        pre = basic_stream.preprocessor
+        print(
+            f"Timing  : sr_model={model_time:.1f}s | bvs_model={denoise_startup:.1f}s | "
+            f"decode={basic_stream.decode_elapsed:.1f}s | basicvsr={pre.elapsed:.1f}s/{pre.clips} clips | "
+            f"feed_wait={feed_wait:.1f}s | sr_gpu_avg={gpu_avg:.3f}s/frame | "
+            f"resize={pump.resize_seconds:.1f}s | write={pump.write_seconds:.1f}s | flush={flush_time:.1f}s | audio={audio_time:.1f}s",
+            flush=True,
+        )
+        print(
+            f"BasicVSR: tile={pre.tile_size} | tiles={pre.tiles} | scene_cuts={basic_stream.scene_cuts}",
+            flush=True,
+        )
     print(f"File    : {size_mib:.2f} MiB | {bitrate:.2f} Mb/s", flush=True)
     print(f"Output  : {output_path}", flush=True)
