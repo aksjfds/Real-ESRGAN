@@ -134,6 +134,9 @@ def _codec_args(
     if codec not in {"h264_nvenc", "hevc_nvenc", "av1_nvenc"}:
         raise ValueError(f"Unsupported video encoder: {codec}")
 
+    # Keep the exact NVENC option spelling used by master/2.7. Older FFmpeg
+    # builds expose spatial_aq/temporal_aq but may not accept the newer aliases
+    # spatial-aq/temporal-aq.
     args = [
         "-gpu", str(encode_gpu),
         "-preset", nvenc_preset,
@@ -142,8 +145,8 @@ def _codec_args(
         "-cq", str(cq),
         "-b:v", "0",
         "-multipass", "fullres",
-        "-spatial-aq", "1",
-        "-temporal-aq", "1",
+        "-spatial_aq", "1",
+        "-temporal_aq", "1",
         "-rc-lookahead", "32",
     ]
     if codec in {"h264_nvenc", "hevc_nvenc"}:
