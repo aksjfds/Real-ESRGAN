@@ -6,7 +6,7 @@ from __future__ import annotations
 import multiprocessing as mp
 
 from encode import runtime as encode_runtime
-from inference import pipeline as inference_pipeline
+from inference import balanced_pipeline as inference_pipeline
 from inference import runtime as inference_runtime
 
 
