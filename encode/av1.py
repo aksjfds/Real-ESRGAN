@@ -43,14 +43,12 @@ def resolve_requested_encoder(ffmpeg_bin: str, requested: str) -> str:
     if requested == "libsvtav1" and not encoder_available(ffmpeg_bin, requested):
         if encoder_available(ffmpeg_bin, "libaom-av1"):
             print(
-                "[encoder-warning] FFmpeg has no libsvtav1; falling back to "
-                "CPU AV1 encoder libaom-av1.",
+                "[warning] FFmpeg has no libsvtav1; falling back to CPU AV1 encoder libaom-av1.",
                 flush=True,
             )
             return "libaom-av1"
         raise RuntimeError(
-            "FFmpeg provides neither libsvtav1 nor libaom-av1, so CPU AV1 encoding "
-            "is unavailable in this environment."
+            "FFmpeg provides neither libsvtav1 nor libaom-av1, so CPU AV1 encoding is unavailable."
         )
     return requested
 
@@ -81,7 +79,6 @@ def _codec_args(
 ) -> list[str]:
     if codec == "libsvtav1":
         return ["-preset", str(svtav1_preset), "-crf", str(crf)]
-
     if codec == "libaom-av1":
         return [
             "-crf", str(crf),
@@ -89,7 +86,6 @@ def _codec_args(
             "-cpu-used", str(aom_cpu_used),
             "-row-mt", "1",
         ]
-
     if codec == "av1_nvenc":
         return [
             "-gpu", str(encode_gpu),
@@ -103,7 +99,6 @@ def _codec_args(
             "-temporal_aq", "1",
             "-rc-lookahead", "32",
         ]
-
     raise ValueError(f"Unsupported AV1 encoder: {codec}")
 
 
@@ -125,11 +120,7 @@ def _frame_pixel_formats(frame: np.ndarray, codec: str) -> tuple[str, str]:
 
 
 class RawVideoWriter:
-    """AV1 writer that selects 8-bit or 10-bit output from the first frame.
-
-    libaom-av1 keeps the asynchronous queue so GPU inference can overlap CPU
-    encoding instead of blocking on every frame written to FFmpeg stdin.
-    """
+    """AV1 writer with automatic bit depth and asynchronous libaom stdin."""
 
     def __init__(
         self,
@@ -176,12 +167,6 @@ class RawVideoWriter:
                 daemon=True,
             )
             self._thread.start()
-            _tile_args, tile_name = _libaom_tile_args(width, height)
-            print(
-                f"[encoder] libaom parallelism: row-mt=1, tiles={tile_name}, "
-                f"async_queue={_AOM_QUEUE_DEPTH}",
-                flush=True,
-            )
 
     def _start(self, frame: np.ndarray) -> None:
         if self.process is not None:
@@ -214,14 +199,10 @@ class RawVideoWriter:
             _AOM_CPU_USED,
         )
         if self.codec == "libaom-av1":
-            tile_args, _tile_name = _libaom_tile_args(self.width, self.height)
+            tile_args, _ = _libaom_tile_args(self.width, self.height)
             command += tile_args
 
         command += ["-pix_fmt", output_pix_fmt, "-tag:v", "av01", str(self.path)]
-        print(
-            f"[encoder] pixel format: {raw_pix_fmt} -> {output_pix_fmt} ({self.codec})",
-            flush=True,
-        )
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def _write_frame_sync(self, frame: np.ndarray) -> None:
@@ -249,7 +230,6 @@ class RawVideoWriter:
     def write(self, frame: np.ndarray) -> None:
         if self._closed:
             raise RuntimeError("cannot write to a closed AV1 encoder")
-
         frame = np.ascontiguousarray(frame)
         self._start(frame)
         if self._queue is None:
@@ -336,7 +316,6 @@ def probe_encoder_runtime(args) -> None:
         text=True,
     )
     if result.returncode == 0:
-        print(f"[encoder] runtime OK: {args.video_codec}", flush=True)
         return
 
     detail = result.stdout.strip()
