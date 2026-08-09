@@ -12,5 +12,3 @@ vsenv/
 *.ffindex
 *.mp4
 *.mkv
-realesrgan-mask-assets/
-realesrgan-mask-engines/
