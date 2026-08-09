@@ -14,7 +14,7 @@
 - `inference/runtime.py`：视频探测/解码、8/10-bit 精度保持、模型加载与单帧 full-frame 推理等基础能力。
 - `inference/source_profiles.py`：BasicVSR++ A-E 源质量档的统一配置。
 - `inference/basicvsrpp.py`：BasicVSR++ NTIRE Track 1 同分辨率视频恢复、时序 clip、场景切换保护与显存自适应分块。
-- `inference/basicvsrpp_autotune.py`：B-E 的质量约束吞吐 autotuner，自动搜索 tile、clip length 与 clip batch，并缓存结果。
+- `inference/basicvsrpp_autotune.py`：B-E 的快速质量约束吞吐 autotuner，只搜索不降低画质的执行参数并缓存结果。
 - `inference/checkpoint_parts.py`：将仓库内 BasicVSR++ checkpoint 分片临时合并、校验后交给 PyTorch 加载。
 - `inference/pipeline.py`：基础 full-frame SR、共享内存、顺序输出、Lanczos/编码流水线。
 - `inference/balanced_pipeline.py`：B-E 多 GPU 负载均衡；BasicVSR++ clip 并行后让全部 GPU 回到 full-frame SR。
@@ -30,29 +30,30 @@
 `--source-profile` 提供五档，默认 `A`：
 
 - `A`：关闭 BasicVSR++，路径与 v4.2 相同，适合干净/高质量片源。
-- `B`：`strength=0.25`、7 帧最低 clip 基线，轻度恢复。
-- `C`：`strength=0.50`、9 帧最低 clip 基线，中等恢复。
-- `D`：`strength=0.75`、11 帧最低 clip 基线，强恢复。
-- `E`：`strength=1.00`、13 帧最低 clip 基线，完整使用 BasicVSR++ 输出，即满强度恢复。
+- `B`：`strength=0.25`、7 帧 clip，轻度恢复。
+- `C`：`strength=0.50`、9 帧 clip，中等恢复。
+- `D`：`strength=0.75`、11 帧 clip，强恢复。
+- `E`：`strength=1.00`、13 帧 clip，完整使用 BasicVSR++ 输出，即满强度恢复。
 
-`strength` 是 `original + strength * (enhanced - original)` 的 residual blend。B-E 固定使用 2 帧 clip overlap、scene-cut 检测、FP16 优先和 32 像素空间上下文。autotuner 不会减小各档时序基线，也不会改变 `strength`、`overlap`、`tile_pad` 或 scene-cut 阈值。
+`strength` 是 `original + strength * (enhanced - original)` 的 residual blend。B-E 固定使用各档 clip length、2 帧 clip overlap、scene-cut 检测、FP16 优先和 32 像素空间上下文。autotuner 不会改变这些画质参数。
 
 BasicVSR++ 输出与输入保持相同分辨率和整数位深：8-bit 输入返回 8-bit，10-bit 解码路径返回 16-bit 容器中的高精度 RGB，再交给现有 Real-ESRGAN 位深路径。
 
 ## BasicVSR++ autotune
 
-B-E 启动后会在实际视频推理前使用合成 clip 做 benchmark，不消费源视频帧。目标不是占满显存，而是在画质约束不变的前提下选择实测吞吐最快的执行参数：
+B-E 启动后会在实际视频推理前使用合成 clip 做快速 benchmark，不消费源视频帧。目标不是占满显存，而是在画质约束不变的前提下选择实测吞吐最快的执行参数：
 
-- tile：从 512 基线开始，测试通用候选和由实际源分辨率推导出的分块拓扑临界点；不会因为连续两个较大 tile 变慢就提前停止。1080p 会覆盖类似 512/540/640/768/896/960/1024/1080/1152/1280/1536 的候选。运行期仍保留 384/320/256 的 OOM fallback。
-- tile benchmark：先按完整源画面的真实 tile 形状和数量做拓扑筛选，再让基线和估算最快的候选实际跑完整源分辨率 tiled BasicVSR++，计入 padding、D2H 和拼接成本。
-- clip length：只允许从 profile 基线向上搜索；B 最多尝试到 13 帧，C/D/E 最多尝试到 15 帧。只有完整源分辨率实测有效 FPS 更快才采用更长 clip。
-- clip batch：使用 BasicVSR++ 原生 `N,T,3,H,W` 的 N 维并行独立 clips。默认尝试 1/2；显存至少 24 GiB 时才额外尝试 3。额外显存占用本身不会提高候选评分，batch 必须带来至少约 2% 的实测吞吐提升才采用。
-- 质量硬约束：`strength`、clip overlap、tile pad、scene-cut 阈值和各档最低 clip 不参与降质式调优；Real-ESRGAN 的 full-frame、模型、Lanczos 和编码路径完全不由该 autotuner 修改。
-- 显存仅作为安全约束：候选至少保留 `max(2 GiB, 20% 总显存)` 的全局空闲余量；评分只看有效输出帧吞吐量。
-- 运行期不再每个 clip batch 无条件调用 `torch.cuda.empty_cache()`；只有全局空闲显存低于同一安全阈值时才释放未占用 allocator cache。
-- 多 GPU B-E 会让每张 restoration GPU 使用自己的 autotune 结果；每张卡可以一次处理多个独立 clip，再按原始顺序输出。
+- 画质硬约束：`strength`、clip length、clip overlap、tile pad 和 scene-cut 阈值全部固定；Real-ESRGAN 的 full-frame、模型、Lanczos 和编码路径完全不由该 autotuner 修改。
+- tile：只向 512 基线以上搜索。候选根据实际源分辨率压缩成少量不同分块拓扑的代表点；例如 1920×1080 通常只测试 `512/640/960/1080`，不再逐个测试十几个接近的 tile。
+- 快速排名：先用 5 帧短 clip 在完整源分辨率上跑真实 tiled BasicVSR++，包含实际切块、padding、D2H 和拼接，只用于排序候选。
+- 最终确认：只让快速排名前两名使用当前 A-E 档的真实 clip length 再跑完整源分辨率 benchmark；基线只有在快速结果非常接近时才额外参加确认。
+- clip batch：16 GiB 级 GPU（包括 Tesla T4）固定 `batch=1`，不再浪费启动时间测试高显存但通常更慢的 batch=2；总显存至少 24 GiB 才尝试 batch=2，至少 48 GiB 且 batch=2 确实更快时才进一步尝试 batch=3。
+- 显存只作为安全约束：候选至少保留 `max(2 GiB, 20% 总显存)` 的全局空闲余量，额外占用显存不会提高评分。
+- CUDA benchmark 前只做一次小尺寸 warm-up，并在计时前后同步 GPU，避免 lazy initialization 和异步 kernel launch 扭曲测量。
+- 运行期不再每个 clip batch 无条件调用 `torch.cuda.empty_cache()`；只有全局空闲显存低于安全阈值时才释放未占用 allocator cache。
+- 多 GPU B-E 会让同型号 GPU 复用相同 autotune cache；第二张相同 GPU 不重复搜索。
 
-结果缓存到 `~/.cache/realesrgan/basicvsrpp-autotune-v2.json`，cache key 包含 GPU 型号、可用/总显存档位、PyTorch/CUDA 版本、源分辨率与 profile 质量基线。相同环境后续运行通常直接复用结果。
+结果缓存到 `~/.cache/realesrgan/basicvsrpp-autotune-v3.json`。cache key 使用 GPU 型号、总显存、PyTorch/CUDA、源分辨率以及完整 profile 质量参数，不再把容易波动的当前 free-VRAM 桶写入 key；读取缓存时仍会根据记录的峰值显存重新做安全检查。
 
 ## BasicVSR++ 权重
 
@@ -85,10 +86,10 @@ Real-ESRGAN 固定使用 full-frame，不包含 tile、batch 自动调参或 til
 `B-E` 档按 GPU 数量调度：
 
 - 2 张及以上 GPU：不再固定“GPU0 只跑 BasicVSR++、GPU1 只跑 SR”。相邻且具有相同 overlap 语义的 BasicVSR++ clips 会分配给多张 GPU 并行恢复；得到一批完整原分辨率帧后，全部请求 GPU 再共同运行 Real-ESRGAN full-frame。
-- autotuner 可以进一步让单张 GPU 在显存和吞吐确有收益时以 batch 形式同时处理 2/3 个独立 clip；不同 clip 不会互相传播时序信息。
+- 在显存和实测吞吐确有收益时，大显存 GPU 可以 batch 处理多个互相独立的 clip；不同 clip 不会互相传播时序信息。
 - 这种 balanced phase 调度用于修复 BasicVSR++ 比 AnimeVideo-v3 更慢时的 producer bottleneck，避免 SR GPU 长时间等待上游出帧。
 - 为避免两个大模型在同一 GPU 上同时抢计算资源，多 GPU B-E 不使用后台 BasicVSR++ prefetch；clip 批次和 SR 批次按需衔接。
-- 单 GPU 同样使用 autotune 后的 tile/clip/batch，但 BasicVSR++ 与 Real-ESRGAN 仍按阶段串行使用 GPU。
+- 单 GPU 同样使用 autotune 后的 tile/batch，但 BasicVSR++ 与 Real-ESRGAN 仍按阶段串行使用 GPU。
 - FFmpeg/NVENC 编码和 Lanczos 输出线程保持现有实现。
 
 ## 编码
@@ -105,6 +106,6 @@ Real-ESRGAN 固定使用 full-frame，不包含 tile、batch 自动调参或 til
 
 ## 使用
 
-在 Kaggle 中打开根目录 `realesrgan.ipynb`，设置 `SOURCE_PROFILE = "A" / "B" / "C" / "D" / "E"` 后运行。Notebook 默认测试区间为 5:35 开始、15 秒；第一次 B-E 建议先观察 autotune 结果、显存、双 GPU 利用率、编码和音画同步；同一环境后续运行会优先复用 autotune cache。
+在 Kaggle 中打开根目录 `realesrgan.ipynb`，设置 `SOURCE_PROFILE = "A" / "B" / "C" / "D" / "E"` 后运行。Notebook 默认测试区间为 5:35 开始、15 秒；第一次 B-E 建议先观察 `[autotuner]` 结果、显存、双 GPU 利用率、编码和音画同步；同一环境后续运行会优先复用 autotune cache。
 
 本仓库保留 Real-ESRGAN 的 BSD 3-Clause `LICENSE`。BasicVSR++ 适配代码的第三方说明见 `THIRD_PARTY_NOTICES.md`。
