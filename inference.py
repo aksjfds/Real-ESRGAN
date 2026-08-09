@@ -24,6 +24,14 @@ def main() -> None:
     encode_runtime.extend_parser(parser)
     args = parser.parse_args()
     encode_runtime.prepare_runtime(inference_runtime, args)
+
+    if args.source_profile != "A":
+        # B/C always use the checkpoint parts bundled in inference/weights.
+        from inference import basicvsrpp
+        from inference.checkpoint_parts import resolve_checkpoint
+
+        basicvsrpp.download_checkpoint = resolve_checkpoint
+
     inference_pipeline.process_video(args)
 
 
