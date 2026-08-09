@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import queue
 import subprocess
+import threading
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -11,6 +14,7 @@ import numpy as np
 CODECS = {"libsvtav1", "libaom-av1", "av1_nvenc"}
 _SVTAV1_PRESET = 6
 _AOM_CPU_USED = 6
+_AOM_QUEUE_DEPTH = 2
 
 
 def require_encoder(ffmpeg_bin: str, encoder: str) -> None:
@@ -103,8 +107,26 @@ def _codec_args(
     raise ValueError(f"Unsupported AV1 encoder: {codec}")
 
 
+def _libaom_tile_args(width: int, height: int) -> tuple[list[str], str]:
+    """Increase libaom parallelism without changing CRF or cpu-used.
+
+    FFmpeg/libaom may use a single tile up through 4K. Multiple tiles allow
+    row-mt and the encoder thread pool to utilize more CPU cores. Keep the tile
+    count conservative to limit the coding-efficiency penalty.
+    """
+    if width >= 3840 or height >= 2160:
+        return ["-tiles", "2x2"], "2x2"
+    if width >= 1920 or height >= 1080:
+        return ["-tiles", "2x1"], "2x1"
+    return [], "1x1"
+
+
 class RawVideoWriter:
-    """RGB24 FFmpeg writer for CPU/NVENC AV1."""
+    """RGB24 FFmpeg writer for CPU/NVENC AV1.
+
+    libaom-av1 uses a small background queue so GPU inference can overlap CPU
+    encoding instead of blocking on every frame written to FFmpeg stdin.
+    """
 
     def __init__(
         self,
@@ -150,24 +172,107 @@ class RawVideoWriter:
             _SVTAV1_PRESET,
             _AOM_CPU_USED,
         )
+
+        tile_name = "n/a"
+        if codec == "libaom-av1":
+            tile_args, tile_name = _libaom_tile_args(width, height)
+            command += tile_args
+
         command += ["-pix_fmt", "yuv420p", "-tag:v", "av01", str(path)]
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    def write(self, frame: np.ndarray) -> None:
+        self._queue: Optional[queue.Queue[Optional[np.ndarray]]] = None
+        self._thread: Optional[threading.Thread] = None
+        self._worker_error: Optional[BaseException] = None
+        self._closed = False
+
+        if codec == "libaom-av1":
+            self._queue = queue.Queue(maxsize=_AOM_QUEUE_DEPTH)
+            self._thread = threading.Thread(
+                target=self._write_loop,
+                name="libaom-av1-writer",
+                daemon=True,
+            )
+            self._thread.start()
+            print(
+                f"[encoder] libaom parallelism: row-mt=1, tiles={tile_name}, "
+                f"async_queue={_AOM_QUEUE_DEPTH}",
+                flush=True,
+            )
+
+    def _write_frame_sync(self, frame: np.ndarray) -> None:
         assert self.process.stdin is not None
-        try:
-            self.process.stdin.write(memoryview(np.ascontiguousarray(frame)).cast("B"))
-        except BrokenPipeError as error:
-            detail = self.process.stderr.read().decode(errors="replace") if self.process.stderr else ""
-            raise RuntimeError(f"ffmpeg encoder closed its input early:\n{detail}") from error
+        self.process.stdin.write(memoryview(frame).cast("B"))
+
+    def _write_loop(self) -> None:
+        assert self._queue is not None
+        while True:
+            frame = self._queue.get()
+            try:
+                if frame is None:
+                    return
+                self._write_frame_sync(frame)
+            except BaseException as error:
+                self._worker_error = error
+                return
+            finally:
+                self._queue.task_done()
+
+    def _raise_worker_error(self) -> None:
+        if self._worker_error is not None:
+            raise RuntimeError("background AV1 encoder writer failed") from self._worker_error
+
+    def write(self, frame: np.ndarray) -> None:
+        if self._closed:
+            raise RuntimeError("cannot write to a closed AV1 encoder")
+
+        frame = np.ascontiguousarray(frame)
+        if self._queue is None:
+            try:
+                self._write_frame_sync(frame)
+            except BrokenPipeError as error:
+                detail = self.process.stderr.read().decode(errors="replace") if self.process.stderr else ""
+                raise RuntimeError(f"ffmpeg encoder closed its input early:\n{detail}") from error
+            return
+
+        while True:
+            self._raise_worker_error()
+            try:
+                self._queue.put(frame, timeout=0.1)
+                return
+            except queue.Full:
+                continue
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        if self._queue is not None and self._thread is not None:
+            while self._thread.is_alive():
+                try:
+                    self._queue.put(None, timeout=0.1)
+                    break
+                except queue.Full:
+                    if self._worker_error is not None:
+                        break
+            self._thread.join()
+
         if self.process.stdin is not None:
-            self.process.stdin.close()
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
         stderr = self.process.stderr.read() if self.process.stderr is not None else b""
         if self.process.stderr is not None:
             self.process.stderr.close()
         return_code = self.process.wait()
+
+        if self._worker_error is not None:
+            raise RuntimeError(
+                "background AV1 encoder writer failed:\n"
+                f"{stderr.decode(errors='replace')}"
+            ) from self._worker_error
         if return_code != 0:
             raise RuntimeError(
                 f"ffmpeg encode failed (exit {return_code}):\n"
