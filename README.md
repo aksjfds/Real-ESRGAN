@@ -13,9 +13,11 @@
 - `realesrgan.ipynb`：Kaggle Notebook。
 - `inference/runtime.py`：视频探测/解码、8/10-bit 精度保持、模型加载与单帧 full-frame 推理等基础能力。
 - `inference/basicvsrpp.py`：BasicVSR++ NTIRE Track 1 同分辨率视频恢复、时序 clip、场景切换保护与显存自适应分块。
-- `inference/pipeline.py`：BasicVSR++ 预取、多 GPU full-frame 流水线、共享内存帧传输、输出顺序控制以及 Lanczos/编码并行。
+- `inference/pipeline.py`：基础 full-frame SR、共享内存、顺序输出、Lanczos/编码流水线。
+- `inference/balanced_pipeline.py`：B/C 多 GPU 负载均衡；BasicVSR++ clip 并行后让全部 GPU 回到 full-frame SR。
 - `inference/models/`：`SRVGGNetCompact` 等推理模型结构。
-- `inference/weights/`：推理权重缓存目录；BasicVSR++ checkpoint 首次使用 B/C 档时自动下载。
+- `inference/weights/`：推理权重目录；BasicVSR++ checkpoint 固定目标路径由 Git LFS 管理。
+- `tools/vendor_basicvsrpp.sh`：从 OpenMMLab 下载并通过 Git LFS 暂存 BasicVSR++ Track 1 checkpoint。
 - `encode/runtime.py`：编码后端选择和 CLI 参数。
 - `encode/hevc.py`：H.264/HEVC 编码实现。
 - `encode/av1.py`：AV1 编码实现。
@@ -32,6 +34,14 @@
 B/C 都使用 2 帧 clip overlap、scene-cut 检测、FP16 优先、32 像素空间上下文。空间 tile 默认 512；OOM 时自动依次回退到 384/320/256。tile 只属于 BasicVSR++ 前置恢复，**不会把 Real-ESRGAN 改成 tile 推理**。
 
 BasicVSR++ 输出与输入保持相同分辨率和整数位深：8-bit 输入返回 8-bit，10-bit 解码路径返回 16-bit 容器中的高精度 RGB，再交给现有 Real-ESRGAN 位深路径。
+
+## BasicVSR++ 权重
+
+固定文件名：
+
+`inference/weights/basicvsr_plusplus_c128n25_ntire_decompress_track1_20210223-7b2eba02.pth`
+
+该文件按 `.gitattributes` 使用 Git LFS 跟踪。可执行 `tools/vendor_basicvsrpp.sh` 下载官方 OpenMMLab checkpoint 并暂存到 LFS；在 LFS 对象尚未提交到仓库时，运行时仍保留原有的官方下载 fallback。
 
 ## 推理策略
 
@@ -52,11 +62,13 @@ Real-ESRGAN 固定使用 full-frame，不包含 tile、batch 自动调参或 til
 - 某张 GPU 完成一帧后立即接收下一帧，不等待其它 GPU、Lanczos 缩放和编码。
 - 全帧 Lanczos4 与 FFmpeg/NVENC 写入在独立输出线程执行，与后续 GPU 推理重叠。
 
-`B/C` 档进一步按 GPU 数量调度：
+`B/C` 档按 GPU 数量调度：
 
-- 2 张及以上 GPU：第一张 GPU 专用于 BasicVSR++，其余 GPU 专用于 Real-ESRGAN full-frame；两个重计算阶段通过有界内存预取队列重叠，避免模型激活互相抢显存。
-- 单 GPU：BasicVSR++ 与 Real-ESRGAN 使用同一设备，采用串行 feed，优先保证显存稳定和画质；Lanczos/编码线程仍保持并行。
-- FFmpeg/NVENC 编码路径不因开启 BasicVSR++ 改写。
+- 2 张及以上 GPU：不再固定“GPU0 只跑 BasicVSR++、GPU1 只跑 SR”。相邻且具有相同 overlap 语义的 BasicVSR++ clips 会分配给多张 GPU 并行恢复；得到一批完整原分辨率帧后，全部请求 GPU 再共同运行 Real-ESRGAN full-frame。
+- 这种 balanced phase 调度用于修复 BasicVSR++ 比 AnimeVideo-v3 更慢时的 producer bottleneck，避免 SR GPU 长时间等待上游出帧。
+- 为避免两个大模型在同一 GPU 上同时抢计算资源，多 GPU B/C 不再使用后台 BasicVSR++ prefetch；clip 批次和 SR 批次按需衔接。模型可以同时常驻显存，但重计算阶段尽量不重叠。
+- 单 GPU：继续使用原 B/C 串行 feed，优先保证显存稳定和画质。
+- FFmpeg/NVENC 编码和 Lanczos 输出线程保持现有实现。
 
 ## 编码
 
@@ -72,6 +84,6 @@ Real-ESRGAN 固定使用 full-frame，不包含 tile、batch 自动调参或 til
 
 ## 使用
 
-在 Kaggle 中打开根目录 `realesrgan.ipynb`，设置 `SOURCE_PROFILE = "A" / "B" / "C"` 后运行。建议先使用 `TEST_SECONDS = 10` 验证显存、BasicVSR++ tile fallback、编码、GPU 利用率和音画同步，再改为 `0` 处理完整视频。
+在 Kaggle 中打开根目录 `realesrgan.ipynb`，设置 `SOURCE_PROFILE = "A" / "B" / "C"` 后运行。建议先使用 `TEST_SECONDS = 10` 验证显存、BasicVSR++ tile fallback、双 GPU 利用率、编码和音画同步，再改为 `0` 处理完整视频。
 
 本仓库保留 Real-ESRGAN 的 BSD 3-Clause `LICENSE`。BasicVSR++ 适配代码的第三方说明见 `THIRD_PARTY_NOTICES.md`。
