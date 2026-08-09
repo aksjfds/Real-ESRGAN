@@ -19,12 +19,12 @@ import torch
 from tqdm import tqdm
 
 from . import runtime as base
-from .basicvsrpp import (
-    SOURCE_PROFILES,
-    BasicVSRPPConfig,
-    BasicVSRPPPreprocessor,
-    BasicVSRPPStreamReader,
-)
+
+SOURCE_PROFILES = {
+    "A": {"strength": 0.0, "clip_length": 0, "description": "off / clean source"},
+    "B": {"strength": 0.25, "clip_length": 7, "description": "mild compression/noise"},
+    "C": {"strength": 0.50, "clip_length": 9, "description": "visible compression/noise"},
+}
 
 _TIMEOUT = 300.0
 
@@ -438,7 +438,7 @@ def process_video(args) -> None:
     print(flush=True)
 
     reader = raw_reader = writer = workers = pump = progress = None
-    basic_stream: Optional[BasicVSRPPStreamReader] = None
+    basic_stream = None
     started = time.monotonic()
     next_frame = next_output = 0
     eof = False
@@ -495,6 +495,9 @@ def process_video(args) -> None:
             reader = raw_reader
             raw_reader = None
         else:
+            # Lazy import keeps profile A on the v4.2 dependency/runtime path.
+            from .basicvsrpp import BasicVSRPPConfig, BasicVSRPPPreprocessor, BasicVSRPPStreamReader
+
             t = time.monotonic()
             preprocessor = BasicVSRPPPreprocessor(
                 BasicVSRPPConfig(
