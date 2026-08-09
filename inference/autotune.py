@@ -1,10 +1,4 @@
-"""Automatic tile/batch tuning for the master inference pipeline.
-
-The tuner runs in a short-lived spawn process so CUDA memory used for probing is
-fully released before the persistent video workers start.  It measures the real
-model on the selected GPU and estimates master branch frame latency using the
-same multi-GPU tile distribution policy as ``PersistentWorkers``.
-"""
+"""Automatic quality-safe tile/batch tuning for the master inference pipeline."""
 
 from __future__ import annotations
 
@@ -17,7 +11,6 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 import torch
-import torch.nn.functional as F
 
 
 _MIN_QUALITY_TILE = 512
@@ -35,10 +28,6 @@ class TuneResult:
     rejected_oom: int
     probe_gpu: int
     search_seconds: float
-
-    @property
-    def tile_label(self) -> str:
-        return "full-frame" if self.tile_size == 0 else str(self.tile_size)
 
 
 def _axis_starts(length: int, tile_size: int, overlap: int) -> list[int]:
@@ -58,12 +47,16 @@ def _probe_forward(
     device: torch.device,
     fp16: bool,
     channels_last: bool,
-    native_scale: int,
-    output_scale: float,
     patch_h: int,
     patch_w: int,
     batch_size: int,
 ) -> tuple[bool, float]:
+    """Measure the native model forward only.
+
+    Final target scaling is intentionally excluded because the runtime performs
+    one full-frame Lanczos resize after reconstruction, independent of the
+    tile/batch candidate being tested.
+    """
     dtype = torch.float16 if fp16 else torch.float32
     tensor = None
     output = None
@@ -81,16 +74,6 @@ def _probe_forward(
         with torch.inference_mode():
             started.record()
             output = model(tensor)
-            if output_scale != native_scale:
-                output = F.interpolate(
-                    output,
-                    size=(
-                        max(1, int(round(patch_h * output_scale))),
-                        max(1, int(round(patch_w * output_scale))),
-                    ),
-                    mode="bicubic",
-                    align_corners=False,
-                )
             ended.record()
             torch.cuda.synchronize(device)
         seconds = started.elapsed_time(ended) / 1000.0
@@ -110,9 +93,7 @@ def _probe_worker(
     height: int,
     gpu_count: int,
     overlap: int,
-    auto_tile: bool,
     max_tile_size: int,
-    auto_batch: bool,
     max_batch_size: int,
     requested_tile: int,
     requested_batch: int,
@@ -127,49 +108,24 @@ def _probe_worker(
         torch.backends.cuda.matmul.allow_tf32 = True
 
         config = base.WorkerConfig(**config_dict)  # type: ignore[arg-type]
-        model, native_scale = base.load_worker_model(config, device)
+        model, _native_scale = base.load_worker_model(config, device)
 
-        if auto_tile:
-            tile_candidates = [0]
-            tile_candidates.extend(
-                tile
-                for tile in _TILE_CANDIDATES
-                if tile <= max_tile_size and tile > overlap * 2
-            )
-            if requested_tile >= _MIN_QUALITY_TILE and requested_tile <= max_tile_size:
-                tile_candidates.append(requested_tile)
-            tile_candidates = list(dict.fromkeys(tile_candidates))
-        else:
-            tile_candidates = [requested_tile]
+        tile_candidates = [
+            tile
+            for tile in _TILE_CANDIDATES
+            if tile <= max_tile_size and tile > overlap * 2
+        ]
+        if _MIN_QUALITY_TILE <= requested_tile <= max_tile_size:
+            tile_candidates.append(requested_tile)
+        tile_candidates = list(dict.fromkeys(tile_candidates))
+        if not tile_candidates:
+            raise RuntimeError("No quality-preserving tile candidate is available")
 
         best: Optional[tuple[float, int, int, float]] = None
         tested = 0
         rejected_oom = 0
 
         for tile_size in tile_candidates:
-            if tile_size == 0:
-                ok, seconds = _probe_forward(
-                    model,
-                    device,
-                    bool(config.fp16),
-                    bool(config.channels_last),
-                    native_scale,
-                    float(config.scale),
-                    height,
-                    width,
-                    1,
-                )
-                if not ok:
-                    rejected_oom += 1
-                    continue
-                tested += 1
-                estimated = seconds / max(1, gpu_count)
-                throughput = width * height / seconds / 1_000_000.0
-                choice = (estimated, 0, 1, throughput)
-                if best is None or choice[0] < best[0]:
-                    best = choice
-                continue
-
             count = _tile_count(width, height, tile_size, overlap)
             worker_counts = [
                 len(range(worker_id, count, max(1, gpu_count)))
@@ -177,17 +133,16 @@ def _probe_worker(
             ]
             max_worker_tiles = max(worker_counts, default=1)
 
-            if auto_batch:
-                batch_candidates = [
-                    value
-                    for value in _BATCH_CANDIDATES
-                    if value <= max_batch_size and value <= max_worker_tiles
-                ]
-                if max_worker_tiles <= max_batch_size:
-                    batch_candidates.append(max_worker_tiles)
-                batch_candidates = sorted(set(batch_candidates))
-            else:
-                batch_candidates = [min(max_worker_tiles, max(1, requested_batch))]
+            batch_candidates = [
+                value
+                for value in _BATCH_CANDIDATES
+                if value <= max_batch_size and value <= max_worker_tiles
+            ]
+            if 1 <= requested_batch <= min(max_batch_size, max_worker_tiles):
+                batch_candidates.append(requested_batch)
+            if max_worker_tiles <= max_batch_size:
+                batch_candidates.append(max_worker_tiles)
+            batch_candidates = sorted(set(batch_candidates))
 
             for batch_size in batch_candidates:
                 ok, seconds = _probe_forward(
@@ -195,15 +150,12 @@ def _probe_worker(
                     device,
                     bool(config.fp16),
                     bool(config.channels_last),
-                    native_scale,
-                    float(config.scale),
                     tile_size,
                     tile_size,
                     batch_size,
                 )
                 if not ok:
                     rejected_oom += 1
-                    # Larger batches for the same tile are not expected to fit.
                     break
 
                 tested += 1
@@ -221,7 +173,7 @@ def _probe_worker(
 
         if best is None:
             raise RuntimeError(
-                "No quality-preserving full-frame/tile/batch combination fit on the probe GPU"
+                "No quality-preserving tile/batch combination fit on the probe GPU"
             )
 
         estimated, tile_size, batch_size, throughput = best
@@ -251,14 +203,12 @@ def select_parameters(
     height: int,
     gpu_count: int,
     overlap: int,
-    auto_tile: bool,
     max_tile_size: int,
-    auto_batch: bool,
     max_batch_size: int,
     requested_tile: int,
     requested_batch: int,
 ) -> TuneResult:
-    """Measure candidate combinations and return the estimated fastest safe one."""
+    """Return the fastest measured quality-safe tiled configuration."""
     if max_tile_size < _MIN_QUALITY_TILE:
         raise ValueError(f"--max-tile-size must be at least {_MIN_QUALITY_TILE}")
     if max_batch_size < 1:
@@ -277,9 +227,7 @@ def select_parameters(
             int(height),
             int(gpu_count),
             int(overlap),
-            bool(auto_tile),
             int(max_tile_size),
-            bool(auto_batch),
             int(max_batch_size),
             int(requested_tile),
             int(requested_batch),
