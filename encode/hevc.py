@@ -46,8 +46,6 @@ def _frame_pixel_formats(frame: np.ndarray, codec: str) -> tuple[str, str]:
     if frame.dtype.kind == "u" and frame.dtype.itemsize == 1:
         return "rgb24", "yuv420p"
     if frame.dtype.kind == "u" and frame.dtype.itemsize == 2:
-        # NVENC consumes 10-bit 4:2:0 through P010; software encoders use the
-        # planar 10-bit format. Both produce a 10-bit encoded video stream.
         output_pix_fmt = "p010le" if codec.endswith("_nvenc") else "yuv420p10le"
         return "rgb48le", output_pix_fmt
     raise RuntimeError(f"Unsupported inference frame dtype for encoding: {frame.dtype}")
@@ -147,11 +145,6 @@ class RawVideoWriter:
         if self.codec in {"libx265", "hevc_nvenc"}:
             command += ["-tag:v", "hvc1"]
         command.append(str(self.path))
-
-        print(
-            f"[encoder] pixel format: {raw_pix_fmt} -> {output_pix_fmt} ({self.codec})",
-            flush=True,
-        )
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def write(self, frame: np.ndarray) -> None:
