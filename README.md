@@ -6,13 +6,24 @@
 
 - `inference.py`：统一命令行入口。
 - `realesrgan.ipynb`：Kaggle Notebook。
-- `inference/runtime.py`：视频解码、Real-ESRGAN 模型、多 GPU worker、tile、融合、进度与音频封装。
-- `inference/bitdepth.py`：自动检测并保持 8-bit / 10-bit 源视频精度。
+- `inference/runtime.py`：视频探测/解码、8/10-bit 精度保持、Real-ESRGAN、多 GPU worker、tile、融合、进度与音频封装。
+- `inference/autotune.py`：在实际 GPU 上测试 full-frame / tile / batch，并选择预计整帧最快的安全组合。
 - `inference/models/`：`SRVGGNetCompact` 等推理模型结构。
+- `inference/weights/`：随仓库提供的推理权重。
 - `encode/runtime.py`：编码后端选择和 CLI 参数。
 - `encode/hevc.py`：H.264/HEVC 编码实现，包括 `libx264`、`libx265`、`h264_nvenc`、`hevc_nvenc`。
 - `encode/av1.py`：AV1 编码实现，包括 `libsvtav1`、`libaom-av1`、`av1_nvenc`。
 - `requirements.txt`：运行依赖。
+
+## 自动调参
+
+Notebook 默认启用 `AUTO_TILE` 和 `AUTO_BATCH`。
+
+- 自动测试 full-frame 与不小于 512 的 tile，避免为了速度主动选择过小 tile。
+- tiled 候选会继续测试不同 batch，并自动过滤 OOM 组合。
+- 评分按 master 当前多 GPU 分配方式估算整帧耗时，而不是简单选择最大 tile 或最大 batch。
+- 若 full-frame 能运行并且预计最快，也会直接选择 full-frame。
+- 关闭自动选项后仍可使用 `TILE_SIZE` / `BATCH_SIZE` 手动指定。
 
 ## 编码
 
