@@ -1,0 +1,575 @@
+name: Full-frame quality refactor
+
+on:
+  push:
+    paths:
+      - .github/workflows/fullframe-quality-refactor.yml
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply refactor
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import ast
+          import json
+
+          runtime_path = Path('inference/runtime.py')
+          text = runtime_path.read_text()
+          text = text.replace('import torch.nn.functional as F\n', '')
+
+          # Replace worker-side resize with native-scale model output only.
+          start = text.index('\ndef infer_image_batch(\n')
+          end = text.index('\ndef worker_main(\n', start)
+          infer_block = '''\ndef _model_native_scale(name: str) -> int:
+              return 2 if name == "RealESRGAN_x2plus" else 4
+
+
+          def _full_frame_lanczos(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+              """Resize a completed native-scale frame once with Lanczos4."""
+              if frame.shape[1] == width and frame.shape[0] == height:
+                  return frame
+              if frame.dtype.kind != "u" or frame.dtype.itemsize not in {1, 2}:
+                  raise RuntimeError(f"Unsupported inference frame dtype for resize: {frame.dtype}")
+              max_value = float(np.iinfo(frame.dtype).max)
+              resized = cv2.resize(
+                  frame.astype(np.float32, copy=False),
+                  (width, height),
+                  interpolation=cv2.INTER_LANCZOS4,
+              )
+              np.rint(resized, out=resized)
+              np.clip(resized, 0, max_value, out=resized)
+              return resized.astype(frame.dtype)
+
+
+          def infer_image_batch(
+              model: torch.nn.Module,
+              patches: Sequence[np.ndarray],
+              device: torch.device,
+              fp16: bool,
+              native_scale: int,
+              output_scale: float,
+              channels_last: bool,
+          ) -> List[np.ndarray]:
+              # The model always returns its native scale. Final target scaling is
+              # performed once after full-frame reconstruction, never per patch.
+              del native_scale, output_scale
+              is_10bit = _is_uint16(patches[0])
+
+              if is_10bit:
+                  rgb = np.stack(patches).astype(np.float32, copy=False)
+                  tensor = torch.from_numpy(rgb).permute(0, 3, 1, 2).to(device, non_blocking=True)
+                  tensor.div_(65535.0)
+                  if fp16 and device.type == "cuda":
+                      tensor = tensor.half()
+              else:
+                  rgb = np.stack(patches)
+                  tensor = torch.from_numpy(rgb).permute(0, 3, 1, 2).to(device, non_blocking=True)
+                  tensor = tensor.half() if fp16 and device.type == "cuda" else tensor.float()
+                  tensor.div_(255.0)
+
+              if channels_last and device.type == "cuda":
+                  tensor = tensor.contiguous(memory_format=torch.channels_last)
+
+              with torch.inference_mode():
+                  output = model(tensor)
+                  output.clamp_(0, 1)
+                  if is_10bit:
+                      output = output.float().mul_(65535.0).round_()
+                  else:
+                      output = output.mul_(255.0).round_().byte()
+
+              array = output.permute(0, 2, 3, 1).contiguous().cpu().numpy()
+              if is_10bit:
+                  array = array.astype(np.uint16)
+              return list(array)
+          '''
+          infer_block = '\n'.join(line[10:] if line.startswith('          ') else line for line in infer_block.splitlines())
+          text = text[:start] + infer_block + text[end:]
+
+          # FULL_FRAME is the single external switch. True=fixed full-frame;
+          # False=automatic quality-safe tile+batch tuning.
+          vstart = text.index('\ndef validate_args(args: argparse.Namespace) -> None:\n')
+          vend = text.index('\ndef _output_pixel_format', vstart)
+          validation = '''\ndef validate_args(args: argparse.Namespace) -> None:
+              if args.scale <= 0:
+                  raise ValueError("--scale must be positive.")
+              if args.batch_size < 1:
+                  raise ValueError("--batch-size must be at least 1.")
+              if args.overlap < 0:
+                  raise ValueError("--overlap must be non-negative.")
+              if not 0 <= args.denoise_strength <= 1:
+                  raise ValueError("--denoise-strength must be between 0 and 1.")
+              if not args.full_frame:
+                  if args.tile_size < 64 or args.tile_size % 4:
+                      raise ValueError("--tile-size must be at least 64 and divisible by 4.")
+                  if args.overlap >= args.tile_size // 2:
+                      raise ValueError("--overlap must be less than half of --tile-size.")
+                  if args.max_tile_size < 512:
+                      raise ValueError("--max-tile-size must be at least 512.")
+                  if args.max_batch_size < 1:
+                      raise ValueError("--max-batch-size must be at least 1.")
+          '''
+          validation = '\n'.join(line[10:] if line.startswith('          ') else line for line in validation.splitlines())
+          text = text[:vstart] + validation + text[vend:]
+
+          # Replace tuning setup.
+          pstart = text.index('    requested_config = WorkerConfig(\n', text.index('def process_video'))
+          pend = text.index('    config = WorkerConfig(\n', pstart)
+          setup = '''    native_scale = _model_native_scale(args.model)
+              requested_config = WorkerConfig(
+                  model_name=args.model,
+                  model_paths=model_paths,
+                  denoise_strength=args.denoise_strength,
+                  scale=args.scale,
+                  tile_size=args.tile_size,
+                  batch_size=args.batch_size,
+                  fp16=effective_fp16,
+                  channels_last=effective_channels_last,
+              )
+
+              tune_result = None
+              cuda_gpu_ids = [int(gpu_id) for gpu_id in gpu_ids if gpu_id is not None]
+              if args.full_frame:
+                  args.tile_size = 0
+                  args.batch_size = 1
+              elif cuda_gpu_ids:
+                  tune_gpu = min(
+                      cuda_gpu_ids,
+                      key=lambda gpu_id: torch.cuda.get_device_properties(gpu_id).total_memory,
+                  )
+                  tune_result = autotune.select_parameters(
+                      config_dict=asdict(requested_config),
+                      gpu_id=tune_gpu,
+                      width=input_width,
+                      height=input_height,
+                      gpu_count=len(cuda_gpu_ids),
+                      overlap=args.overlap,
+                      max_tile_size=args.max_tile_size,
+                      max_batch_size=args.max_batch_size,
+                      requested_tile=args.tile_size,
+                      requested_batch=args.batch_size,
+                  )
+                  args.tile_size = tune_result.tile_size
+                  args.batch_size = tune_result.batch_size
+
+          '''
+          setup = '\n'.join(line[10:] if line.startswith('          ') else line for line in setup.splitlines())
+          text = text[:pstart] + setup + text[pend:]
+
+          # Compact log: show native model scale and one full-frame Lanczos resize.
+          old_model_log = '''    print(
+              f"Model   : {args.model} | scale={args.scale:g}x | channels_last={effective_channels_last}",
+              flush=True,
+          )
+          '''
+          new_model_log = '''    resample_text = (
+              f"native={native_scale}x"
+              if float(args.scale) == float(native_scale)
+              else f"native={native_scale}x -> final={args.scale:g}x | resample=full-frame Lanczos4"
+          )
+              print(
+                  f"Model   : {args.model} | {resample_text} | channels_last={effective_channels_last}",
+                  flush=True,
+              )
+          '''
+          new_model_log = '\n'.join(line[10:] if line.startswith('          ') else line for line in new_model_log.splitlines())
+          if old_model_log not in text:
+              raise RuntimeError('model log block not found')
+          text = text.replace(old_model_log, new_model_log, 1)
+
+          old_tuning = '''    if tune_result is not None:
+              print(
+                  f"Tuning  : tile={tune_result.tile_label} | batch={tune_result.batch_size} | "
+                  f"estimate={tune_result.estimated_seconds:.3f}s/frame | "
+                  f"tested={tune_result.tested}, OOM={tune_result.rejected_oom} | "
+                  f"search={tune_result.search_seconds:.1f}s",
+                  flush=True,
+              )
+          elif args.tile_size == 0:
+              print(f"Tuning  : manual | full-frame | parallel_frames={len(gpu_ids)}", flush=True)
+          else:
+              print(
+                  f"Tuning  : manual | tile={args.tile_size} | overlap={args.overlap} | batch={args.batch_size}",
+                  flush=True,
+              )
+          '''
+          new_tuning = '''    if args.full_frame:
+              print(f"Mode    : FULL_FRAME=True | full-frame | parallel_frames={len(gpu_ids)}", flush=True)
+          elif tune_result is not None:
+              print(
+                  f"Mode    : FULL_FRAME=False | auto tile={tune_result.tile_size} | "
+                  f"batch={tune_result.batch_size} | estimate={tune_result.estimated_seconds:.3f}s/frame | "
+                  f"tested={tune_result.tested}, OOM={tune_result.rejected_oom} | search={tune_result.search_seconds:.1f}s",
+                  flush=True,
+              )
+          else:
+              print(
+                  f"Mode    : FULL_FRAME=False | CPU fallback tile={args.tile_size} | batch={args.batch_size}",
+                  flush=True,
+              )
+          '''
+          new_tuning = '\n'.join(line[10:] if line.startswith('          ') else line for line in new_tuning.splitlines())
+          if old_tuning not in text:
+              raise RuntimeError('tuning log block not found')
+          text = text.replace(old_tuning, new_tuning, 1)
+
+          text = text.replace(
+              '        "blend": 0.0,\n        "write": 0.0,\n',
+              '        "blend": 0.0,\n        "resize": 0.0,\n        "write": 0.0,\n',
+              1,
+          )
+
+          old_full_write = '''                    stage_started = time.monotonic()
+                      for frame_id, _frame in indexed_frames:
+                          writer.write(frame_outputs[frame_id])
+                      timings["write"] += time.monotonic() - stage_started
+          '''
+          new_full_write = '''                    resized_outputs = {}
+                      stage_started = time.monotonic()
+                      for frame_id, _frame in indexed_frames:
+                          resized_outputs[frame_id] = _full_frame_lanczos(
+                              frame_outputs[frame_id], output_width, output_height
+                          )
+                      timings["resize"] += time.monotonic() - stage_started
+                      stage_started = time.monotonic()
+                      for frame_id, _frame in indexed_frames:
+                          writer.write(resized_outputs[frame_id])
+                      timings["write"] += time.monotonic() - stage_started
+          '''
+          old_full_write = '\n'.join(line[10:] if line.startswith('          ') else line for line in old_full_write.splitlines()) + '\n'
+          new_full_write = '\n'.join(line[10:] if line.startswith('          ') else line for line in new_full_write.splitlines()) + '\n'
+          if old_full_write not in text:
+              raise RuntimeError('full-frame write block not found')
+          text = text.replace(old_full_write, new_full_write, 1)
+
+          old_tile = '''                    output = blend_tiles(
+                          tile_outputs,
+                          tile_infos,
+                          input_width,
+                          input_height,
+                          args.scale,
+                          args.overlap,
+                      )
+                      timings["blend"] += time.monotonic() - stage_started
+                      stage_started = time.monotonic()
+                      writer.write(output)
+          '''
+          new_tile = '''                    native_output = blend_tiles(
+                          tile_outputs,
+                          tile_infos,
+                          input_width,
+                          input_height,
+                          native_scale,
+                          args.overlap,
+                      )
+                      timings["blend"] += time.monotonic() - stage_started
+                      stage_started = time.monotonic()
+                      output = _full_frame_lanczos(native_output, output_width, output_height)
+                      timings["resize"] += time.monotonic() - stage_started
+                      stage_started = time.monotonic()
+                      writer.write(output)
+          '''
+          old_tile = '\n'.join(line[10:] if line.startswith('          ') else line for line in old_tile.splitlines()) + '\n'
+          new_tile = '\n'.join(line[10:] if line.startswith('          ') else line for line in new_tile.splitlines()) + '\n'
+          if old_tile not in text:
+              raise RuntimeError('tile output block not found')
+          text = text.replace(old_tile, new_tile, 1)
+
+          text = text.replace(
+              'f"inference={timings[\'inference\']:.1f}s | blend={timings[\'blend\']:.1f}s | "\n        f"encode={encode_time:.1f}s | audio={timings[\'audio_mux\']:.1f}s",',
+              'f"inference={timings[\'inference\']:.1f}s | blend={timings[\'blend\']:.1f}s | "\n        f"resize={timings[\'resize\']:.1f}s | encode={encode_time:.1f}s | audio={timings[\'audio_mux\']:.1f}s",',
+              1,
+          )
+
+          # Replace CLI auto-tile/auto-batch toggles with one FULL_FRAME switch.
+          parser_start = text.index('    parser.add_argument(\n        "--tile-size",', text.index('def build_parser'))
+          parser_end = text.index('    parser.add_argument("--gpu-ids"', parser_start)
+          parser_block = '''    parser.add_argument(
+              "--full-frame",
+              action=argparse.BooleanOptionalAction,
+              default=True,
+              help="True uses quality-first full-frame inference; False enables automatic tile+batch tuning",
+          )
+              parser.add_argument(
+                  "--tile-size",
+                  type=int,
+                  default=512,
+                  help="Fallback/additional tile candidate used when --no-full-frame",
+              )
+              parser.add_argument("--max-tile-size", type=int, default=1536)
+              parser.add_argument("--overlap", type=int, default=32)
+              parser.add_argument(
+                  "--batch-size", type=int, default=4,
+                  help="Fallback/additional batch candidate used when --no-full-frame",
+              )
+              parser.add_argument("--max-batch-size", type=int, default=32)
+          '''
+          parser_block = '\n'.join(line[10:] if line.startswith('          ') else line for line in parser_block.splitlines()) + '\n'
+          text = text[:parser_start] + parser_block + text[parser_end:]
+
+          runtime_path.write_text(text)
+
+          # Autotuner: tiled auto-search only, and benchmark native model forward.
+          auto_path = Path('inference/autotune.py')
+          auto = auto_path.read_text().replace('import torch.nn.functional as F\n', '')
+          astart = auto.index('\ndef _probe_forward(\n')
+          aend = auto.index('\ndef _probe_worker(\n', astart)
+          probe = '''\ndef _probe_forward(
+              model: torch.nn.Module,
+              device: torch.device,
+              fp16: bool,
+              channels_last: bool,
+              patch_h: int,
+              patch_w: int,
+              batch_size: int,
+          ) -> tuple[bool, float]:
+              dtype = torch.float16 if fp16 else torch.float32
+              tensor = None
+              output = None
+              try:
+                  tensor = torch.zeros(
+                      (batch_size, 3, patch_h, patch_w),
+                      dtype=dtype,
+                      device=device,
+                  )
+                  if channels_last:
+                      tensor = tensor.contiguous(memory_format=torch.channels_last)
+                  started = torch.cuda.Event(enable_timing=True)
+                  ended = torch.cuda.Event(enable_timing=True)
+                  with torch.inference_mode():
+                      started.record()
+                      output = model(tensor)
+                      ended.record()
+                      torch.cuda.synchronize(device)
+                  seconds = started.elapsed_time(ended) / 1000.0
+                  return True, max(seconds, 1e-9)
+              except torch.cuda.OutOfMemoryError:
+                  return False, 0.0
+              finally:
+                  del output, tensor
+                  torch.cuda.empty_cache()
+          '''
+          probe = '\n'.join(line[10:] if line.startswith('          ') else line for line in probe.splitlines())
+          auto = auto[:astart] + probe + auto[aend:]
+
+          # Signature and candidate policy.
+          auto = auto.replace(
+              '    auto_tile: bool,\n    max_tile_size: int,\n    auto_batch: bool,\n    max_batch_size: int,\n',
+              '    max_tile_size: int,\n    max_batch_size: int,\n',
+          )
+          worker_candidate_start = auto.index('        if auto_tile:\n', auto.index('def _probe_worker'))
+          worker_candidate_end = auto.index('        best: Optional[tuple', worker_candidate_start)
+          candidate = '''        tile_candidates = [
+              tile for tile in _TILE_CANDIDATES
+              if tile <= max_tile_size and tile > overlap * 2
+          ]
+              if requested_tile >= _MIN_QUALITY_TILE and requested_tile <= max_tile_size:
+                  tile_candidates.append(requested_tile)
+              tile_candidates = list(dict.fromkeys(tile_candidates))
+              if not tile_candidates:
+                  raise RuntimeError("No quality-preserving tile candidate is available")
+
+          '''
+          candidate = '\n'.join(line[10:] if line.startswith('          ') else line for line in candidate.splitlines())
+          auto = auto[:worker_candidate_start] + candidate + auto[worker_candidate_end:]
+
+          # Remove full-frame branch in tuner.
+          ff_start = auto.index('            if tile_size == 0:\n', auto.index('for tile_size in tile_candidates'))
+          ff_end = auto.index('            count = _tile_count', ff_start)
+          auto = auto[:ff_start] + auto[ff_end:]
+
+          batch_start = auto.index('            if auto_batch:\n', auto.index('count = _tile_count'))
+          batch_end = auto.index('\n            for batch_size in batch_candidates:', batch_start)
+          batch_code = '''            batch_candidates = [
+                  value for value in _BATCH_CANDIDATES
+                  if value <= max_batch_size and value <= max_worker_tiles
+              ]
+              if 1 <= requested_batch <= min(max_batch_size, max_worker_tiles):
+                  batch_candidates.append(requested_batch)
+              if max_worker_tiles <= max_batch_size:
+                  batch_candidates.append(max_worker_tiles)
+              batch_candidates = sorted(set(batch_candidates))
+          '''
+          batch_code = '\n'.join(line[10:] if line.startswith('          ') else line for line in batch_code.splitlines())
+          auto = auto[:batch_start] + batch_code + auto[batch_end:]
+
+          # Update _probe_forward calls by removing native/output scale args.
+          auto = auto.replace(
+              '                    bool(config.channels_last),\n                    native_scale,\n                    float(config.scale),\n                    tile_size,\n',
+              '                    bool(config.channels_last),\n                    tile_size,\n',
+          )
+          auto = auto.replace('        model, native_scale = base.load_worker_model(config, device)\n',
+                              '        model, _native_scale = base.load_worker_model(config, device)\n')
+
+          # select_parameters signature/call removes auto flags.
+          auto = auto.replace(
+              '    auto_tile: bool,\n    max_tile_size: int,\n    auto_batch: bool,\n    max_batch_size: int,\n',
+              '    max_tile_size: int,\n    max_batch_size: int,\n',
+          )
+          auto = auto.replace(
+              '            bool(auto_tile),\n            int(max_tile_size),\n            bool(auto_batch),\n            int(max_batch_size),\n',
+              '            int(max_tile_size),\n            int(max_batch_size),\n',
+          )
+          auto = auto.replace(
+              '                "No quality-preserving full-frame/tile/batch combination fit on the probe GPU"\n',
+              '                "No quality-preserving tile/batch combination fit on the probe GPU"\n',
+          )
+          auto = auto.replace(
+              '    """Measure candidate combinations and return the estimated fastest safe one."""\n',
+              '    """Measure quality-safe tile/batch candidates and return the fastest safe one."""\n',
+          )
+          auto_path.write_text(auto)
+
+          # Notebook: one FULL_FRAME switch only.
+          nb_path = Path('realesrgan.ipynb')
+          nb = json.loads(nb_path.read_text())
+          config_cell = '''INPUT_VIDEO = "/kaggle/input/datasets/rustacean1/hanime/bz.mp4"
+          OUTPUT_VIDEO = "/kaggle/working/realesrgan.mp4"
+
+          MODEL = "realesr-animevideov3"
+          MODEL_PATH = ""
+          SCALE = 2
+          FPS = "24000/1001"
+
+          START_TIME = 0
+          TEST_SECONDS = 10
+
+          DENOISE_STRENGTH = 1.0
+          FP16 = True
+          CHANNELS_LAST = True
+          INPUT_WIDTH = 0
+          INPUT_HEIGHT = 0
+
+          # True：画质优先，固定整帧推理；不会进行 tile/batch 自动搜索。
+          # False：自动寻找 >=512 的 tile + batch 最快组合。
+          FULL_FRAME = True
+          MAX_TILE_SIZE = 1536
+          MAX_BATCH_SIZE = 32
+          TILE_SIZE = 512       # FULL_FRAME=False 时作为额外候选/回退值
+          OVERLAP = 32
+          BATCH_SIZE = 4        # FULL_FRAME=False 时作为额外候选/回退值
+          GPU_IDS = "0,1"
+
+          # 编码器：
+          #   CPU HEVC = "libx265"
+          #   GPU HEVC = "hevc_nvenc"
+          #   CPU AV1  = "libsvtav1"  # 缺失时自动尝试 libaom-av1
+          #   CPU AV1  = "libaom-av1"
+          #   GPU AV1  = "av1_nvenc"
+          VIDEO_CODEC = "hevc_nvenc"
+          CRF = 18
+          PRESET = "medium"
+          SVTAV1_PRESET = 6
+          AOM_CPU_USED = 6
+          CQ = 18
+          NVENC_PRESET = "p7"
+          ENCODE_GPU = 0
+
+          AUDIO_CODEC = "copy"
+          AUDIO_BITRATE = "192k"
+          '''
+          config_cell = '\n'.join(line[10:] if line.startswith('          ') else line for line in config_cell.splitlines()) + '\n'
+          nb['cells'][1]['source'] = config_cell.splitlines(keepends=True)
+
+          run_cell = '''import subprocess
+          import sys
+
+
+def boolean_flag(enabled, yes, no):
+              return yes if enabled else no
+
+
+          command = [
+              sys.executable, "/kaggle/working/Real-ESRGAN/inference.py",
+              "--input", INPUT_VIDEO,
+              "--output", OUTPUT_VIDEO,
+              "--model", MODEL,
+              "--model-path", MODEL_PATH,
+              "--denoise-strength", str(DENOISE_STRENGTH),
+              "--scale", str(SCALE),
+              "--fps", str(FPS),
+              boolean_flag(FP16, "--fp16", "--no-fp16"),
+              boolean_flag(CHANNELS_LAST, "--channels-last", "--no-channels-last"),
+              "--input-width", str(INPUT_WIDTH),
+              "--input-height", str(INPUT_HEIGHT),
+              boolean_flag(FULL_FRAME, "--full-frame", "--no-full-frame"),
+              "--max-tile-size", str(MAX_TILE_SIZE),
+              "--tile-size", str(TILE_SIZE),
+              "--overlap", str(OVERLAP),
+              "--max-batch-size", str(MAX_BATCH_SIZE),
+              "--batch-size", str(BATCH_SIZE),
+              "--gpu-ids", GPU_IDS,
+              "--video-codec", VIDEO_CODEC,
+              "--crf", str(CRF),
+              "--preset", PRESET,
+              "--svtav1-preset", str(SVTAV1_PRESET),
+              "--aom-cpu-used", str(AOM_CPU_USED),
+              "--cq", str(CQ),
+              "--nvenc-preset", NVENC_PRESET,
+              "--encode-gpu", str(ENCODE_GPU),
+              "--audio-codec", AUDIO_CODEC,
+              "--audio-bitrate", AUDIO_BITRATE,
+              "--start-time", str(START_TIME),
+              "--test-seconds", str(TEST_SECONDS),
+              "--ffmpeg-bin", "ffmpeg",
+              "--ffprobe-bin", "ffprobe",
+          ]
+
+          _result = subprocess.run(command, check=True)
+          '''
+          run_cell = '\n'.join(line[10:] if line.startswith('          ') else line for line in run_cell.splitlines()) + '\n'
+          nb['cells'][2]['source'] = run_cell.splitlines(keepends=True)
+          nb_path.write_text(json.dumps(nb, ensure_ascii=False, indent=1) + '\n')
+
+          # README sync.
+          readme_path = Path('README.md')
+          readme = readme_path.read_text()
+          readme = readme.replace(
+              '- `inference/runtime.py`：视频探测/解码、8/10-bit 保持、模型 worker、tile 融合、进度与音频封装。\n',
+              '- `inference/runtime.py`：视频探测/解码、8/10-bit 保持、模型 worker、原生倍率重建、全帧 Lanczos4 缩放、进度与音频封装。\n',
+          )
+          readme = readme.replace(
+              '- `inference/autotune.py`：在实际 GPU 上探测 full-frame / tile + batch，并按多 GPU 调度估算整帧耗时。\n',
+              '- `inference/autotune.py`：当 `FULL_FRAME=False` 时，在实际 GPU 上自动寻找 >=512 的 tile + batch 最快组合。\n',
+          )
+          marker = '- 位深自动保持：8-bit 源输出 8-bit；10-bit 源使用高精度 RGB 推理并输出 10-bit。\n'
+          if marker in readme and 'FULL_FRAME' not in readme:
+              readme = readme.replace(marker, marker + '- `FULL_FRAME=True` 固定整帧推理；`False` 才启用 tile + batch 自动搜索。\n- 模型始终保留原生倍率输出，完整重建后再做一次全帧 Lanczos4 到目标倍率，不再在 worker 内用 bicubic 缩放。\n')
+          readme_path.write_text(readme)
+
+          # Static checks before committing.
+          for path in [runtime_path, auto_path, Path('inference.py'), Path('encode/av1.py'), Path('encode/hevc.py')]:
+              ast.parse(path.read_text(), filename=str(path))
+          json.loads(nb_path.read_text())
+          runtime_final = runtime_path.read_text()
+          auto_final = auto_path.read_text()
+          nb_final = nb_path.read_text()
+          assert '--auto-tile' not in runtime_final
+          assert '--auto-batch' not in runtime_final
+          assert '--full-frame' in runtime_final
+          assert 'mode="bicubic"' not in runtime_final
+          assert 'F.interpolate' not in runtime_final
+          assert 'INTER_LANCZOS4' in runtime_final
+          assert 'AUTO_TILE' not in nb_final and 'AUTO_BATCH' not in nb_final
+          assert 'FULL_FRAME = True' in nb_final
+          assert 'auto_tile' not in auto_final and 'auto_batch' not in auto_final
+          PY
+
+          rm .github/workflows/fullframe-quality-refactor.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add full-frame quality mode"
+          git push
