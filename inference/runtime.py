@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Multi-GPU Real-ESRGAN video inference runtime.
 
-This module owns video probing/decoding, automatic 8/10-bit preservation,
-model workers, tile fusion, automatic tile/batch tuning integration, progress,
-and audio muxing. Concrete FFmpeg encoders are injected from ``encode``.
+The model always runs at its native scale. When the requested output scale is
+smaller (for example AnimeVideo-v3 native x4 -> final x2), the runtime first
+reconstructs the complete native-resolution frame and then performs one
+full-frame Lanczos4 resize. No per-patch bicubic resize is used.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple, Ty
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 
 try:  # pragma: no cover - depends on installed torchvision
@@ -267,9 +267,7 @@ def resolve_model_paths(args: argparse.Namespace) -> Tuple[str, ...]:
         if not primary.is_file():
             raise FileNotFoundError(f"Model weight not found: {primary}")
         if args.model == "realesr-general-x4v3" and args.denoise_strength != 1.0:
-            raise ValueError(
-                "A custom realesr-general-x4v3 weight can only use --denoise-strength 1."
-            )
+            raise ValueError("A custom realesr-general-x4v3 weight can only use --denoise-strength 1.")
         return (str(primary),)
 
     urls = MODEL_URLS[args.model]
@@ -297,6 +295,10 @@ def build_model(name: str) -> Tuple[torch.nn.Module, int]:
             num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=32, upscale=4, act_type="prelu"
         ), 4
     raise ValueError(f"Unsupported model: {name}")
+
+
+def _model_native_scale(name: str) -> int:
+    return 2 if name == "RealESRGAN_x2plus" else 4
 
 
 def torch_load_cpu(path: str) -> Dict[str, object]:
@@ -337,6 +339,23 @@ def _is_uint16(frame: np.ndarray) -> bool:
     return frame.dtype.kind == "u" and frame.dtype.itemsize == 2
 
 
+def _full_frame_lanczos(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Resize a completed native-scale frame once with Lanczos4."""
+    if frame.shape[1] == width and frame.shape[0] == height:
+        return frame
+    if frame.dtype.kind != "u" or frame.dtype.itemsize not in {1, 2}:
+        raise RuntimeError(f"Unsupported inference frame dtype for resize: {frame.dtype}")
+    max_value = float(np.iinfo(frame.dtype).max)
+    resized = cv2.resize(
+        frame.astype(np.float32, copy=False),
+        (width, height),
+        interpolation=cv2.INTER_LANCZOS4,
+    )
+    np.rint(resized, out=resized)
+    np.clip(resized, 0, max_value, out=resized)
+    return resized.astype(frame.dtype)
+
+
 def infer_image_batch(
     model: torch.nn.Module,
     patches: Sequence[np.ndarray],
@@ -346,7 +365,8 @@ def infer_image_batch(
     output_scale: float,
     channels_last: bool,
 ) -> List[np.ndarray]:
-    input_height, input_width = patches[0].shape[:2]
+    """Run the model at native scale; never resize individual patches."""
+    del native_scale, output_scale
     is_10bit = _is_uint16(patches[0])
 
     if is_10bit:
@@ -366,16 +386,6 @@ def infer_image_batch(
 
     with torch.inference_mode():
         output = model(tensor)
-        if output_scale != native_scale:
-            output = F.interpolate(
-                output,
-                size=(
-                    max(1, int(round(input_height * output_scale))),
-                    max(1, int(round(input_width * output_scale))),
-                ),
-                mode="bicubic",
-                align_corners=False,
-            )
         output.clamp_(0, 1)
         if is_10bit:
             output = output.float().mul_(65535.0).round_()
@@ -622,6 +632,7 @@ def blend_tiles(
     scale: float,
     overlap: int,
 ) -> np.ndarray:
+    """Blend model-native tile outputs before any final resize."""
     if not outputs:
         raise RuntimeError("Tile fusion received no model outputs.")
     sample = next(iter(outputs.values()))
@@ -642,7 +653,7 @@ def blend_tiles(
         width = ox1 - ox0
         tile = outputs[info.index]
         if tile.shape[0] < height or tile.shape[1] < width:
-            tile = cv2.resize(tile, (width, height), interpolation=cv2.INTER_CUBIC)
+            tile = cv2.resize(tile, (width, height), interpolation=cv2.INTER_LANCZOS4)
         else:
             tile = tile[:height, :width]
         wx = feather_axis(width, fade, info.x0 > 0, info.x1 < input_width)
@@ -711,8 +722,15 @@ def mux_audio(
             raise
         print("[warning] audio stream copy failed; retrying with AAC", flush=True)
         mux_audio(
-            silent_video, input_path, output_path, ffmpeg_bin, start, duration,
-            has_audio, "aac", audio_bitrate,
+            silent_video,
+            input_path,
+            output_path,
+            ffmpeg_bin,
+            start,
+            duration,
+            has_audio,
+            "aac",
+            audio_bitrate,
         )
 
 
@@ -736,23 +754,21 @@ def parse_gpu_ids(value: str) -> List[Optional[int]]:
 def validate_args(args: argparse.Namespace) -> None:
     if args.scale <= 0:
         raise ValueError("--scale must be positive.")
-    if args.tile_size != 0 and (args.tile_size < 64 or args.tile_size % 4):
-        raise ValueError("--tile-size must be 0, or at least 64 and divisible by 4.")
-    if args.tile_size == 0:
-        if args.overlap != 0 and not args.auto_tile:
-            raise ValueError("--overlap must be 0 with manual full-frame mode.")
-    elif args.overlap < 0 or args.overlap >= args.tile_size // 2:
-        raise ValueError("--overlap must be non-negative and less than half of --tile-size.")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1.")
-    if args.auto_tile and args.max_tile_size < 512:
-        raise ValueError("--max-tile-size must be at least 512 when auto-tile is enabled.")
-    if args.auto_batch and args.max_batch_size < 1:
-        raise ValueError("--max-batch-size must be at least 1 when auto-batch is enabled.")
     if args.overlap < 0:
         raise ValueError("--overlap must be non-negative.")
     if not 0 <= args.denoise_strength <= 1:
         raise ValueError("--denoise-strength must be between 0 and 1.")
+    if not args.full_frame:
+        if args.tile_size < 64 or args.tile_size % 4:
+            raise ValueError("--tile-size must be at least 64 and divisible by 4.")
+        if args.overlap >= args.tile_size // 2:
+            raise ValueError("--overlap must be less than half of --tile-size.")
+        if args.max_tile_size < 512:
+            raise ValueError("--max-tile-size must be at least 512.")
+        if args.max_batch_size < 1:
+            raise ValueError("--max-batch-size must be at least 1.")
 
 
 def _output_pixel_format(codec: str, bit_depth: int) -> str:
@@ -812,6 +828,7 @@ def process_video(args: argparse.Namespace) -> None:
     effective_fp16 = args.fp16 and gpu_ids != [None]
     effective_channels_last = args.channels_last and gpu_ids != [None]
     model_paths = resolve_model_paths(args)
+    native_scale = _model_native_scale(args.model)
 
     requested_config = WorkerConfig(
         model_name=args.model,
@@ -826,7 +843,10 @@ def process_video(args: argparse.Namespace) -> None:
 
     tune_result = None
     cuda_gpu_ids = [int(gpu_id) for gpu_id in gpu_ids if gpu_id is not None]
-    if (args.auto_tile or args.auto_batch) and cuda_gpu_ids:
+    if args.full_frame:
+        args.tile_size = 0
+        args.batch_size = 1
+    elif cuda_gpu_ids:
         tune_gpu = min(
             cuda_gpu_ids,
             key=lambda gpu_id: torch.cuda.get_device_properties(gpu_id).total_memory,
@@ -838,9 +858,7 @@ def process_video(args: argparse.Namespace) -> None:
             height=input_height,
             gpu_count=len(cuda_gpu_ids),
             overlap=args.overlap,
-            auto_tile=args.auto_tile,
             max_tile_size=args.max_tile_size,
-            auto_batch=args.auto_batch,
             max_batch_size=args.max_batch_size,
             requested_tile=args.tile_size,
             requested_batch=args.batch_size,
@@ -876,24 +894,33 @@ def process_video(args: argparse.Namespace) -> None:
         f"{duration:.3f}s | {expected_frames} inference / {expected_output_frames} output frames",
         flush=True,
     )
+    if float(args.scale) == float(native_scale):
+        resample_text = f"native={native_scale}x"
+    else:
+        resample_text = (
+            f"native={native_scale}x -> final={args.scale:g}x | resample=full-frame Lanczos4"
+        )
     print(
-        f"Model   : {args.model} | scale={args.scale:g}x | channels_last={effective_channels_last}",
+        f"Model   : {args.model} | {resample_text} | channels_last={effective_channels_last}",
         flush=True,
     )
     print(f"GPU     : {_device_text(gpu_ids, effective_fp16)}", flush=True)
-    if tune_result is not None:
+    if args.full_frame:
         print(
-            f"Tuning  : tile={tune_result.tile_label} | batch={tune_result.batch_size} | "
-            f"estimate={tune_result.estimated_seconds:.3f}s/frame | "
+            f"Mode    : FULL_FRAME=True | full-frame | parallel_frames={len(gpu_ids)}",
+            flush=True,
+        )
+    elif tune_result is not None:
+        print(
+            f"Mode    : FULL_FRAME=False | auto tile={tune_result.tile_size} | "
+            f"batch={tune_result.batch_size} | estimate={tune_result.estimated_seconds:.3f}s/frame | "
             f"tested={tune_result.tested}, OOM={tune_result.rejected_oom} | "
             f"search={tune_result.search_seconds:.1f}s",
             flush=True,
         )
-    elif args.tile_size == 0:
-        print(f"Tuning  : manual | full-frame | parallel_frames={len(gpu_ids)}", flush=True)
     else:
         print(
-            f"Tuning  : manual | tile={args.tile_size} | overlap={args.overlap} | batch={args.batch_size}",
+            f"Mode    : FULL_FRAME=False | CPU fallback tile={args.tile_size} | batch={args.batch_size}",
             flush=True,
         )
     print(flush=True)
@@ -908,6 +935,7 @@ def process_video(args: argparse.Namespace) -> None:
         "decode": 0.0,
         "inference": 0.0,
         "blend": 0.0,
+        "resize": 0.0,
         "write": 0.0,
         "encode_flush": 0.0,
         "audio_mux": 0.0,
@@ -964,13 +992,24 @@ def process_video(args: argparse.Namespace) -> None:
                     timings["decode"] += time.monotonic() - stage_started
                     if not indexed_frames:
                         break
+
                     stage_started = time.monotonic()
                     frame_outputs = workers.infer_frames(batch_id, indexed_frames)
                     timings["inference"] += time.monotonic() - stage_started
+
+                    stage_started = time.monotonic()
+                    resized_outputs: Dict[int, np.ndarray] = {}
+                    for frame_id, _frame in indexed_frames:
+                        resized_outputs[frame_id] = _full_frame_lanczos(
+                            frame_outputs[frame_id], output_width, output_height
+                        )
+                    timings["resize"] += time.monotonic() - stage_started
+
                     stage_started = time.monotonic()
                     for frame_id, _frame in indexed_frames:
-                        writer.write(frame_outputs[frame_id])
+                        writer.write(resized_outputs[frame_id])
                     timings["write"] += time.monotonic() - stage_started
+
                     processed += len(indexed_frames)
                     batch_id += 1
                     progress.update(len(indexed_frames))
@@ -983,23 +1022,31 @@ def process_video(args: argparse.Namespace) -> None:
                     timings["decode"] += time.monotonic() - stage_started
                     if frame is None:
                         break
+
                     patches, tile_infos = split_tiles(frame, args.tile_size, args.overlap)
                     stage_started = time.monotonic()
                     tile_outputs = workers.infer_tiles(processed, patches)
                     timings["inference"] += time.monotonic() - stage_started
+
                     stage_started = time.monotonic()
-                    output = blend_tiles(
+                    native_output = blend_tiles(
                         tile_outputs,
                         tile_infos,
                         input_width,
                         input_height,
-                        args.scale,
+                        native_scale,
                         args.overlap,
                     )
                     timings["blend"] += time.monotonic() - stage_started
+
+                    stage_started = time.monotonic()
+                    output = _full_frame_lanczos(native_output, output_width, output_height)
+                    timings["resize"] += time.monotonic() - stage_started
+
                     stage_started = time.monotonic()
                     writer.write(output)
                     timings["write"] += time.monotonic() - stage_started
+
                     processed += 1
                     progress.update(1)
                     elapsed_now = max(time.monotonic() - started, 1e-6)
@@ -1064,7 +1111,8 @@ def process_video(args: argparse.Namespace) -> None:
     print(
         f"Timing  : model={timings['model_startup']:.1f}s | decode={timings['decode']:.1f}s | "
         f"inference={timings['inference']:.1f}s | blend={timings['blend']:.1f}s | "
-        f"encode={encode_time:.1f}s | audio={timings['audio_mux']:.1f}s",
+        f"resize={timings['resize']:.1f}s | encode={encode_time:.1f}s | "
+        f"audio={timings['audio_mux']:.1f}s",
         flush=True,
     )
     print(f"File    : {size_mib:.2f} MiB | {bitrate_mbps:.2f} Mb/s", flush=True)
@@ -1091,25 +1139,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-width", type=int, default=0, help="0 keeps source/aspect-derived width")
     parser.add_argument("--input-height", type=int, default=0, help="0 keeps source/aspect-derived height")
     parser.add_argument(
-        "--tile-size",
-        type=int,
-        default=256,
-        help="Manual/fallback tile size; 0 uses full-frame inference",
+        "--full-frame",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="True uses quality-first full-frame inference; False enables automatic tile+batch tuning",
     )
     parser.add_argument(
-        "--auto-tile",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Benchmark full-frame and tile sizes >=512, then use the fastest safe choice",
+        "--tile-size",
+        type=int,
+        default=512,
+        help="Fallback/additional tile candidate used when --no-full-frame",
     )
     parser.add_argument("--max-tile-size", type=int, default=1536)
     parser.add_argument("--overlap", type=int, default=32)
-    parser.add_argument("--batch-size", type=int, default=4, help="Manual/fallback tiles per batch per GPU")
     parser.add_argument(
-        "--auto-batch",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Benchmark safe batch sizes for tiled candidates",
+        "--batch-size",
+        type=int,
+        default=4,
+        help="Fallback/additional batch candidate used when --no-full-frame",
     )
     parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--gpu-ids", default="0,1", help="Comma-separated IDs, or cpu")
