@@ -12,6 +12,15 @@ from inference import runtime as inference_runtime
 
 def main() -> None:
     parser = inference_runtime.build_parser()
+    parser.add_argument(
+        "--source-profile",
+        choices=("A", "B", "C"),
+        default="A",
+        help=(
+            "A=BasicVSR++ off; B=light NTIRE compressed-video restoration; "
+            "C=stronger restoration for visibly compressed/noisy sources"
+        ),
+    )
     encode_runtime.extend_parser(parser)
     args = parser.parse_args()
     encode_runtime.prepare_runtime(inference_runtime, args)
