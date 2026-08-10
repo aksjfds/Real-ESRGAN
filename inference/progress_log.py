@@ -13,11 +13,29 @@ from tqdm import tqdm as _tqdm
 from . import pipeline
 
 _INSTALLED = False
-_LOG_INTERVAL = 10.0
+_LOG_INTERVAL = 60.0
 _RATE_WINDOW = 120.0
 _EMIT_LOCK = threading.Lock()
 _LAST_EMIT_SIGNATURE: Optional[Tuple[int, int]] = None
 _LAST_EMIT_AT = 0.0
+
+
+class _InteractiveTqdm(_tqdm):
+    """Console tqdm tuned for a foreground Kaggle notebook child process."""
+
+    def __init__(self, *args, **kwargs):
+        # tqdm defaults to stderr. Force that default here because the project
+        # historically passed sys.stdout explicitly, whose carriage-return
+        # redraws are not reliably surfaced by Kaggle's notebook subprocess UI.
+        kwargs["file"] = sys.stderr
+        kwargs["disable"] = False
+        # The workload is bursty (BVS clips then SR frames). Dynamic miniters can
+        # otherwise become too large after a fast burst and make the bar appear
+        # frozen during the following slower interval.
+        kwargs["miniters"] = 1
+        kwargs["mininterval"] = min(float(kwargs.get("mininterval", 0.5)), 0.5)
+        kwargs["maxinterval"] = min(float(kwargs.get("maxinterval", 2.0)), 2.0)
+        super().__init__(*args, **kwargs)
 
 
 class _SilentTqdm(_tqdm):
@@ -80,6 +98,21 @@ def _install_clean_postfix_format() -> None:
     base_cls._clean_postfix_format_installed = True
 
 
+def _install_interactive_tqdm() -> None:
+    """Route every interactive progress constructor through stderr."""
+    # Base/A/single-GPU paths construct pipeline.PersistentTqdm directly.
+    if hasattr(pipeline, "PersistentTqdm"):
+        pipeline.PersistentTqdm = _InteractiveTqdm
+
+    # v5.2 multi-GPU B-E scheduler imported tqdm into its own module namespace.
+    try:
+        from . import v52_scheduler
+
+        v52_scheduler.tqdm = _InteractiveTqdm
+    except Exception:
+        pass
+
+
 def _disable_batch_tqdm() -> None:
     """Keep batch logs clean by suppressing all carriage-return tqdm rendering."""
     # Base/A/single-GPU paths construct pipeline.PersistentTqdm directly.
@@ -111,13 +144,15 @@ def install_persistent_progress(interval: float = _LOG_INTERVAL) -> None:
     # Fix the interactive bar independently of the saved-log heartbeat.
     _install_clean_postfix_format()
 
-    # Foreground notebook: tqdm is the only progress renderer.
+    # Foreground notebook: use a normal console tqdm on stderr. The inference
+    # process is a subprocess, so a notebook widget tqdm is not appropriate here.
     if _is_kaggle_interactive():
+        _install_interactive_tqdm()
         return
 
     # Save & Run / Batch: carriage-return bars are useless in persisted logs and
-    # are the source of the giant concatenated Real-ESRGAN lines. Keep tqdm's
-    # counter object but render nothing; the heartbeat below is the sole logger.
+    # are the source of giant concatenated Real-ESRGAN lines. Keep tqdm's counter
+    # object but render nothing; the heartbeat below is the sole progress logger.
     _disable_batch_tqdm()
 
     base_cls = pipeline.OutputPump
@@ -179,11 +214,10 @@ def install_persistent_progress(interval: float = _LOG_INTERVAL) -> None:
             processed = max(0, int(getattr(self, "processed", 0)))
             total = max(0, int(getattr(self.progress, "total", 0) or 0))
 
-            # While models/checkpoints are still starting, one line every 30s is
-            # enough. Once output begins, return to the normal heartbeat cadence.
+            # Batch progress is intentionally sparse: one record per configured
+            # heartbeat interval, including while waiting for the first output.
             if processed == 0 and not final:
-                zero_interval = max(30.0, self._heartbeat_interval * 3.0)
-                if now - self._heartbeat_last_zero_at < zero_interval:
+                if now - self._heartbeat_last_zero_at < self._heartbeat_interval:
                     return
                 self._heartbeat_last_zero_at = now
 
