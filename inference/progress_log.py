@@ -38,6 +38,11 @@ def _durable_write(line: str) -> None:
     print(line, flush=True)
 
 
+def _is_kaggle_interactive() -> bool:
+    """Return True only for Kaggle's foreground interactive notebook session."""
+    return os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "").strip().lower() == "interactive"
+
+
 def install_persistent_progress(interval: float = _LOG_INTERVAL) -> None:
     """Install one heartbeat logger around whichever OutputPump is active."""
     global _INSTALLED
@@ -45,11 +50,19 @@ def install_persistent_progress(interval: float = _LOG_INTERVAL) -> None:
         return
     _INSTALLED = True
 
-    # Disable the earlier frame-triggered durable logger. It only ran after
-    # completed frames and still shared tqdm's stdout machinery.
+    # The original v5.3 PersistentTqdm logger prints real newline records from
+    # set_postfix(), which collides with the interactive carriage-return bar.
+    # Disable that path everywhere; batch logging is handled by the heartbeat.
     persistent_tqdm = getattr(pipeline, "PersistentTqdm", None)
     if persistent_tqdm is not None and hasattr(persistent_tqdm, "_persistent_log"):
         persistent_tqdm._persistent_log = lambda *args, **kwargs: None
+
+    # Kaggle exposes the run mode to child processes too. In the foreground
+    # Interactive session, leave stdout/tqdm completely alone so the live bar
+    # can repaint normally. Save & Run uses Batch and continues below to install
+    # the durable newline heartbeat for the persisted online logs.
+    if _is_kaggle_interactive():
+        return
 
     base_cls = pipeline.OutputPump
     if getattr(base_cls, "_persistent_heartbeat_wrapped", False):
