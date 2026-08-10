@@ -5,8 +5,7 @@
 ## 版本
 
 - v4.2 代码基线：`0ae09726e28500f94c9a1db012eb83382fa0731e`
-- v5.0：加入可选 BasicVSR++ NTIRE 压缩视频恢复；Real-ESRGAN 仍保持 full-frame。
-- v5.1：保持画质参数不变，优化 8-bit BasicVSR++ / Real-ESRGAN 数据搬运并统一稳定的进度速度与 ETA。
+- v5.1 代码基线：`e582920ee1eead8c2237a054cf098326db9f1e3f`
 
 ## 结构
 
