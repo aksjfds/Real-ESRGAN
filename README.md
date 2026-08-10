@@ -6,6 +6,7 @@
 
 - v4.2 代码基线：`0ae09726e28500f94c9a1db012eb83382fa0731e`
 - v5.0：加入可选 BasicVSR++ NTIRE 压缩视频恢复；Real-ESRGAN 仍保持 full-frame。
+- v5.1：保持画质参数不变，优化 8-bit BasicVSR++ / Real-ESRGAN 数据搬运并统一稳定的进度速度与 ETA。
 
 ## 结构
 
@@ -15,6 +16,7 @@
 - `inference/source_profiles.py`：BasicVSR++ A-E 源质量档的统一配置。
 - `inference/basicvsrpp.py`：BasicVSR++ NTIRE Track 1 同分辨率视频恢复、时序 clip、场景切换保护与显存自适应分块。
 - `inference/basicvsrpp_autotune.py`：B-E 的快速质量约束吞吐 autotuner，只搜索不降低画质的执行参数并缓存结果。
+- `inference/v51_runtime.py`：v5.1 的质量保持型执行优化，包括 8-bit GPU 端 BasicVSR++ 拼接/混合/量化、SR 直接写共享输出缓冲和稳定 ETA。
 - `inference/checkpoint_parts.py`：将仓库内 BasicVSR++ checkpoint 分片临时合并、校验后交给 PyTorch 加载。
 - `inference/pipeline.py`：基础 full-frame SR、共享内存、顺序输出、Lanczos/编码流水线。
 - `inference/balanced_pipeline.py`：B-E 多 GPU 负载均衡；BasicVSR++ clip 并行后让全部 GPU 回到 full-frame SR。
@@ -29,7 +31,7 @@
 
 `--source-profile` 提供五档，默认 `A`：
 
-- `A`：关闭 BasicVSR++，路径与 v4.2 相同，适合干净/高质量片源。
+- `A`：关闭 BasicVSR++，适合干净/高质量片源。
 - `B`：`strength=0.25`、7 帧 clip，轻度恢复。
 - `C`：`strength=0.50`、9 帧 clip，中等恢复。
 - `D`：`strength=0.75`、11 帧 clip，强恢复。
@@ -44,16 +46,28 @@ BasicVSR++ 输出与输入保持相同分辨率和整数位深：8-bit 输入返
 B-E 启动后会在实际视频推理前使用合成 clip 做快速 benchmark，不消费源视频帧。目标不是占满显存，而是在画质约束不变的前提下选择实测吞吐最快的执行参数：
 
 - 画质硬约束：`strength`、clip length、clip overlap、tile pad 和 scene-cut 阈值全部固定；Real-ESRGAN 的 full-frame、模型、Lanczos 和编码路径完全不由该 autotuner 修改。
-- tile：只向 512 基线以上搜索。候选根据实际源分辨率压缩成少量不同分块拓扑的代表点；例如 1920×1080 通常只测试 `512/640/960/1080`，不再逐个测试十几个接近的 tile。
-- 快速排名：先用 5 帧短 clip 在完整源分辨率上跑真实 tiled BasicVSR++，包含实际切块、padding、D2H 和拼接，只用于排序候选。
-- 最终确认：只让快速排名前两名使用当前 A-E 档的真实 clip length 再跑完整源分辨率 benchmark；基线只有在快速结果非常接近时才额外参加确认。
-- clip batch：16 GiB 级 GPU（包括 Tesla T4）固定 `batch=1`，不再浪费启动时间测试高显存但通常更慢的 batch=2；总显存至少 24 GiB 才尝试 batch=2，至少 48 GiB 且 batch=2 确实更快时才进一步尝试 batch=3。
+- tile：只向 512 基线以上搜索。候选根据实际源分辨率压缩成少量不同分块拓扑的代表点；例如 1920×1080 通常只测试 `512/640/960/1080`。
+- 快速排名：先用 5 帧短 clip 在完整源分辨率上跑真实 tiled BasicVSR++；最终只让排名靠前的候选使用当前档位真实 clip length 再确认。
+- clip batch：16 GiB 级 GPU（包括 Tesla T4）固定 `batch=1`；总显存至少 24 GiB 才尝试 batch=2，至少 48 GiB 且 batch=2 确实更快时才进一步尝试 batch=3。
 - 显存只作为安全约束：候选至少保留 `max(2 GiB, 20% 总显存)` 的全局空闲余量，额外占用显存不会提高评分。
-- CUDA benchmark 前只做一次小尺寸 warm-up，并在计时前后同步 GPU，避免 lazy initialization 和异步 kernel launch 扭曲测量。
 - 运行期不再每个 clip batch 无条件调用 `torch.cuda.empty_cache()`；只有全局空闲显存低于安全阈值时才释放未占用 allocator cache。
-- 多 GPU B-E 会让同型号 GPU 复用相同 autotune cache；第二张相同 GPU 不重复搜索。
 
-结果缓存到 `~/.cache/realesrgan/basicvsrpp-autotune-v3.json`。cache key 使用 GPU 型号、总显存、PyTorch/CUDA、源分辨率以及完整 profile 质量参数，不再把容易波动的当前 free-VRAM 桶写入 key；读取缓存时仍会根据记录的峰值显存重新做安全检查。
+v5.1 的 8-bit BasicVSR++ 数据路径与旧版本性能特征不同，因此 autotune cache 升级到 `~/.cache/realesrgan/basicvsrpp-autotune-v4.json`。10-bit 仍走原有高精度处理路径。
+
+## v5.1 数据路径优化
+
+画质算法保持不变，只减少中间数据搬运和 CPU 内存复制：
+
+- 8-bit BasicVSR++：tile 输出保持在 GPU 上完成完整 clip 拼接；`strength` residual blend、clamp、round 和 uint8 量化也在 GPU 上完成，最后只把最终 uint8 恢复帧传回 CPU。这样避免逐 tile 把 float32 结果传回 CPU，再由 CPU 拼接/混合/量化。
+- 8-bit Real-ESRGAN：模型仍按原有 full-frame FP16 + channels-last 路径计算；量化后的 CUDA uint8 输出直接复制到对应 worker 的共享输出缓冲，不再先生成 worker-local NumPy 大帧再 `np.copyto` 一次。
+- 10-bit：BasicVSR++ 和 Real-ESRGAN 都保留 v5.0 原路径，不为了性能修改高位深计算与转换语义。
+- Lanczos4、编码参数、A-E profile、scene-cut、tile pad 和 clip overlap 均未修改。
+
+双 GPU B-E 仍采用阶段互斥的 balanced 调度：两张 GPU 并行处理 BasicVSR++ clip，随后两张 GPU 共同处理 Real-ESRGAN full-frame。v5.1 不强行让同一 GPU 同时执行两个大模型，避免 CUDA/显存竞争导致吞吐下降或 OOM；输出线程继续与 GPU 阶段并行执行 Lanczos4 和 FFmpeg/NVENC 写入。
+
+## 进度与 ETA
+
+v5.1 不再同时显示 tqdm 的短窗口瞬时速度和另一套累计 FPS。进度条只显示一套基于已完成输出帧的稳定速度：前期使用自首帧以来的平均值，运行足够久后使用最长约 120 秒的窗口，并用同一速度计算 ETA。这样可以覆盖 BasicVSR++ 的批次节奏，减少 ETA 大幅跳动。
 
 ## BasicVSR++ 权重
 
@@ -75,23 +89,6 @@ Real-ESRGAN 固定使用 full-frame，不包含 tile、batch 自动调参或 til
 - 当目标倍率小于模型原生倍率时，完整帧推理结束后仅做一次全帧 Lanczos4 缩放。
 - 8-bit 源输出 8-bit；10-bit 源使用高精度 RGB 推理并输出 10-bit。
 
-## 流水线
-
-`A` 档保持原 v4.2 流水线：
-
-- 输入帧和模型原生倍率输出通过共享内存传递，`multiprocessing.Queue` 只传递 frame ID / worker ID 等小型元数据。
-- 某张 GPU 完成一帧后立即接收下一帧，不等待其它 GPU、Lanczos 缩放和编码。
-- 全帧 Lanczos4 与 FFmpeg/NVENC 写入在独立输出线程执行，与后续 GPU 推理重叠。
-
-`B-E` 档按 GPU 数量调度：
-
-- 2 张及以上 GPU：不再固定“GPU0 只跑 BasicVSR++、GPU1 只跑 SR”。相邻且具有相同 overlap 语义的 BasicVSR++ clips 会分配给多张 GPU 并行恢复；得到一批完整原分辨率帧后，全部请求 GPU 再共同运行 Real-ESRGAN full-frame。
-- 在显存和实测吞吐确有收益时，大显存 GPU 可以 batch 处理多个互相独立的 clip；不同 clip 不会互相传播时序信息。
-- 这种 balanced phase 调度用于修复 BasicVSR++ 比 AnimeVideo-v3 更慢时的 producer bottleneck，避免 SR GPU 长时间等待上游出帧。
-- 为避免两个大模型在同一 GPU 上同时抢计算资源，多 GPU B-E 不使用后台 BasicVSR++ prefetch；clip 批次和 SR 批次按需衔接。
-- 单 GPU 同样使用 autotune 后的 tile/batch，但 BasicVSR++ 与 Real-ESRGAN 仍按阶段串行使用 GPU。
-- FFmpeg/NVENC 编码和 Lanczos 输出线程保持现有实现。
-
 ## 编码
 
 支持：
@@ -106,6 +103,6 @@ Real-ESRGAN 固定使用 full-frame，不包含 tile、batch 自动调参或 til
 
 ## 使用
 
-在 Kaggle 中打开根目录 `realesrgan.ipynb`，设置 `SOURCE_PROFILE = "A" / "B" / "C" / "D" / "E"` 后运行。Notebook 默认测试区间为 5:35 开始、15 秒；第一次 B-E 建议先观察 `[autotuner]` 结果、显存、双 GPU 利用率、编码和音画同步；同一环境后续运行会优先复用 autotune cache。
+在 Kaggle 中打开根目录 `realesrgan.ipynb`，设置 `SOURCE_PROFILE = "A" / "B" / "C" / "D" / "E"` 后运行。Notebook 默认测试区间为 5:35 开始、15 秒；第一次 B-E 建议观察 `[autotuner]` 结果、双 GPU 利用率、稳定 FPS/ETA、编码和音画同步；相同环境后续运行会优先复用 autotune cache。
 
 本仓库保留 Real-ESRGAN 的 BSD 3-Clause `LICENSE`。BasicVSR++ 适配代码的第三方说明见 `THIRD_PARTY_NOTICES.md`。
