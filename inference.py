@@ -20,33 +20,25 @@ def _validate_basicvsrpp_args(args) -> None:
         raise ValueError("--bvs-tile-size must be >=256 and divisible by 4")
     if int(args.bvs_batch_size) < 1:
         raise ValueError("--bvs-batch-size must be at least 1")
+    if float(args.rife_fps) < 0:
+        raise ValueError("--rife-fps must be >= 0")
 
 
 def main() -> None:
     parser = inference_runtime.build_parser()
+    parser.add_argument("--bvs-tile-size", type=int, default=640,
+                        help="BasicVSR++ spatial tile size. Default: 640.")
+    parser.add_argument("--bvs-clip-length", type=int, default=13,
+                        help="BasicVSR++ temporal clip length. Default: 13.")
+    parser.add_argument("--bvs-batch-size", type=int, default=1,
+                        help="Independent BasicVSR++ clips per GPU task. Default: 1.")
+    parser.add_argument("--bvs-strength", type=float, default=1.0,
+                        help="BasicVSR++ residual blend strength in (0,1]. Default: 1.0.")
     parser.add_argument(
-        "--bvs-tile-size",
-        type=int,
-        default=640,
-        help="BasicVSR++ spatial tile size. Default: 640.",
-    )
-    parser.add_argument(
-        "--bvs-clip-length",
-        type=int,
-        default=13,
-        help="BasicVSR++ temporal clip length. Default: 13.",
-    )
-    parser.add_argument(
-        "--bvs-batch-size",
-        type=int,
-        default=1,
-        help="Independent BasicVSR++ clips per GPU task. Default: 1.",
-    )
-    parser.add_argument(
-        "--bvs-strength",
+        "--rife-fps",
         type=float,
-        default=1.0,
-        help="BasicVSR++ residual blend strength in (0,1]. Default: 1.0.",
+        default=0.0,
+        help="Enable Practical-RIFE 4.25 interpolation when greater than source FPS; e.g. 60.",
     )
     parser.add_argument(
         "--gpu-timing",
@@ -61,9 +53,6 @@ def main() -> None:
     install_pipeline_optimizations()
     install_persistent_progress()
 
-    # BasicVSR++ is always enabled with explicit fixed parameters. The checkpoint
-    # is assembled from bundled repository parts; parameters are used directly and
-    # no runtime parameter search is installed.
     from inference import basicvsrpp
     from inference.checkpoint_parts import resolve_checkpoint
     from inference.v54_runtime import install_basicvsrpp_execution_optimizations
@@ -73,7 +62,6 @@ def main() -> None:
 
     if args.gpu_timing:
         from inference.gpu_timing import install_gpu_timing
-
         install_gpu_timing(enable_bvs=True)
 
     inference_pipeline.process_video(args)
