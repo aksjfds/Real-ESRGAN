@@ -7,8 +7,8 @@ import multiprocessing as mp
 from pathlib import Path
 
 from encode import runtime as encode_runtime
-from inference import balanced_pipeline as inference_pipeline
 from inference import runtime as inference_runtime
+from inference import v52_scheduler as inference_pipeline
 from inference.source_profiles import PROFILE_CHOICES, SOURCE_PROFILES
 from inference.v51_runtime import install_basicvsrpp_optimizations, install_pipeline_optimizations
 
