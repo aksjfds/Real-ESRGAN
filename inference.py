@@ -141,6 +141,98 @@ def _install_v55_repeat_run_fix() -> None:
     cls._v55_repeat_run_fix_installed = True
 
 
+def _install_v56_selective_channels_last() -> None:
+    """Use channels-last only inside BasicVSR++ convolution-heavy 4D islands."""
+    import torch
+    from torch import nn
+
+    from inference import basicvsrpp_autotune as tune
+    from inference import v54_runtime
+
+    cls = tune.AutoTunedBasicVSRPPPreprocessor
+    if getattr(cls, "_v56_selective_channels_last_installed", False):
+        return
+
+    class ChannelsLastIsland(nn.Module):
+        """Run one convolution island as NHWC, then restore NCHW for other ops."""
+
+        def __init__(self, module: nn.Module):
+            super().__init__()
+            self.module = module
+            # Checkpoint loading has already finished by the time this wrapper is
+            # created, so changing weight memory format cannot alter state-dict keys.
+            self.module.to(memory_format=torch.channels_last)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = x.contiguous(memory_format=torch.channels_last)
+            output = self.module(x)
+            # grid_sample and torchvision deform_conv2d stay on the established
+            # contiguous NCHW path; only the dense convolution islands use NHWC.
+            return output.contiguous(memory_format=torch.contiguous_format)
+
+    def wrap(module: nn.Module) -> nn.Module:
+        if isinstance(module, ChannelsLastIsland):
+            return module
+        return ChannelsLastIsland(module)
+
+    def apply_model(model: nn.Module) -> None:
+        if getattr(model, "_v56_selective_channels_last_applied", False):
+            return
+
+        # These are the long Conv2d-heavy regions. Keeping conversion boundaries
+        # around whole islands amortizes NCHW<->NHWC copies over many convolutions.
+        model.feat_extract = wrap(model.feat_extract)
+        model.reconstruction = wrap(model.reconstruction)
+
+        for index in range(len(model.spynet.basic_module)):
+            model.spynet.basic_module[index] = wrap(model.spynet.basic_module[index])
+
+        for name in list(model.backbone.keys()):
+            model.backbone[name] = wrap(model.backbone[name])
+
+        # Only offset prediction convolutions use channels-last here. The actual
+        # deform_conv2d weight/input layout remains untouched.
+        for name in list(model.deform_align.keys()):
+            alignment = model.deform_align[name]
+            alignment.conv_offset = wrap(alignment.conv_offset)
+
+        model._v56_selective_channels_last_applied = True
+        print(
+            "[basicvsrpp] selective channels_last enabled for convolution islands",
+            flush=True,
+        )
+
+    original_autotune = cls._autotune
+
+    def autotune_v56(self) -> None:
+        # AutoTunedBasicVSRPPPreprocessor calls _autotune only after the checkpoint
+        # is loaded, the model is on CUDA, and FP16 selection is complete.
+        apply_model(self.model)
+        original_autotune(self)
+
+    cls._autotune = autotune_v56
+    cls._v56_selective_channels_last_installed = True
+
+    def select_v6_cache() -> None:
+        # The execution layout changed, so do not reuse v5 timing decisions. The
+        # first v5.6 run re-benchmarks tile choice; following runs use this cache.
+        tune._CACHE_VERSION = 6
+        tune._cache_path = lambda: Path.home() / ".cache" / "realesrgan" / "basicvsrpp-autotune-v6.json"
+
+    select_v6_cache()
+
+    # v5.5's process_video late hook reapplies its v5 cache settings immediately
+    # before model construction. Wrap that hook so v6 remains the final cache
+    # policy whenever it runs, including repeated notebook executions.
+    original_late_patches = v54_runtime._install_v55_late_patches
+
+    def late_patches_v56() -> None:
+        original_late_patches()
+        select_v6_cache()
+
+    v54_runtime._install_v55_late_patches = late_patches_v56
+
+
 def main() -> None:
     parser = inference_runtime.build_parser()
     parser.add_argument(
@@ -197,6 +289,7 @@ def main() -> None:
             install_autotune()
         install_basicvsrpp_optimizations(source_bit_depth)
         _install_v55_repeat_run_fix()
+        _install_v56_selective_channels_last()
 
     # CUDA-event timing is diagnostic instrumentation. Keep it off in normal
     # inference so Event synchronization cannot serialize the production path.
