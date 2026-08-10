@@ -1,4 +1,4 @@
-"""Durable newline progress logging for saved cloud notebook logs."""
+"""Durable progress logging for saved cloud notebook logs."""
 from __future__ import annotations
 
 from collections import deque
@@ -6,13 +6,26 @@ import os
 import sys
 import threading
 import time
-from typing import Deque, Tuple
+from typing import Deque, Optional, Tuple
+
+from tqdm import tqdm as _tqdm
 
 from . import pipeline
 
 _INSTALLED = False
 _LOG_INTERVAL = 10.0
 _RATE_WINDOW = 120.0
+_EMIT_LOCK = threading.Lock()
+_LAST_EMIT_SIGNATURE: Optional[Tuple[int, int]] = None
+_LAST_EMIT_AT = 0.0
+
+
+class _SilentTqdm(_tqdm):
+    """Keep tqdm's counters/API but never render a carriage-return bar."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
 
 
 def _format_duration(seconds: float) -> str:
@@ -27,8 +40,8 @@ def _format_duration(seconds: float) -> str:
 
 
 def _durable_write(line: str) -> None:
-    """Write a real newline record, bypassing TextIO/tqdm carriage-return buffering."""
-    payload = ("\n" + line + "\n").encode("utf-8", errors="replace")
+    """Write exactly one newline-terminated record to the persisted log stream."""
+    payload = (line + "\n").encode("utf-8", errors="replace")
     try:
         fd = sys.stdout.fileno()
         os.write(fd, payload)
@@ -38,31 +51,74 @@ def _durable_write(line: str) -> None:
     print(line, flush=True)
 
 
+def _kaggle_run_type() -> str:
+    return os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "").strip().lower()
+
+
 def _is_kaggle_interactive() -> bool:
     """Return True only for Kaggle's foreground interactive notebook session."""
-    return os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "").strip().lower() == "interactive"
+    return _kaggle_run_type() == "interactive"
+
+
+def _install_clean_postfix_format() -> None:
+    """Remove the duplicate comma before tqdm's string postfix."""
+    base_cls = pipeline.OutputPump
+    if getattr(base_cls, "_clean_postfix_format_installed", False):
+        return
+
+    original_init = base_cls.__init__
+
+    def clean_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # tqdm's {postfix} is automatically prefixed with ', ' when it is a
+        # normal string. Do not add another comma in bar_format.
+        self.progress.bar_format = (
+            "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}{postfix}]"
+        )
+
+    base_cls.__init__ = clean_init
+    base_cls._clean_postfix_format_installed = True
+
+
+def _disable_batch_tqdm() -> None:
+    """Keep batch logs clean by suppressing all carriage-return tqdm rendering."""
+    # Base/A/single-GPU paths construct pipeline.PersistentTqdm directly.
+    if hasattr(pipeline, "PersistentTqdm"):
+        pipeline.PersistentTqdm = _SilentTqdm
+
+    # v5.2 multi-GPU B-E scheduler imported tqdm into its own module namespace.
+    try:
+        from . import v52_scheduler
+
+        v52_scheduler.tqdm = _SilentTqdm
+    except Exception:
+        pass
 
 
 def install_persistent_progress(interval: float = _LOG_INTERVAL) -> None:
-    """Install one heartbeat logger around whichever OutputPump is active."""
+    """Keep interactive tqdm live; install one clean heartbeat for batch logs."""
     global _INSTALLED
     if _INSTALLED:
         return
     _INSTALLED = True
 
-    # The original v5.3 PersistentTqdm logger prints real newline records from
-    # set_postfix(), which collides with the interactive carriage-return bar.
-    # Disable that path everywhere; batch logging is handled by the heartbeat.
+    # The original v5.3 PersistentTqdm logger writes newline records from
+    # set_postfix(), which conflicts with interactive carriage-return redraws.
     persistent_tqdm = getattr(pipeline, "PersistentTqdm", None)
     if persistent_tqdm is not None and hasattr(persistent_tqdm, "_persistent_log"):
         persistent_tqdm._persistent_log = lambda *args, **kwargs: None
 
-    # Kaggle exposes the run mode to child processes too. In the foreground
-    # Interactive session, leave stdout/tqdm completely alone so the live bar
-    # can repaint normally. Save & Run uses Batch and continues below to install
-    # the durable newline heartbeat for the persisted online logs.
+    # Fix the interactive bar independently of the saved-log heartbeat.
+    _install_clean_postfix_format()
+
+    # Foreground notebook: tqdm is the only progress renderer.
     if _is_kaggle_interactive():
         return
+
+    # Save & Run / Batch: carriage-return bars are useless in persisted logs and
+    # are the source of the giant concatenated Real-ESRGAN lines. Keep tqdm's
+    # counter object but render nothing; the heartbeat below is the sole logger.
+    _disable_batch_tqdm()
 
     base_cls = pipeline.OutputPump
     if getattr(base_cls, "_persistent_heartbeat_wrapped", False):
@@ -76,6 +132,7 @@ def install_persistent_progress(interval: float = _LOG_INTERVAL) -> None:
             self._heartbeat_stop = threading.Event()
             self._heartbeat_closed = False
             self._heartbeat_samples: Deque[Tuple[int, float]] = deque()
+            self._heartbeat_last_zero_at = float("-inf")
             super().__init__(*args, **kwargs)
             self._heartbeat_thread = threading.Thread(
                 target=self._heartbeat_run,
@@ -85,6 +142,11 @@ def install_persistent_progress(interval: float = _LOG_INTERVAL) -> None:
             self._heartbeat_thread.start()
 
         def _heartbeat_rate(self, processed: int, now: float) -> float:
+            if processed <= 0:
+                return 0.0
+
+            # Mirror StableOutputPump: prefer a long rolling window, then fall
+            # back to average throughput since the first completed output frame.
             self._heartbeat_samples.append((processed, now))
             while (
                 len(self._heartbeat_samples) > 2
@@ -95,15 +157,50 @@ def install_persistent_progress(interval: float = _LOG_INTERVAL) -> None:
                 old_count, old_time = self._heartbeat_samples[0]
                 span = now - old_time
                 delta = processed - old_count
-                if span > 1e-6 and delta > 0:
+                if span >= 20.0 and delta > 0:
                     return delta / span
-            elapsed = max(now - float(self.started), 1e-6)
-            return processed / elapsed if processed > 0 else 0.0
+
+            first_output_at = getattr(self, "first_output_at", None)
+            if first_output_at is not None:
+                return max(
+                    0.0,
+                    (processed - 1) / max(now - float(first_output_at), 1e-6),
+                )
+
+            first_count, first_time = self._heartbeat_samples[0]
+            span = now - first_time
+            delta = processed - first_count
+            return delta / span if span > 1e-6 and delta > 0 else 0.0
 
         def _heartbeat_emit(self, final: bool = False) -> None:
+            global _LAST_EMIT_AT, _LAST_EMIT_SIGNATURE
+
             now = time.monotonic()
             processed = max(0, int(getattr(self, "processed", 0)))
             total = max(0, int(getattr(self.progress, "total", 0) or 0))
+
+            # While models/checkpoints are still starting, one line every 30s is
+            # enough. Once output begins, return to the normal heartbeat cadence.
+            if processed == 0 and not final:
+                zero_interval = max(30.0, self._heartbeat_interval * 3.0)
+                if now - self._heartbeat_last_zero_at < zero_interval:
+                    return
+                self._heartbeat_last_zero_at = now
+
+            # If more than one OutputPump exists briefly, suppress near-identical
+            # heartbeat records instead of printing duplicate rows a few ms apart.
+            signature = (processed, total)
+            with _EMIT_LOCK:
+                duplicate_window = min(2.0, max(0.5, self._heartbeat_interval / 4.0))
+                if (
+                    not final
+                    and signature == _LAST_EMIT_SIGNATURE
+                    and now - _LAST_EMIT_AT < duplicate_window
+                ):
+                    return
+                _LAST_EMIT_SIGNATURE = signature
+                _LAST_EMIT_AT = now
+
             elapsed = max(0.0, now - float(self.started))
             rate = self._heartbeat_rate(processed, now)
             percent = 100.0 * processed / total if total > 0 else 0.0
@@ -123,8 +220,6 @@ def install_persistent_progress(interval: float = _LOG_INTERVAL) -> None:
             )
 
         def _heartbeat_run(self) -> None:
-            # Emit immediately so saved logs prove the heartbeat is installed,
-            # then keep emitting even while BVS/SR is producing no output frames.
             self._heartbeat_emit()
             while not self._heartbeat_stop.wait(self._heartbeat_interval):
                 self._heartbeat_emit()
