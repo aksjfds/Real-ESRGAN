@@ -10,6 +10,7 @@ from encode import runtime as encode_runtime
 from inference import balanced_pipeline as inference_pipeline
 from inference import runtime as inference_runtime
 from inference.source_profiles import PROFILE_CHOICES, SOURCE_PROFILES
+from inference.v51_runtime import install_basicvsrpp_optimizations, install_pipeline_optimizations
 
 
 def main() -> None:
@@ -26,11 +27,13 @@ def main() -> None:
     encode_runtime.extend_parser(parser)
     args = parser.parse_args()
     encode_runtime.prepare_runtime(inference_runtime, args)
+    install_pipeline_optimizations()
 
     # Keep the CLI as the single public entry while allowing the pipeline to
     # share the extended A-E profile table without duplicating configuration.
     inference_pipeline.base_pipeline.SOURCE_PROFILES = SOURCE_PROFILES
 
+    source_bit_depth = None
     if args.source_profile != "A":
         # B-E always use the checkpoint parts bundled in inference/weights.
         from inference import basicvsrpp
@@ -45,12 +48,14 @@ def main() -> None:
                 args.ffprobe_bin,
             )
             install_autotune(source.width, source.height)
+            source_bit_depth = source.bit_depth
         except Exception as error:
             print(
                 f"[autotuner] source probe unavailable ({error}); using hardware-only search",
                 flush=True,
             )
             install_autotune()
+        install_basicvsrpp_optimizations(source_bit_depth)
 
     inference_pipeline.process_video(args)
 
