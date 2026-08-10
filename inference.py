@@ -30,6 +30,11 @@ def main() -> None:
     encode_runtime.prepare_runtime(inference_runtime, args)
     install_pipeline_optimizations()
 
+    # v5.2's dynamic B-E scheduler creates its own tqdm instance. Route that
+    # path through the persistent logger too so Kaggle saved logs receive real
+    # newline records instead of only carriage-return redraws.
+    inference_pipeline.tqdm = inference_pipeline.base_pipeline.PersistentTqdm
+
     # Keep the CLI as the single public entry while allowing the pipeline to
     # share the extended A-E profile table without duplicating configuration.
     inference_pipeline.base_pipeline.SOURCE_PROFILES = SOURCE_PROFILES
