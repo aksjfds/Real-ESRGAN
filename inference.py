@@ -14,6 +14,133 @@ from inference.source_profiles import PROFILE_CHOICES, SOURCE_PROFILES
 from inference.v51_runtime import install_basicvsrpp_optimizations, install_pipeline_optimizations
 
 
+def _install_v55_repeat_run_fix() -> None:
+    """Make v5.5 clip prefetch deterministic and fail-fast across repeated runs."""
+    import queue
+    import threading
+    import traceback
+
+    from inference import balanced_pipeline
+    from inference import v54_runtime
+
+    cls = balanced_pipeline.BalancedBasicVSRPPStreamReader
+    if getattr(cls, "_v55_repeat_run_fix_installed", False):
+        return
+
+    # Capture the original synchronous reader methods before v5.5 installs its
+    # Queue.get()-based producer wrapper. We keep the exact same task generator,
+    # scene-cut logic, overlap policy, and frame ordering.
+    base_init = cls.__init__
+    base_next_task = cls._next_task
+    base_close = cls.close
+
+    # v5.1/autotune is already installed when this helper is called, so it is now
+    # safe to apply v5.5's late uint8-H2D patches. This also installs the old
+    # producer wrapper, which is immediately replaced below with the deterministic
+    # implementation built from the captured synchronous methods.
+    v54_runtime._install_v55_late_patches()
+
+    class ProducerFailure:
+        def __init__(self, error: BaseException, traceback_text: str) -> None:
+            self.error = error
+            self.traceback_text = traceback_text
+
+    def safe_init(self, *args, **kwargs):
+        base_init(self, *args, **kwargs)
+        depth = max(
+            2,
+            sum(max(1, int(getattr(item, "clip_batch", 1))) for item in self.preprocessors),
+        )
+        self._v55_task_queue = queue.Queue(maxsize=depth)
+        self._v55_task_stop = threading.Event()
+        self._v55_task_thread = None
+
+        # Prime one complete scheduling window synchronously. On a cached second
+        # run, the scheduler can otherwise start before the background producer
+        # has prepared GPU1's first clip and block inside Queue.get().
+        reached_eof = False
+        try:
+            for _ in range(depth):
+                item = base_next_task(self)
+                self._v55_task_queue.put_nowait(item)
+                if item is None:
+                    reached_eof = True
+                    break
+        except Exception as error:
+            self._v55_task_queue.put_nowait(ProducerFailure(error, traceback.format_exc()))
+            reached_eof = True
+
+        if reached_eof:
+            return
+
+        def put_item(item) -> bool:
+            while not self._v55_task_stop.is_set():
+                try:
+                    self._v55_task_queue.put(item, timeout=0.25)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def producer_run() -> None:
+            try:
+                while not self._v55_task_stop.is_set():
+                    item = base_next_task(self)
+                    if not put_item(item):
+                        return
+                    if item is None:
+                        return
+            except Exception as error:
+                put_item(ProducerFailure(error, traceback.format_exc()))
+
+        self._v55_task_thread = threading.Thread(
+            target=producer_run,
+            name="basicvsrpp-clip-producer",
+            daemon=True,
+        )
+        self._v55_task_thread.start()
+
+    def safe_next_task(self):
+        # Do not allow the dynamic scheduler to hang forever on an empty queue.
+        # Normally the queue is prefilled and continuously replenished; timeout
+        # polling is only a liveness guard for an unexpectedly stopped producer.
+        while True:
+            try:
+                item = self._v55_task_queue.get(timeout=0.5)
+                break
+            except queue.Empty:
+                thread = getattr(self, "_v55_task_thread", None)
+                if thread is None or not thread.is_alive():
+                    raise RuntimeError(
+                        "BasicVSR++ clip producer stopped before emitting EOF; "
+                        "refusing to leave the scheduler blocked at 0%."
+                    )
+
+        if isinstance(item, ProducerFailure):
+            raise RuntimeError(
+                f"BasicVSR++ clip producer failed: {item.error!r}\n{item.traceback_text}"
+            ) from item.error
+        return item
+
+    def safe_close(self) -> None:
+        stop = getattr(self, "_v55_task_stop", None)
+        if stop is not None:
+            stop.set()
+        thread = getattr(self, "_v55_task_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+        try:
+            base_close(self)
+        finally:
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=1.0)
+
+    cls.__init__ = safe_init
+    cls._next_task = safe_next_task
+    cls.close = safe_close
+    cls._v55_repeat_run_fix_installed = True
+
+
 def main() -> None:
     parser = inference_runtime.build_parser()
     parser.add_argument(
@@ -69,6 +196,7 @@ def main() -> None:
             )
             install_autotune()
         install_basicvsrpp_optimizations(source_bit_depth)
+        _install_v55_repeat_run_fix()
 
     # CUDA-event timing is diagnostic instrumentation. Keep it off in normal
     # inference so Event synchronization cannot serialize the production path.
