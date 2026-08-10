@@ -3,7 +3,8 @@
 These patches preserve the BasicVSR++ model, weights, clip policy, tiling,
 scene-cut behavior, and restoration arithmetic. They only reduce execution and
 transfer overhead: cache invariant warp grids, avoid temporary zero tensors that
-are immediately overwritten, and keep 8-bit clips compact across H2D.
+are immediately overwritten, keep 8-bit clips compact across H2D, and use a
+conservative channels-last layout for the main Conv2d-heavy restoration blocks.
 """
 from __future__ import annotations
 
@@ -246,6 +247,46 @@ def _enhance_clips(self, clips: Sequence[Sequence[np.ndarray]]) -> list[list[np.
     ]
 
 
+def _enable_selective_channels_last(preprocessor) -> None:
+    """Convert only the main Conv2d-heavy BVS blocks to channels-last weights.
+
+    This deliberately leaves SPyNet, deformable-alignment offset convolutions,
+    PixelShuffle/output convolutions, and the custom deform_conv2d weight alone.
+    No input/output wrapper is installed, so scheduler and CUDA thread behavior
+    are unchanged from the fixed-parameter v5.7 path.
+    """
+    if preprocessor.dtype != torch.float16:
+        return
+    major, _minor = torch.cuda.get_device_capability(preprocessor.device)
+    if major < 7:
+        return
+
+    converter = getattr(torch.nn.utils, "convert_conv2d_weight_memory_format", None)
+    if converter is None:
+        print(
+            "[basicvsrpp] selective channels_last unavailable in this PyTorch build; using NCHW",
+            flush=True,
+        )
+        return
+
+    model = preprocessor.model
+    targets = (
+        model.feat_extract,
+        model.backbone,
+        model.reconstruction,
+    )
+    converted = 0
+    for module in targets:
+        converted += sum(1 for item in module.modules() if isinstance(item, torch.nn.Conv2d))
+        converter(module, torch.channels_last)
+
+    print(
+        f"[basicvsrpp] selective channels_last enabled: {converted} Conv2d weights | "
+        "SPyNet/deform-align/upsample kept unchanged",
+        flush=True,
+    )
+
+
 def install_basicvsrpp_execution_optimizations() -> None:
     """Install fixed-parameter BasicVSR++ execution optimizations."""
     global _INSTALLED
@@ -261,3 +302,12 @@ def install_basicvsrpp_execution_optimizations() -> None:
         cls._fixed_original_enhance_clip = cls.enhance_clip
     cls.enhance_clip = _enhance_clip
     cls.enhance_clips = _enhance_clips
+
+    if not hasattr(cls, "_fixed_original_init"):
+        cls._fixed_original_init = cls.__init__
+
+        def init_with_selective_channels_last(self, *args, **kwargs):
+            self._fixed_original_init(*args, **kwargs)
+            _enable_selective_channels_last(self)
+
+        cls.__init__ = init_with_selective_channels_last
