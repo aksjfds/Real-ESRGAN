@@ -194,6 +194,22 @@ def install_pipeline_optimizations() -> None:
     pipeline._worker = _worker_v51
     pipeline.OutputPump = StableOutputPump
 
+    # Balanced BasicVSR++ clips run in parallel across GPUs. Reporting the sum
+    # of per-GPU elapsed times makes the stage look roughly Nx slower than its
+    # wall time; the longest worker is the useful approximation for this log.
+    try:
+        from . import balanced_pipeline
+
+        def parallel_elapsed(stats) -> float:
+            return max(
+                (float(getattr(item, "elapsed", 0.0)) for item in stats._preprocessors),
+                default=0.0,
+            )
+
+        balanced_pipeline._AggregatePreprocessorStats.elapsed = property(parallel_elapsed)
+    except Exception:
+        pass
+
 
 def _run_model_device(preprocessor, clip_gpu: torch.Tensor) -> torch.Tensor:
     """Run BasicVSR++ from a CUDA float32 clip and return CUDA float32 output."""
