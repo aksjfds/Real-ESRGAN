@@ -5,7 +5,7 @@
 ## 版本
 
 - v4.3 代码基线：`90208548939f7b59ae08ff7db7f338b41b703e22`
-- v5.3 代码基线：`2b2f22916e2c60919c864a41e6e9ef2b163759e1`
+- v5.8 代码基线：`f5eca71cc10e6b105310cef762bd46469d173e8a`
 
 ## 结构
 
@@ -13,7 +13,7 @@
 - `realesrgan.ipynb`：Kaggle Notebook。
 - `inference/runtime.py`：视频探测/解码、8/10-bit 精度保持、模型加载与单帧 full-frame 推理。
 - `inference/basicvsrpp.py`：BasicVSR++ NTIRE Track 1 模型、时序 clip、场景切换保护与显存分块。
-- `inference/v54_runtime.py`：BasicVSR++ 执行层优化，包括 warp grid 缓存、临时张量削减和 8-bit 紧凑 H2D。
+- `inference/v54_runtime.py`：BasicVSR++ 执行层优化，包括 warp grid 缓存、临时张量削减、8-bit 紧凑 H2D 和 selective channels_last。
 - `inference/v52_scheduler.py`：双 GPU 及以上的 BasicVSR++ / Real-ESRGAN 动态调度。
 - `inference/v51_runtime.py`：Real-ESRGAN 共享内存传输和稳定 ETA 等执行优化。
 - `inference/checkpoint_parts.py`：合并并校验仓库内 BasicVSR++ checkpoint 分片。
@@ -25,14 +25,14 @@
 
 ## BasicVSR++ 固定参数
 
-BasicVSR++ 不再使用档位选择或启动时性能搜索。参数直接由 Notebook / CLI 提供，并原样传入推理：
+BasicVSR++ 不再使用 `SOURCE_PROFILE`、A-E 档位或启动时 autotuner。参数直接由 Notebook / CLI 提供，并原样传入推理：
 
 - `--bvs-tile-size`：空间 tile，默认 `640`。
 - `--bvs-clip-length`：时序 clip 长度，默认 `13`。
 - `--bvs-batch-size`：每张 GPU 单个 BVS 任务包含的独立 clip 数，默认 `1`。
 - `--bvs-strength`：恢复结果 residual blend 强度，默认 `1.0`。
 
-默认配置等价于：
+默认配置：
 
 ```text
 bvs_tile_size=640
@@ -41,15 +41,49 @@ bvs_batch_size=1
 bvs_strength=1.0
 ```
 
-`strength` 使用 `original + strength * (enhanced - original)`。当前固定 `clip_overlap=2`、`tile_pad=32`、`scene_threshold=0.30`，BasicVSR++ 优先使用 FP16。若指定 tile 发生 CUDA OOM，只允许向 `384 / 320 / 256` 回退以保证任务能够继续运行，不会自动向其他 tile 搜索。
+`strength` 使用 `original + strength * (enhanced - original)`。当前固定 `clip_overlap=2`、`tile_pad=32`、`scene_threshold=0.30`，BasicVSR++ 优先使用 FP16。若指定 tile 发生 CUDA OOM，只允许向 `384 / 320 / 256` 回退以保证任务能够继续运行，不做性能搜索。
 
 当前动态调度路径要求至少两张 CUDA GPU。每张 GPU 都加载独立 BasicVSR++ 实例，并在 BVS clip 与 full-frame Real-ESRGAN 任务之间动态分配工作。
+
+## v5.8 selective channels_last
+
+v5.8 在固定参数路径上增加 BasicVSR++ selective channels_last 优化。实现只改变主卷积区域 `Conv2d` 权重的 memory format，不修改模型结构、checkpoint 权重数值或恢复参数。
+
+使用 PyTorch 的：
+
+```python
+torch.nn.utils.convert_conv2d_weight_memory_format(
+    module,
+    torch.channels_last,
+)
+```
+
+当前转换范围：
+
+- `feat_extract`
+- `backward_1`
+- `forward_1`
+- `backward_2`
+- `forward_2`
+- `reconstruction`
+
+明确保持原路径、不做 selective channels_last 转换的区域：
+
+- SPyNet
+- deformable alignment / `deform_conv2d`
+- `conv_offset`
+- PixelShuffle / upsample 卷积
+- `conv_hr`
+- `conv_last`
+
+该优化只在 FP16 CUDA 且 GPU Compute Capability >= 7.0 时启用。当前版本不包含 `torch.compile`。
 
 ## 数据路径
 
 - 8-bit BasicVSR++：源 clip 保持 uint8 传入 GPU，在 CUDA 上转 float32 并归一化；tile 拼接、strength blend、clamp、round 和 uint8 量化均在 GPU 完成，最后只传回最终恢复帧。
 - 10-bit BasicVSR++：保留高精度原路径。
-- Real-ESRGAN：固定 full-frame FP16 + channels-last；不做 Real-ESRGAN tile/batch 自动调参。
+- Real-ESRGAN：固定 full-frame FP16 + channels_last；不做 Real-ESRGAN tile/batch 自动调参。
+- BasicVSR++：v5.8 对主 Conv2d-heavy restoration blocks 使用 selective channels_last；复杂时序/光流/可变形卷积区域保持原执行路径。
 - 目标倍率小于模型原生倍率时，完整帧超分后只做一次全帧 Lanczos4 缩放。
 
 ## 进度与日志
