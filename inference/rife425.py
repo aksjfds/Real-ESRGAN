@@ -166,17 +166,29 @@ def resolve_rife425_weights() -> Path:
     return target
 
 
-def _load_state(path: Path) -> dict[str, torch.Tensor]:
+def _load_state(path: Path) -> tuple[dict[str, torch.Tensor], int]:
+    """Load only inference IFNet weights and drop training-only teacher tensors."""
     try:
         obj = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
         obj = torch.load(path, map_location="cpu")
     if not isinstance(obj, dict):
         raise TypeError("Unexpected RIFE checkpoint object")
-    state = {str(k): v for k, v in obj.items() if isinstance(v, torch.Tensor)}
-    if any(k.startswith("module.") for k in state):
-        state = {k.removeprefix("module."): v for k, v in state.items()}
-    return state
+
+    state: dict[str, torch.Tensor] = {}
+    ignored_teacher = 0
+    for raw_key, value in obj.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        key = str(raw_key).removeprefix("module.")
+        if key.startswith("teacher."):
+            ignored_teacher += 1
+            continue
+        state[key] = value
+
+    if not state:
+        raise RuntimeError("RIFE 4.25 checkpoint contains no inference weights")
+    return state, ignored_teacher
 
 
 class RIFE425Interpolator:
@@ -185,17 +197,22 @@ class RIFE425Interpolator:
         self.device = torch.device(f"cuda:{self.gpu_id}")
         torch.cuda.set_device(self.gpu_id)
         self.model = _IFNet425().eval().requires_grad_(False)
-        result = self.model.load_state_dict(_load_state(weights), strict=False)
-        if result.missing_keys or result.unexpected_keys:
+        state, ignored_teacher = _load_state(weights)
+        try:
+            self.model.load_state_dict(state, strict=True)
+        except RuntimeError as error:
             raise RuntimeError(
-                f"RIFE 4.25 checkpoint mismatch: missing={result.missing_keys[:8]} "
-                f"unexpected={result.unexpected_keys[:8]}"
-            )
+                "RIFE 4.25 inference checkpoint mismatch after filtering training-only teacher.* weights"
+            ) from error
         self.dtype = torch.float16
         self.model.to(self.device, dtype=self.dtype)
         self.elapsed = 0.0
         self.frames = 0
-        print(f"[rife] Practical-RIFE 4.25 loaded on cuda:{self.gpu_id} (FP16)", flush=True)
+        suffix = f" | ignored_teacher={ignored_teacher}" if ignored_teacher else ""
+        print(
+            f"[rife] Practical-RIFE 4.25 loaded on cuda:{self.gpu_id} (FP16){suffix}",
+            flush=True,
+        )
 
     @staticmethod
     def _to_float(frame: np.ndarray) -> tuple[np.ndarray, float]:

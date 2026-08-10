@@ -5,7 +5,7 @@
 ```text
 FFmpeg 解码
 → BasicVSR++ NTIRE Track 1 同分辨率时序恢复
-→ Practical-RIFE 4.25 任意 timestep 插帧（可选，默认 Notebook 目标 60 FPS）
+→ Practical-RIFE 4.25 任意 timestep 插帧（目标帧率由 RIFE_FPS 唯一决定）
 → Real-ESRGAN full-frame 超分
 → Lanczos4 最终倍率调整
 → HEVC / AV1 编码
@@ -44,25 +44,24 @@ scene_threshold=0.30
 
 若 `tile=640` OOM，只向 `384 / 320 / 256` 回退。
 
-## RIFE 4.25 / 60 FPS
+## RIFE 4.25 / 输出帧率
 
-Notebook 默认：
+Notebook 只保留一个帧率参数：
 
 ```python
-FPS = "source"
 RIFE_FPS = 60
 ```
 
-`RIFE_FPS = 0` 关闭插帧。只有当 `RIFE_FPS` 大于源帧率时才启用 RIFE。
+不再提供独立的 `FPS = "source"` / `--fps` 配置。`RIFE_FPS` 同时是 RIFE 目标帧率和最终视频输出帧率，并且必须 **大于或等于源视频帧率**；若小于源帧率，程序会在加载 GPU 模型之前直接报错。
 
-v6.0 不做整数倍率近似，而是根据目标 CFR 时间轴为每一帧计算真实 interpolation timestep。例如 24 → 60 FPS 会直接生成目标 60 FPS 时间点所需的中间帧，不先升到 120 FPS 再丢帧。
+当 `RIFE_FPS` 等于源帧率时，不需要生成中间帧；当它高于源帧率时，v6.0 根据目标 CFR 时间轴计算真实 interpolation timestep。例如 24 → 60 FPS 会直接生成目标 60 FPS 时间点所需的中间帧，不先升到 120 FPS 再丢帧。
 
 RIFE 位于 BasicVSR++ 之后、Real-ESRGAN 之前，因此：
 
 - BasicVSR++ 仍只处理源帧率，不因 60 FPS 增加 2.5 倍工作量。
 - RIFE 只处理源分辨率帧，不在 4K 上插帧。
-- Real-ESRGAN 接收真正的 60 FPS 帧流。
-- Writer 在 RIFE 开启时直接以目标帧率接收帧，不再由 FFmpeg `fps` filter 补重复帧。
+- Real-ESRGAN 接收真正的目标 FPS 帧流。
+- Writer 在 RIFE 提升帧率时直接以目标帧率接收帧，不再由 FFmpeg `fps` filter 补重复帧。
 
 ### 场景切换和重复帧
 
@@ -70,7 +69,7 @@ RIFE 位于 BasicVSR++ 之后、Real-ESRGAN 之前，因此：
 
 若相邻恢复帧通过现有 `scene_difference >= 0.30` 判定为场景切换，则不跨镜头插帧，而是在下一个真实源帧时间点前保持上一镜头。
 
-### 模型
+### 模型与 checkpoint
 
 使用 Practical-RIFE 4.25。首次启用时通过 `gdown` 从 Practical-RIFE 官方 Google Drive 模型链接下载 `RIFEv4.25_0919.zip`，只提取 `flownet.pkl`，缓存到：
 
@@ -78,7 +77,9 @@ RIFE 位于 BasicVSR++ 之后、Real-ESRGAN 之前，因此：
 ~/.cache/realesrgan/rife-v4.25/flownet.pkl
 ```
 
-RIFE 使用官方 CLI 同样支持的 FP16 路径，以利用 T4 Tensor Core；模型结构、权重和目标 timestep 不变。
+官方 4.25 checkpoint 可能包含 `teacher.*` 训练/蒸馏分支权重。v6.0 推理加载器会明确过滤这些 training-only tensor，然后对剩余 IFNet 推理权重执行 strict 校验；不会再因为 `teacher.*` 被当作 unexpected keys 而启动失败。
+
+RIFE 使用官方 CLI 同样支持的 FP16 路径，以利用 T4 Tensor Core；模型结构、推理权重和目标 timestep 不变。
 
 ## 多 GPU 调度
 
@@ -111,7 +112,6 @@ SPyNet、deformable alignment / `deform_conv2d`、`conv_offset`、PixelShuffle�
 ```python
 MODEL = "realesr-animevideov3"
 SCALE = 2
-FPS = "source"
 RIFE_FPS = 60
 
 GPU_IDS = "0,1"

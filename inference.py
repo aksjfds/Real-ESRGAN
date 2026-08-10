@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+from pathlib import Path
 
 from encode import runtime as encode_runtime
 from inference import runtime as inference_runtime
@@ -20,12 +21,43 @@ def _validate_basicvsrpp_args(args) -> None:
         raise ValueError("--bvs-tile-size must be >=256 and divisible by 4")
     if int(args.bvs_batch_size) < 1:
         raise ValueError("--bvs-batch-size must be at least 1")
-    if float(args.rife_fps) < 0:
-        raise ValueError("--rife-fps must be >= 0")
+    if float(args.rife_fps) <= 0:
+        raise ValueError("--rife-fps must be positive")
+
+
+def _remove_legacy_fps_argument(parser) -> None:
+    """Remove the inherited --fps knob; v6.0 output FPS is owned by RIFE_FPS."""
+    for action in list(parser._actions):
+        if action.dest != "fps":
+            continue
+        parser._remove_action(action)
+        for option in action.option_strings:
+            parser._option_string_actions.pop(option, None)
+        break
+
+
+def _validate_rife_target(args) -> None:
+    """Reject down-FPS requests before loading any GPU model."""
+    input_path = Path(args.input).expanduser().resolve()
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Input video not found: {input_path}")
+    inference_runtime.require_binary(args.ffprobe_bin)
+    info = inference_runtime.probe_video(input_path, args.ffprobe_bin)
+    source_fps = float(info.fps)
+    target_fps = float(args.rife_fps)
+    if target_fps + 1e-9 < source_fps:
+        raise ValueError(
+            f"--rife-fps must be >= source FPS; got target={target_fps:g}, "
+            f"source={source_fps:.6g}"
+        )
+    # v52_scheduler still consumes the shared runtime's legacy args.fps field.
+    # Keep it internal and fixed to source; users can no longer set it.
+    args.fps = "source"
 
 
 def main() -> None:
     parser = inference_runtime.build_parser()
+    _remove_legacy_fps_argument(parser)
     parser.add_argument("--bvs-tile-size", type=int, default=640,
                         help="BasicVSR++ spatial tile size. Default: 640.")
     parser.add_argument("--bvs-clip-length", type=int, default=13,
@@ -37,8 +69,8 @@ def main() -> None:
     parser.add_argument(
         "--rife-fps",
         type=float,
-        default=0.0,
-        help="Enable Practical-RIFE 4.25 interpolation when greater than source FPS; e.g. 60.",
+        default=60.0,
+        help="Practical-RIFE 4.25 target/output FPS; must be >= source FPS. Default: 60.",
     )
     parser.add_argument(
         "--gpu-timing",
@@ -48,6 +80,7 @@ def main() -> None:
     encode_runtime.extend_parser(parser)
     args = parser.parse_args()
     _validate_basicvsrpp_args(args)
+    _validate_rife_target(args)
     encode_runtime.prepare_runtime(inference_runtime, args)
 
     install_pipeline_optimizations()
