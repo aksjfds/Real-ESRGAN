@@ -14,122 +14,131 @@ from inference.source_profiles import PROFILE_CHOICES, SOURCE_PROFILES
 from inference.v51_runtime import install_basicvsrpp_optimizations, install_pipeline_optimizations
 
 
-def _disable_v55_clip_producer() -> None:
-    """Keep v5.5 uint8-H2D optimizations but disable its queue-based clip producer.
+def _install_v55_repeat_run_fix() -> None:
+    """Make v5.5 clip prefetch deterministic and fail-fast across repeated runs."""
+    import queue
+    import threading
+    import traceback
 
-    The dynamic v5.2 scheduler already requests clips synchronously for each free
-    restoration GPU. Wrapping that request in a blocking Queue.get() can stall the
-    scheduler between GPU0 and GPU1 dispatch, leaving GPU1 idle while progress
-    remains at 0%. Source decode is tiny compared with BasicVSR++ compute in the
-    measured workload, so restoring the original synchronous task generator trades
-    negligible overlap for deterministic multi-GPU scheduling.
-    """
+    from inference import balanced_pipeline
     from inference import v54_runtime
 
-    if getattr(v54_runtime, "_v56_clip_producer_disabled", False):
+    cls = balanced_pipeline.BalancedBasicVSRPPStreamReader
+    if getattr(cls, "_v55_repeat_run_fix_installed", False):
         return
 
-    # v5.5's late patch also installs the compact uint8 H2D execution path. Keep
-    # that optimization, but permanently turn its optional queue producer into a
-    # no-op before any late patch can wrap BalancedBasicVSRPPStreamReader.
-    v54_runtime._install_clip_producer = lambda: None
-    v54_runtime._v56_clip_producer_disabled = True
+    # Capture the original synchronous reader methods before v5.5 installs its
+    # Queue.get()-based producer wrapper. We keep the exact same task generator,
+    # scene-cut logic, overlap policy, and frame ordering.
+    base_init = cls.__init__
+    base_next_task = cls._next_task
+    base_close = cls.close
 
-    # Apply the remaining v5.5 late patches now. The v5.6 cache policy installed
-    # below will override the temporary v5 cache selection before model creation.
+    # v5.1/autotune is already installed when this helper is called, so it is now
+    # safe to apply v5.5's late uint8-H2D patches. This also installs the old
+    # producer wrapper, which is immediately replaced below with the deterministic
+    # implementation built from the captured synchronous methods.
     v54_runtime._install_v55_late_patches()
 
+    class ProducerFailure:
+        def __init__(self, error: BaseException, traceback_text: str) -> None:
+            self.error = error
+            self.traceback_text = traceback_text
 
-def _install_v56_selective_channels_last() -> None:
-    """Use channels-last only inside BasicVSR++ convolution-heavy 4D islands."""
-    import torch
-    from torch import nn
+    def safe_init(self, *args, **kwargs):
+        base_init(self, *args, **kwargs)
+        depth = max(
+            2,
+            sum(max(1, int(getattr(item, "clip_batch", 1))) for item in self.preprocessors),
+        )
+        self._v55_task_queue = queue.Queue(maxsize=depth)
+        self._v55_task_stop = threading.Event()
+        self._v55_task_thread = None
 
-    from inference import basicvsrpp_autotune as tune
-    from inference import v54_runtime
+        # Prime one complete scheduling window synchronously. On a cached second
+        # run, the scheduler can otherwise start before the background producer
+        # has prepared GPU1's first clip and block inside Queue.get().
+        reached_eof = False
+        try:
+            for _ in range(depth):
+                item = base_next_task(self)
+                self._v55_task_queue.put_nowait(item)
+                if item is None:
+                    reached_eof = True
+                    break
+        except Exception as error:
+            self._v55_task_queue.put_nowait(ProducerFailure(error, traceback.format_exc()))
+            reached_eof = True
 
-    cls = tune.AutoTunedBasicVSRPPPreprocessor
-    if getattr(cls, "_v56_selective_channels_last_installed", False):
-        return
-
-    class ChannelsLastIsland(nn.Module):
-        """Run one convolution island as NHWC, then restore NCHW for other ops."""
-
-        def __init__(self, module: nn.Module):
-            super().__init__()
-            self.module = module
-            # Checkpoint loading has already finished by the time this wrapper is
-            # created, so changing weight memory format cannot alter state-dict keys.
-            self.module.to(memory_format=torch.channels_last)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            x = x.contiguous(memory_format=torch.channels_last)
-            output = self.module(x)
-            # grid_sample and torchvision deform_conv2d stay on the established
-            # contiguous NCHW path; only the dense convolution islands use NHWC.
-            return output.contiguous(memory_format=torch.contiguous_format)
-
-    def wrap(module: nn.Module) -> nn.Module:
-        if isinstance(module, ChannelsLastIsland):
-            return module
-        return ChannelsLastIsland(module)
-
-    def apply_model(model: nn.Module) -> None:
-        if getattr(model, "_v56_selective_channels_last_applied", False):
+        if reached_eof:
             return
 
-        # These are the long Conv2d-heavy regions. Keeping conversion boundaries
-        # around whole islands amortizes NCHW<->NHWC copies over many convolutions.
-        model.feat_extract = wrap(model.feat_extract)
-        model.reconstruction = wrap(model.reconstruction)
+        def put_item(item) -> bool:
+            while not self._v55_task_stop.is_set():
+                try:
+                    self._v55_task_queue.put(item, timeout=0.25)
+                    return True
+                except queue.Full:
+                    continue
+            return False
 
-        for index in range(len(model.spynet.basic_module)):
-            model.spynet.basic_module[index] = wrap(model.spynet.basic_module[index])
+        def producer_run() -> None:
+            try:
+                while not self._v55_task_stop.is_set():
+                    item = base_next_task(self)
+                    if not put_item(item):
+                        return
+                    if item is None:
+                        return
+            except Exception as error:
+                put_item(ProducerFailure(error, traceback.format_exc()))
 
-        for name in list(model.backbone.keys()):
-            model.backbone[name] = wrap(model.backbone[name])
-
-        # Only offset prediction convolutions use channels-last here. The actual
-        # deform_conv2d weight/input layout remains untouched.
-        for name in list(model.deform_align.keys()):
-            alignment = model.deform_align[name]
-            alignment.conv_offset = wrap(alignment.conv_offset)
-
-        model._v56_selective_channels_last_applied = True
-        print(
-            "[basicvsrpp] selective channels_last enabled for convolution islands",
-            flush=True,
+        self._v55_task_thread = threading.Thread(
+            target=producer_run,
+            name="basicvsrpp-clip-producer",
+            daemon=True,
         )
+        self._v55_task_thread.start()
 
-    original_autotune = cls._autotune
+    def safe_next_task(self):
+        # Do not allow the dynamic scheduler to hang forever on an empty queue.
+        # Normally the queue is prefilled and continuously replenished; timeout
+        # polling is only a liveness guard for an unexpectedly stopped producer.
+        while True:
+            try:
+                item = self._v55_task_queue.get(timeout=0.5)
+                break
+            except queue.Empty:
+                thread = getattr(self, "_v55_task_thread", None)
+                if thread is None or not thread.is_alive():
+                    raise RuntimeError(
+                        "BasicVSR++ clip producer stopped before emitting EOF; "
+                        "refusing to leave the scheduler blocked at 0%."
+                    )
 
-    def autotune_v56(self) -> None:
-        # AutoTunedBasicVSRPPPreprocessor calls _autotune only after the checkpoint
-        # is loaded, the model is on CUDA, and FP16 selection is complete.
-        apply_model(self.model)
-        original_autotune(self)
+        if isinstance(item, ProducerFailure):
+            raise RuntimeError(
+                f"BasicVSR++ clip producer failed: {item.error!r}\n{item.traceback_text}"
+            ) from item.error
+        return item
 
-    cls._autotune = autotune_v56
-    cls._v56_selective_channels_last_installed = True
+    def safe_close(self) -> None:
+        stop = getattr(self, "_v55_task_stop", None)
+        if stop is not None:
+            stop.set()
+        thread = getattr(self, "_v55_task_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+        try:
+            base_close(self)
+        finally:
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=1.0)
 
-    def select_v6_cache() -> None:
-        # The execution layout changed, so do not reuse v5 timing decisions. The
-        # first v5.6 run re-benchmarks tile choice; following runs use this cache.
-        tune._CACHE_VERSION = 6
-        tune._cache_path = lambda: Path.home() / ".cache" / "realesrgan" / "basicvsrpp-autotune-v6.json"
-
-    select_v6_cache()
-
-    # v5.5's process_video late hook reapplies its v5 cache settings immediately
-    # before model construction. Wrap that hook so v6 remains the final cache
-    # policy whenever it runs, including repeated notebook executions.
-    original_late_patches = v54_runtime._install_v55_late_patches
-
-    def late_patches_v56() -> None:
-        original_late_patches()
-        select_v6_cache()
-
-    v54_runtime._install_v55_late_patches = late_patches_v56
+    cls.__init__ = safe_init
+    cls._next_task = safe_next_task
+    cls.close = safe_close
+    cls._v55_repeat_run_fix_installed = True
 
 
 def main() -> None:
@@ -187,8 +196,7 @@ def main() -> None:
             )
             install_autotune()
         install_basicvsrpp_optimizations(source_bit_depth)
-        _disable_v55_clip_producer()
-        _install_v56_selective_channels_last()
+        _install_v55_repeat_run_fix()
 
     # CUDA-event timing is diagnostic instrumentation. Keep it off in normal
     # inference so Event synchronization cannot serialize the production path.
