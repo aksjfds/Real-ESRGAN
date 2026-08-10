@@ -166,8 +166,8 @@ def resolve_rife425_weights() -> Path:
     return target
 
 
-def _load_state(path: Path) -> tuple[dict[str, torch.Tensor], int]:
-    """Load only inference IFNet weights and drop training-only teacher tensors."""
+def _load_state(path: Path) -> tuple[dict[str, torch.Tensor], int, int]:
+    """Load inference IFNet weights; drop known training-only teacher/caltime tensors."""
     try:
         obj = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
@@ -177,6 +177,7 @@ def _load_state(path: Path) -> tuple[dict[str, torch.Tensor], int]:
 
     state: dict[str, torch.Tensor] = {}
     ignored_teacher = 0
+    ignored_caltime = 0
     for raw_key, value in obj.items():
         if not isinstance(value, torch.Tensor):
             continue
@@ -184,11 +185,14 @@ def _load_state(path: Path) -> tuple[dict[str, torch.Tensor], int]:
         if key.startswith("teacher."):
             ignored_teacher += 1
             continue
+        if key.startswith("caltime."):
+            ignored_caltime += 1
+            continue
         state[key] = value
 
     if not state:
         raise RuntimeError("RIFE 4.25 checkpoint contains no inference weights")
-    return state, ignored_teacher
+    return state, ignored_teacher, ignored_caltime
 
 
 class RIFE425Interpolator:
@@ -197,18 +201,24 @@ class RIFE425Interpolator:
         self.device = torch.device(f"cuda:{self.gpu_id}")
         torch.cuda.set_device(self.gpu_id)
         self.model = _IFNet425().eval().requires_grad_(False)
-        state, ignored_teacher = _load_state(weights)
+        state, ignored_teacher, ignored_caltime = _load_state(weights)
         try:
             self.model.load_state_dict(state, strict=True)
         except RuntimeError as error:
             raise RuntimeError(
-                "RIFE 4.25 inference checkpoint mismatch after filtering training-only teacher.* weights"
+                "RIFE 4.25 inference checkpoint mismatch after filtering known "
+                "training-only teacher.* / caltime.* weights"
             ) from error
         self.dtype = torch.float16
         self.model.to(self.device, dtype=self.dtype)
         self.elapsed = 0.0
         self.frames = 0
-        suffix = f" | ignored_teacher={ignored_teacher}" if ignored_teacher else ""
+        ignored = []
+        if ignored_teacher:
+            ignored.append(f"teacher={ignored_teacher}")
+        if ignored_caltime:
+            ignored.append(f"caltime={ignored_caltime}")
+        suffix = f" | ignored_training={'/'.join(ignored)}" if ignored else ""
         print(
             f"[rife] Practical-RIFE 4.25 loaded on cuda:{self.gpu_id} (FP16){suffix}",
             flush=True,
