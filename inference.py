@@ -9,6 +9,7 @@ from pathlib import Path
 from encode import runtime as encode_runtime
 from inference import runtime as inference_runtime
 from inference import v52_scheduler as inference_pipeline
+from inference.gpu_timing import install_gpu_timing
 from inference.source_profiles import PROFILE_CHOICES, SOURCE_PROFILES
 from inference.v51_runtime import install_basicvsrpp_optimizations, install_pipeline_optimizations
 
@@ -57,6 +58,9 @@ def main() -> None:
             install_autotune()
         install_basicvsrpp_optimizations(source_bit_depth)
 
+    # CUDA Events replace host launch timing for SR/BVS and report per-GPU
+    # timed-device busy/wait without changing the scheduler or model math.
+    install_gpu_timing(enable_bvs=args.source_profile != "A")
     inference_pipeline.process_video(args)
 
 
