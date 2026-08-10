@@ -10,6 +10,7 @@ from encode import runtime as encode_runtime
 from inference import runtime as inference_runtime
 from inference import v52_scheduler as inference_pipeline
 from inference.gpu_timing import install_gpu_timing
+from inference.progress_log import install_persistent_progress
 from inference.source_profiles import PROFILE_CHOICES, SOURCE_PROFILES
 from inference.v51_runtime import install_basicvsrpp_optimizations, install_pipeline_optimizations
 
@@ -29,11 +30,9 @@ def main() -> None:
     args = parser.parse_args()
     encode_runtime.prepare_runtime(inference_runtime, args)
     install_pipeline_optimizations()
-
-    # v5.2's dynamic B-E scheduler creates its own tqdm instance. Route that
-    # path through the persistent logger too so Kaggle saved logs receive real
-    # newline records instead of only carriage-return redraws.
-    inference_pipeline.tqdm = inference_pipeline.base_pipeline.PersistentTqdm
+    # Durable saved-log heartbeat is independent of tqdm and wraps the active
+    # OutputPump after v5.1 transfer/progress optimizations are installed.
+    install_persistent_progress()
 
     # Keep the CLI as the single public entry while allowing the pipeline to
     # share the extended A-E profile table without duplicating configuration.
