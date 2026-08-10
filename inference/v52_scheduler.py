@@ -1,8 +1,9 @@
-"""Dynamic multi-GPU scheduler for BasicVSR++ + full-frame Real-ESRGAN.
+"""Dynamic multi-GPU scheduler for fixed-parameter BasicVSR++ + Real-ESRGAN.
 
-The scheduler removes the global BVS->SR phase barrier. Each GPU runs exactly
-one heavy task at a time (BasicVSR++ clip or Real-ESRGAN frame), while different
-GPUs may be in different stages. Quality-related model parameters are unchanged.
+Each GPU runs exactly one heavy task at a time (BasicVSR++ clip or Real-ESRGAN
+frame), while different GPUs may be in different stages. BasicVSR++ tile, clip,
+batch, and strength come directly from CLI arguments; there is no profile or
+runtime parameter-search layer.
 """
 from __future__ import annotations
 
@@ -44,14 +45,11 @@ def _run_bvs_group(preprocessor, tasks: Sequence[_RestoredTask]):
 
 
 def process_video(args) -> None:
-    """Run v5.2 dynamic scheduling for multi-GPU B-E; otherwise use base pipeline."""
-    profile_name = str(getattr(args, "source_profile", "A")).upper()
     requested_gpu_ids = base_pipeline.base.parse_gpu_ids(args.gpu_ids)
-    if profile_name == "A" or len(requested_gpu_ids) < 2:
-        base_pipeline.process_video(args)
-        return
+    if len(requested_gpu_ids) < 2:
+        raise RuntimeError("Fixed BasicVSR++ dynamic scheduling requires at least two CUDA GPUs")
     if any(gpu is None for gpu in requested_gpu_ids):
-        raise RuntimeError("BasicVSR++ profiles B-E require CUDA")
+        raise RuntimeError("BasicVSR++ requires CUDA GPUs")
 
     if base_pipeline.base._require_encoder is None or base_pipeline.base._writer_type is None:
         raise RuntimeError("Encoding backend is not configured. Run through root inference.py.")
@@ -81,11 +79,16 @@ def process_video(args) -> None:
     out_w, out_h = int(round(in_w * args.scale)), int(round(in_h * args.scale))
     if out_w % 2 or out_h % 2:
         raise ValueError(f"4:2:0 output needs even dimensions, got {out_w}x{out_h}.")
-    start, duration, expected = base.resolve_range(info, args.start_time, args.test_seconds, inference_rate)
+    start, duration, expected = base.resolve_range(
+        info, args.start_time, args.test_seconds, inference_rate
+    )
     expected_output = max(1, int(round(duration * output_fps)))
     end = start + duration
     gpu_ids = [int(gpu) for gpu in requested_gpu_ids]
-    profile = base_pipeline.SOURCE_PROFILES[profile_name]
+    strength = float(args.bvs_strength)
+    clip_length = int(args.bvs_clip_length)
+    tile_size = int(args.bvs_tile_size)
+    batch_size = int(args.bvs_batch_size)
     native_scale = base._model_native_scale(args.model)
     config = base.WorkerConfig(args.model, base.resolve_model_paths(args))
     dtype = np.dtype("<u2") if info.bit_depth == 10 else np.dtype(np.uint8)
@@ -116,8 +119,8 @@ def process_video(args) -> None:
     )
     print(f"Model   : {args.model} | {scale_text}", flush=True)
     print(
-        f"Denoise : {profile_name} | BasicVSR++ NTIRE Track 1 | strength={profile['strength']:.2f} | "
-        f"clip={profile['clip_length']} | tile=512(auto fallback) | dynamic GPUs="
+        f"Denoise : BasicVSR++ NTIRE Track 1 | strength={strength:.2f} | "
+        f"clip={clip_length} | tile={tile_size}(OOM fallback) | batch={batch_size} | dynamic GPUs="
         + ",".join(f"cuda:{gpu}" for gpu in gpu_ids),
         flush=True,
     )
@@ -186,10 +189,10 @@ def process_video(args) -> None:
         primary = BasicVSRPPPreprocessor(
             BasicVSRPPConfig(
                 gpu_id=gpu_ids[0],
-                strength=float(profile["strength"]),
-                clip_length=int(profile["clip_length"]),
+                strength=strength,
+                clip_length=clip_length,
                 clip_overlap=2,
-                tile_size=512,
+                tile_size=tile_size,
                 tile_pad=32,
                 fp16=True,
                 scene_threshold=0.30,
@@ -198,6 +201,8 @@ def process_video(args) -> None:
         )
         task_source = balanced_pipeline.BalancedBasicVSRPPStreamReader(raw_reader, primary)
         preprocessors = list(task_source.preprocessors)
+        for preprocessor in preprocessors:
+            preprocessor.clip_batch = batch_size
         raw_reader = None
         bvs_model_time = time.monotonic() - t
 
@@ -213,7 +218,7 @@ def process_video(args) -> None:
             flush=True,
         )
         print(
-            "Pipeline: no global BVS->SR barrier | at least one BVS producer is kept active "
+            "Pipeline: no global BVS->SR barrier | at least one BVS task remains active "
             "while restoration work remains",
             flush=True,
         )
@@ -230,7 +235,6 @@ def process_video(args) -> None:
         pump = base_pipeline.OutputPump(workers, writer, out_w, out_h, progress, started)
 
         overlap = int(primary.config.clip_overlap)
-        clip_length = int(primary.config.clip_length)
         sr_trigger = max(1, clip_length - 2 * overlap)
 
         def schedule_bvs(worker_id: int) -> bool:
@@ -277,12 +281,6 @@ def process_video(args) -> None:
                     raise RuntimeError("BasicVSR++ dynamic worker returned an unexpected frame count")
                 for offset, frame in enumerate(emitted):
                     heapq.heappush(restored_heap, (task.output_start + offset, frame))
-            preprocessor = preprocessors[worker_id]
-            try:
-                if hasattr(preprocessor, "release_unused_cache_if_tight"):
-                    preprocessor.release_unused_cache_if_tight()
-            except Exception:
-                pass
 
         while True:
             pump.check()
@@ -442,7 +440,8 @@ def process_video(args) -> None:
         flush=True,
     )
     print(
-        f"BasicVSR: tile={selected_tile} | tiles={bvs_tiles} | scene_cuts={scene_cuts}",
+        f"BasicVSR: tile={selected_tile} | clip={clip_length} | batch={batch_size} | "
+        f"strength={strength:.2f} | tiles={bvs_tiles} | scene_cuts={scene_cuts}",
         flush=True,
     )
     print(

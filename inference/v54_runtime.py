@@ -1,17 +1,13 @@
-"""v5.4-v5.5 BasicVSR++ execution-only optimizations.
+"""Fixed-parameter BasicVSR++ execution optimizations.
 
 These patches preserve the BasicVSR++ model, weights, clip policy, tiling,
-scene-cut behavior, and arithmetic. v5.4 reuses invariant warp grids and avoids
-temporary zero tensors that were immediately overwritten. v5.5 keeps 8-bit
-clips compact across H2D and prepares future clip tasks on a bounded CPU thread.
+scene-cut behavior, and restoration arithmetic. They only reduce execution and
+transfer overhead: cache invariant warp grids, avoid temporary zero tensors that
+are immediately overwritten, and keep 8-bit clips compact across H2D.
 """
 from __future__ import annotations
 
-import queue
-import threading
 import time
-import traceback
-from pathlib import Path
 from typing import Dict, Sequence, Tuple
 
 import numpy as np
@@ -52,7 +48,11 @@ def _flow_warp_cached(
     gy = 2.0 * grid[..., 1] / (h - 1) - 1.0 if h > 1 else torch.zeros_like(grid[..., 1])
     normalized = torch.stack((gx, gy), dim=-1)
     return F.grid_sample(
-        x, normalized, mode=interpolation, padding_mode=padding_mode, align_corners=align_corners
+        x,
+        normalized,
+        mode=interpolation,
+        padding_mode=padding_mode,
+        align_corners=align_corners,
     )
 
 
@@ -102,8 +102,8 @@ def _propagate_v54(
     return feats
 
 
-def _enhance_u8_with_tile_v55(preprocessor, clip_cpu: torch.Tensor, tile_size: int) -> np.ndarray:
-    """Transfer uint8 clips compactly, then normalize and restore entirely on CUDA."""
+def _enhance_u8_with_tile(preprocessor, clip_cpu: torch.Tensor, tile_size: int) -> np.ndarray:
+    """Transfer uint8 clips compactly, then normalize and restore on CUDA."""
     from . import v51_runtime as v51
 
     device = preprocessor.device
@@ -126,14 +126,11 @@ def _enhance_u8_with_tile_v55(preprocessor, clip_cpu: torch.Tensor, tile_size: i
         start_event = end_event = None
 
     if clip_cpu.dtype == torch.uint8:
-        # Keep PCIe payload at one byte/channel. The float conversion and /255
-        # happen after the compact uint8 tensor reaches the target GPU.
         original_u8 = clip_cpu.to(device=device, non_blocking=True)
         original = original_u8.to(dtype=torch.float32)
         original.div_(255.0)
         del original_u8
     else:
-        # Compatibility path for probes/callers that still provide float clips.
         original = clip_cpu.to(device=device, dtype=torch.float32, non_blocking=True)
 
     _n, _t, _c, height, width = original.shape
@@ -177,7 +174,7 @@ def _enhance_u8_with_tile_v55(preprocessor, clip_cpu: torch.Tensor, tile_size: i
     return result
 
 
-def _enhance_u8_v55(preprocessor, clip_cpu: torch.Tensor) -> np.ndarray:
+def _enhance_u8(preprocessor, clip_cpu: torch.Tensor) -> np.ndarray:
     requested = int(preprocessor.tile_size)
     candidates = [requested]
     for fallback in (384, 320, 256):
@@ -186,7 +183,7 @@ def _enhance_u8_v55(preprocessor, clip_cpu: torch.Tensor) -> np.ndarray:
     last_error = None
     for tile_size in candidates:
         try:
-            output = _enhance_u8_with_tile_v55(preprocessor, clip_cpu, tile_size)
+            output = _enhance_u8_with_tile(preprocessor, clip_cpu, tile_size)
             if tile_size != preprocessor.tile_size:
                 preprocessor.tile_size = tile_size
                 print(f"[basicvsrpp] VRAM fallback locked to tile={tile_size}", flush=True)
@@ -198,7 +195,7 @@ def _enhance_u8_v55(preprocessor, clip_cpu: torch.Tensor) -> np.ndarray:
     raise RuntimeError("BasicVSR++ ran out of GPU memory even at tile=256") from last_error
 
 
-def _enhance_clip_v55(self, frames: Sequence[np.ndarray]) -> list[np.ndarray]:
+def _enhance_clip(self, frames: Sequence[np.ndarray]) -> list[np.ndarray]:
     if not frames:
         return []
     first_shape = frames[0].shape
@@ -208,39 +205,39 @@ def _enhance_clip_v55(self, frames: Sequence[np.ndarray]) -> list[np.ndarray]:
     if len(frames) == 1:
         return [np.ascontiguousarray(frame) for frame in frames]
     if first_dtype != np.dtype(np.uint8):
-        return self._v51_original_enhance_clip(frames)
+        return self._fixed_original_enhance_clip(frames)
 
     packed = np.stack(frames, axis=0)
     clip = torch.from_numpy(packed).permute(0, 3, 1, 2).unsqueeze(0)
     started = time.monotonic()
-    enhanced_u8 = _enhance_u8_v55(self, clip)[0]
+    enhanced_u8 = _enhance_u8(self, clip)[0]
     self.elapsed += time.monotonic() - started
     self.clips += 1
     return [np.ascontiguousarray(frame) for frame in enhanced_u8]
 
 
-def _enhance_clips_v55(self, clips: Sequence[Sequence[np.ndarray]]) -> list[list[np.ndarray]]:
+def _enhance_clips(self, clips: Sequence[Sequence[np.ndarray]]) -> list[list[np.ndarray]]:
     if not clips:
         return []
     if len(clips) == 1:
-        return [_enhance_clip_v55(self, clips[0])]
+        return [_enhance_clip(self, clips[0])]
 
     lengths = {len(frames) for frames in clips}
     if len(lengths) != 1 or next(iter(lengths)) < 2:
-        return [_enhance_clip_v55(self, frames) for frames in clips]
+        return [_enhance_clip(self, frames) for frames in clips]
     first = clips[0][0]
     first_shape = first.shape
     first_dtype = np.dtype(first.dtype)
     for frames in clips:
         if any(frame.shape != first_shape or np.dtype(frame.dtype) != first_dtype for frame in frames):
-            return [_enhance_clip_v55(self, item) for item in clips]
+            return [_enhance_clip(self, item) for item in clips]
     if first_dtype != np.dtype(np.uint8):
-        return self._v51_original_enhance_clips(clips)
+        return [self._fixed_original_enhance_clip(frames) for frames in clips]
 
     packed = np.stack([np.stack(frames, axis=0) for frames in clips], axis=0)
     tensor = torch.from_numpy(packed).permute(0, 1, 4, 2, 3)
     started = time.monotonic()
-    enhanced_u8 = _enhance_u8_v55(self, tensor)
+    enhanced_u8 = _enhance_u8(self, tensor)
     self.elapsed += time.monotonic() - started
     self.clips += len(clips)
     return [
@@ -249,173 +246,18 @@ def _enhance_clips_v55(self, clips: Sequence[Sequence[np.ndarray]]) -> list[list
     ]
 
 
-def _probe_full_frame_v55(self, tile_size: int, clip_length: int, clip_batch: int):
-    """Autotune the same compact uint8 H2D path used by real 8-bit clips."""
-    self._quality_guard(tile_size, clip_batch)
-    device = self.device
-    torch.cuda.set_device(device)
-    free_before, total = torch.cuda.mem_get_info(device)
-    headroom = self._headroom(total)
-    if free_before <= headroom:
-        return None
-
-    from . import basicvsrpp_autotune as tune
-
-    height, width = tune._source_shape(tile_size)
-    clip = torch.zeros((clip_batch, clip_length, 3, height, width), dtype=torch.uint8)
-    old_tiles = self.tiles
-    try:
-        torch.cuda.reset_peak_memory_stats(device)
-        torch.cuda.synchronize(device)
-        started = time.perf_counter()
-        output = _enhance_u8_with_tile_v55(self, clip, tile_size)
-        torch.cuda.synchronize(device)
-        elapsed = max(time.perf_counter() - started, 1e-6)
-        peak_reserved = torch.cuda.max_memory_reserved(device)
-        peak_allocated = torch.cuda.max_memory_allocated(device)
-        free_after, _ = torch.cuda.mem_get_info(device)
-        safe = free_after >= headroom
-        emitted = max(1, clip_length - 2 * self._profile_overlap)
-        score = (clip_batch * emitted) / elapsed
-        del output
-        return {
-            "score": float(score) if safe else 0.0,
-            "elapsed": float(elapsed),
-            "peak_reserved": float(peak_reserved),
-            "peak_allocated": float(peak_allocated),
-            "safe": 1.0 if safe else 0.0,
-        }
-    except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
-        message = str(error).lower()
-        if not isinstance(error, torch.cuda.OutOfMemoryError) and "out of memory" not in message:
-            raise
-        torch.cuda.empty_cache()
-        return None
-    finally:
-        self.tiles = old_tiles
-        del clip
-
-
-class _ProducerFailure:
-    def __init__(self, error: BaseException, traceback_text: str) -> None:
-        self.error = error
-        self.traceback_text = traceback_text
-
-
-def _install_clip_producer() -> None:
-    """Prefetch exact existing v5.2 clip tasks without changing task semantics."""
-    from . import balanced_pipeline
-
-    cls = balanced_pipeline.BalancedBasicVSRPPStreamReader
-    if getattr(cls, "_v55_clip_producer_installed", False):
-        return
-
-    original_init = cls.__init__
-    original_next_task = cls._next_task
-    original_close = cls.close
-
-    def producer_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        depth = max(
-            2,
-            sum(max(1, int(getattr(item, "clip_batch", 1))) for item in self.preprocessors),
-        )
-        self._v55_task_queue = queue.Queue(maxsize=depth)
-        self._v55_task_stop = threading.Event()
-
-        def put_item(item) -> bool:
-            while not self._v55_task_stop.is_set():
-                try:
-                    self._v55_task_queue.put(item, timeout=0.25)
-                    return True
-                except queue.Full:
-                    continue
-            return False
-
-        def producer_run() -> None:
-            try:
-                while not self._v55_task_stop.is_set():
-                    item = original_next_task(self)
-                    if not put_item(item):
-                        return
-                    if item is None:
-                        return
-            except Exception as error:
-                put_item(_ProducerFailure(error, traceback.format_exc()))
-
-        self._v55_task_thread = threading.Thread(
-            target=producer_run,
-            name="basicvsrpp-clip-producer",
-            daemon=True,
-        )
-        self._v55_task_thread.start()
-
-    def prefetched_next_task(self):
-        item = self._v55_task_queue.get()
-        if isinstance(item, _ProducerFailure):
-            raise RuntimeError(
-                f"BasicVSR++ clip producer failed: {item.error!r}\n{item.traceback_text}"
-            ) from item.error
-        return item
-
-    def producer_close(self) -> None:
-        stop = getattr(self, "_v55_task_stop", None)
-        if stop is not None:
-            stop.set()
-        try:
-            original_close(self)
-        finally:
-            thread = getattr(self, "_v55_task_thread", None)
-            if thread is not None and thread.is_alive():
-                thread.join(timeout=5.0)
-
-    cls.__init__ = producer_init
-    cls._next_task = prefetched_next_task
-    cls.close = producer_close
-    cls._v55_clip_producer_installed = True
-
-
-def _install_v55_late_patches() -> None:
-    """Apply v5.5 after v5.1/autotune installers have selected their classes."""
-    from . import basicvsrpp_autotune as tune
-    from . import v51_runtime as v51
-
-    cls = tune.AutoTunedBasicVSRPPPreprocessor
-    cls.enhance_clip = _enhance_clip_v55
-    cls.enhance_clips = _enhance_clips_v55
-
-    # v5.1 only replaces the autotune probe for 8-bit sources. Detect that
-    # exact case so 10-bit sources keep their established float/uint16 probe.
-    if cls._probe_full_frame is v51._probe_full_frame_v51:
-        cls._probe_full_frame = _probe_full_frame_v55
-        tune._CACHE_VERSION = 5
-        tune._cache_path = lambda: Path.home() / ".cache" / "realesrgan" / "basicvsrpp-autotune-v5.json"
-
-    bvsr.BasicVSRPPPreprocessor = cls
-    _install_clip_producer()
-
-
-def _install_late_hook() -> None:
-    from . import v52_scheduler
-
-    if getattr(v52_scheduler, "_v55_late_hook_installed", False):
-        return
-    original_process_video = v52_scheduler.process_video
-
-    def process_video_v55(args) -> None:
-        _install_v55_late_patches()
-        original_process_video(args)
-
-    v52_scheduler.process_video = process_video_v55
-    v52_scheduler._v55_late_hook_installed = True
-
-
 def install_basicvsrpp_execution_optimizations() -> None:
-    """Install v5.4/v5.5 execution patches without changing restoration semantics."""
+    """Install fixed-parameter BasicVSR++ execution optimizations."""
     global _INSTALLED
     if _INSTALLED:
         return
     _INSTALLED = True
+
     bvsr.flow_warp = _flow_warp_cached
     bvsr.BasicVSRPlusPlusNet.propagate = _propagate_v54
-    _install_late_hook()
+
+    cls = bvsr.BasicVSRPPPreprocessor
+    if not hasattr(cls, "_fixed_original_enhance_clip"):
+        cls._fixed_original_enhance_clip = cls.enhance_clip
+    cls.enhance_clip = _enhance_clip
+    cls.enhance_clips = _enhance_clips
