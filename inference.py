@@ -9,7 +9,6 @@ from pathlib import Path
 from encode import runtime as encode_runtime
 from inference import runtime as inference_runtime
 from inference import v52_scheduler as inference_pipeline
-from inference.gpu_timing import install_gpu_timing
 from inference.progress_log import install_persistent_progress
 from inference.source_profiles import PROFILE_CHOICES, SOURCE_PROFILES
 from inference.v51_runtime import install_basicvsrpp_optimizations, install_pipeline_optimizations
@@ -25,6 +24,11 @@ def main() -> None:
             "A=BasicVSR++ off; B=25%%; C=50%%; D=75%%; "
             "E=100%% full-strength NTIRE compressed-video restoration"
         ),
+    )
+    parser.add_argument(
+        "--gpu-timing",
+        action="store_true",
+        help="Enable CUDA-event GPU busy/wait diagnostics (adds profiling overhead).",
     )
     encode_runtime.extend_parser(parser)
     args = parser.parse_args()
@@ -44,7 +48,11 @@ def main() -> None:
         from inference import basicvsrpp
         from inference.basicvsrpp_autotune import install_autotune
         from inference.checkpoint_parts import resolve_checkpoint
+        from inference.v54_runtime import install_basicvsrpp_execution_optimizations
 
+        # v5.4 only changes execution: cache invariant warp grids and avoid
+        # temporary CUDA zero tensors that are immediately overwritten.
+        install_basicvsrpp_execution_optimizations()
         basicvsrpp.SOURCE_PROFILES = SOURCE_PROFILES
         basicvsrpp.download_checkpoint = resolve_checkpoint
         try:
@@ -62,9 +70,12 @@ def main() -> None:
             install_autotune()
         install_basicvsrpp_optimizations(source_bit_depth)
 
-    # CUDA Events replace host launch timing for SR/BVS and report per-GPU
-    # timed-device busy/wait without changing the scheduler or model math.
-    install_gpu_timing(enable_bvs=args.source_profile != "A")
+    # CUDA-event timing is diagnostic instrumentation. Keep it off in normal
+    # inference so Event synchronization cannot serialize the production path.
+    if args.gpu_timing:
+        from inference.gpu_timing import install_gpu_timing
+
+        install_gpu_timing(enable_bvs=args.source_profile != "A")
     inference_pipeline.process_video(args)
 
 
