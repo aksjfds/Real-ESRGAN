@@ -218,6 +218,56 @@ def _watchdog(
         )
 
 
+def _schedule_idle_worker_without_rife(
+    state: SchedulerState,
+    worker_id: int,
+) -> bool:
+    """Keep BVS parallel until the restored-frame backlog reaches one emit batch.
+
+    BVS dominates this pipeline. When interpolation is disabled, immediately
+    draining every restored frame through SR causes one GPU to spend long bursts
+    on SR while the other is the only GPU still producing BVS clips. The stable
+    pre-process scheduler used a high-water mark equal to one normal BVS emit
+    batch before letting SR preempt the second BVS lane; preserve that behavior
+    here while retaining the process-isolated worker boundary.
+    """
+    if state.active[worker_id] is not None:
+        return False
+
+    if (
+        not state.bvs_eof
+        and not state.bvs_running()
+        and state.schedule_bvs(worker_id)
+    ):
+        return True
+
+    sr_trigger = max(
+        1,
+        int(state.clip_source.clip_length)
+        - 2 * int(state.clip_source.overlap),
+    )
+    other_bvs_running = state.bvs_running()
+    sr_backlog_ready = (
+        state.bvs_eof
+        or (other_bvs_running and len(state.restored_heap) >= sr_trigger)
+    )
+
+    if sr_backlog_ready:
+        if state.schedule_sr(worker_id, local_only=True):
+            return True
+        if state.schedule_sr(worker_id, local_only=False):
+            return True
+
+    if not state.bvs_eof and state.schedule_bvs(worker_id):
+        return True
+
+    if state.schedule_sr(worker_id, local_only=True):
+        return True
+    if state.schedule_sr(worker_id, local_only=False):
+        return True
+    return False
+
+
 def run_scheduler(
     state: SchedulerState,
     pump,
@@ -266,7 +316,14 @@ def run_scheduler(
             made_progress = True
 
         for worker_id in range(len(state.gpu_ids)):
-            if state.schedule_idle_worker(worker_id):
+            if state.planner.rife_enabled:
+                scheduled = state.schedule_idle_worker(worker_id)
+            else:
+                scheduled = _schedule_idle_worker_without_rife(
+                    state,
+                    worker_id,
+                )
+            if scheduled:
                 made_progress = True
 
         now = time.monotonic()

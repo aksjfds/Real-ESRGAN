@@ -9,6 +9,7 @@ import multiprocessing as mp
 from encode import runtime as encode_runtime
 from inference import runtime as inference_runtime
 from inference import v52_scheduler as inference_pipeline
+from inference.run_lock import exclusive_output_run
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -124,8 +125,9 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
     _validate_args(args)
-    encode_runtime.prepare_runtime(inference_runtime, args)
-    inference_pipeline.process_video(args)
+    with exclusive_output_run(args.output):
+        encode_runtime.prepare_runtime(inference_runtime, args)
+        inference_pipeline.process_video(args)
 
 
 if __name__ == "__main__":

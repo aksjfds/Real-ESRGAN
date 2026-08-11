@@ -1,6 +1,6 @@
 # Real-ESRGAN 动画视频推理
 
-当前 v6.5 流水线：
+当前 v6.7 流水线：
 
 ```text
 FFmpeg 解码
@@ -20,11 +20,13 @@ FFmpeg 解码
 - v6.2：typed task protocol、FrameHandle 引用计数、locality-aware 调度。
 - v6.3：去除活动路径 monkey-patch，显式 runtime、事件驱动 IPC、RIFE direct-slot、原生 GPU timing。
 - v6.4：OutputPump/Pipe fail-fast、BVS CUDA direct-slot、scene signature cache、runtime API 边界和更严格 task/runtime 类型协议。
-- v6.5：`RIFE_FPS=0` 关闭插帧并保持源帧率；RIFE 优先使用仓库内模型归档；离线 `[progress]` 首次 60 秒后开始并每 60 秒打印一次。
+- v6.5：`RIFE_FPS=0` 关闭插帧并保持源帧率；RIFE 优先使用仓库内模型归档；离线 `[progress]` 使用固定 heartbeat。
+- v6.6：BVS emit group 使用一次 batch D2H，再复制到 FrameHandle shared-memory slots，避免逐帧 blocking D2H。
+- v6.7：RIFE 关闭时恢复 BVS/SR 高水位调度，避免 SR 过早抢占第二条 BVS GPU lane；同输出路径增加单实例进程锁；Kaggle Notebook 将子进程 stdout/stderr 合并后由 notebook kernel 单路转发，避免离线日志重复。
 
 ## 当前结构
 
-- `inference.py`：当前 CLI；只暴露 `RIFE_FPS`，不提供遗留 `--fps` 参数。
+- `inference.py`：当前 CLI；只暴露 `RIFE_FPS`，不提供遗留 `--fps` 参数，并在入口持有同输出路径单实例锁。
 - `inference/scheduler.py`：CPU 视频编排，不直接执行 CUDA 模型。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：任务策略、状态、结果处理、watchdog 和事件驱动等待。
 - `inference/task_protocol.py`：BVS / RIFE / SR typed task/result protocol。
@@ -36,14 +38,16 @@ FFmpeg 解码
 - `inference/gpu_workers.py` / `frame_pool.py`：FrameHandle、slot 引用计数和 locality-aware 数据传递。
 - `inference/gpu_worker_process.py`：固定 CUDA device context 的 worker 主循环。
 - `inference/gpu_task_handlers.py`：GPU task handler registry 和 direct-slot transport。
-- `inference/bvs_runtime.py`：当前 BasicVSR++ uint8 CUDA direct-slot runtime。
+- `inference/frame_transport.py`：CUDA→shared-memory 的 batch D2H 传输边界与严格 shape/dtype/slot 校验。
+- `inference/bvs_runtime.py`：当前 BasicVSR++ uint8 CUDA runtime。
 - `inference/optimized_basicvsrpp.py`：v5.8 BasicVSR++ 数值/执行优化基础类。
 - `inference/optimized_rife425.py`：RIFE 4.25 compact H2D 和 direct shared-slot 输出。
 - `inference/sr_runtime.py`：显式 Real-ESRGAN uint8 CUDA helper。
 - `inference/output_runtime.py`：fail-fast 输出 pump、Lanczos4 resize、交互/批处理 progress。
 - `inference/clip_source.py` / `timeline.py` / `scene_metrics.py`：CPU clip、目标时间轴和缓存 scene signature。
+- `inference/run_lock.py`：同一输出路径的进程级单实例锁，避免重复运行争抢 GPU/输出文件。
 
-旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留历史兼容；当前 v6.5 主路径不依赖这些旧安装器。
+旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留历史兼容；当前 v6.7 主路径不依赖这些旧安装器。
 
 ## BasicVSR++ 固定参数
 
@@ -59,7 +63,9 @@ scene_threshold=0.30
 
 若 `tile=640` OOM，只向 `384 / 320 / 256` 回退。当前版本不包含 `torch.compile`。
 
-8-bit BVS 结果保持 CUDA `uint8` 到 handler，由 handler 只把需要 emit 的帧直接复制到预留 FrameHandle shared-memory slot；不再先构造完整 CPU clip ndarray 再做第二次 CPU memcpy。10-bit 路径保持保守兼容实现。
+8-bit BVS 结果保持 CUDA `uint8` 到 handler，只对真正需要 emit 的帧执行一次 group-level batch D2H，再由 CPU `np.copyto` 写入预留 FrameHandle shared-memory slots；不会对每个 emit 帧单独做 blocking D2H。10-bit 路径保持保守兼容实现。
+
+当 RIFE 关闭时，scheduler 使用一个正常 BVS emit batch 作为 SR backlog 高水位：`clip_length - 2 * overlap`，当前固定参数下为 `9`。在 backlog 未达到高水位时优先保持两张 GPU 继续生产 BVS；达到高水位或 BVS EOF 后再让空闲 GPU 消化 SR，从而避免 SR 一出现就长期抢占第二条 BVS lane。
 
 ## RIFE 4.25 / 输出帧率
 
@@ -111,9 +117,13 @@ OutputPump 的有界队列使用 timeout + error check 循环。若 resize/write
 
 启动前在 Linux 上检查 `/dev/shm` 可用容量，避免 shared-memory 不足运行到中途才出现不明确故障。
 
+同一 `--output` 路径在 POSIX 上通过 `flock(LOCK_EX | LOCK_NB)` 只允许一个 inference 主进程持有；第二个重复运行会在加载 GPU 模型前直接报错，不会与第一个任务争抢 GPU 或同时写同一输出文件。
+
 ## 离线进度
 
-非交互式运行时只打印 `[progress]`。首次周期进度在运行 60 秒后输出，之后每 60 秒一次；结束时可额外输出最终 `done` 状态。不会再输出 `[gpu-status]`。
+非交互式运行时只打印 `[progress]`：启动时立即打印一条，之后每 60 秒一次；结束时可额外输出最终 `done` 状态。不会再输出 `[gpu-status]`。
+
+Kaggle Notebook 使用 `subprocess.Popen(..., stdout=PIPE, stderr=STDOUT)` 捕获 inference 子进程的单一合并输出流，再由 notebook kernel 顺序转发到 stdout，避免子进程输出同时进入多个持久化日志通道。
 
 ## GPU timing
 
