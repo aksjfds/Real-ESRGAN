@@ -20,8 +20,6 @@ class FrameStorage(str, Enum):
 
 @dataclass(frozen=True)
 class FrameHandle:
-    """Persistent frame stored in one worker's shared output-slot pool."""
-
     worker_id: int
     slot: int
     generation: int
@@ -29,8 +27,6 @@ class FrameHandle:
 
 @dataclass(frozen=True)
 class FrameInput:
-    """Worker-side reference to either an input slot or a persistent output slot."""
-
     storage: FrameStorage
     slot: int
 
@@ -88,6 +84,7 @@ class TaskResult:
     kind: TaskKind
     seconds: float
     payload: Any
+    gpu_seconds: float | None = None
 
 
 @dataclass(frozen=True)

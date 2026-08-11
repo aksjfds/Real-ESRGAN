@@ -1,4 +1,4 @@
-"""Result handling, watchdogs, and the main scheduler event loop."""
+"""Result handling, watchdogs, and the event-driven scheduler loop."""
 
 from __future__ import annotations
 
@@ -164,6 +164,12 @@ def _handle_result(
             f"task={message.task_id}/{message.kind.value}"
         )
 
+    state.record_gpu_timing(
+        message.worker_id,
+        message.kind,
+        message.gpu_seconds,
+    )
+
     if message.kind == TaskKind.BVS:
         _handle_bvs_result(state, message)
     elif message.kind == TaskKind.RIFE:
@@ -257,7 +263,7 @@ def run_scheduler(
     expected_output: int,
     frame_output_slots: int,
 ) -> float:
-    scheduler_idle = 0.0
+    scheduler_wait = 0.0
     last_status = time.monotonic()
 
     while True:
@@ -319,9 +325,11 @@ def run_scheduler(
             break
 
         if not made_progress:
-            idle_started = time.monotonic()
-            time.sleep(0.01)
-            scheduler_idle += time.monotonic() - idle_started
+            until_status = max(0.0, 30.0 - (now - last_status))
+            timeout = min(1.0, until_status if until_status > 0 else 1.0)
+            wait_started = time.monotonic()
+            state.workers.wait_for_event(timeout)
+            scheduler_wait += time.monotonic() - wait_started
 
     if state.pending:
         raise RuntimeError(
@@ -351,4 +359,4 @@ def run_scheduler(
             f"Pipeline ended with {live_handles} live FrameHandle slot(s)"
         )
 
-    return scheduler_idle
+    return scheduler_wait

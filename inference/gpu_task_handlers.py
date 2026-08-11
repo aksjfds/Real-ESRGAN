@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from . import runtime as base
+from .sr_runtime import infer_cuda_u8_tensor
 from .task_protocol import (
     BVSResult,
     BVSTask,
@@ -75,9 +76,7 @@ def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
         end = output_cursor + emitted_count
         slots = task.output_slots[output_cursor:end]
         if len(slots) != emitted_count:
-            raise RuntimeError(
-                "BVS task output-slot accounting mismatch"
-            )
+            raise RuntimeError("BVS task output-slot accounting mismatch")
 
         for slot, frame in zip(slots, emitted):
             np.copyto(
@@ -88,9 +87,7 @@ def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
         output_cursor = end
 
     if output_cursor != len(task.output_slots):
-        raise RuntimeError(
-            "BVS task did not fill all reserved output slots"
-        )
+        raise RuntimeError("BVS task did not fill all reserved output slots")
 
     return BVSResult(
         emitted_counts=tuple(emitted_counts),
@@ -102,40 +99,29 @@ def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
 
 def run_rife(context: WorkerContext, task: RIFETask) -> RIFEResult:
     if context.rife is None:
-        raise RuntimeError(
-            "RIFE task submitted to a worker without a RIFE model"
-        )
+        raise RuntimeError("RIFE task submitted to a worker without a RIFE model")
 
     frame0 = resolve_frame(context, task.frame0)
     frame1 = resolve_frame(context, task.frame1)
-    generated = context.rife.interpolate_many(
+    count = context.rife.interpolate_into(
         frame0,
         frame1,
         task.timesteps,
+        context.frame_output_view,
+        task.output_slots,
     )
-
-    if len(generated) != len(task.output_slots):
+    if count != len(task.output_slots):
         raise RuntimeError(
             "RIFE returned a different frame count than reserved output slots"
         )
-
-    for slot, frame in zip(task.output_slots, generated):
-        np.copyto(
-            context.frame_output_view[slot],
-            frame,
-            casting="no",
-        )
-
-    return RIFEResult(count=len(generated))
+    return RIFEResult(count=count)
 
 
 def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
     frame = resolve_frame(context, task.frame)
 
     if context.dtype == np.dtype(np.uint8):
-        from . import v51_runtime as v51
-
-        result_cuda = v51._infer_cuda_u8_tensor(
+        result_cuda = infer_cuda_u8_tensor(
             context.sr_model,
             frame,
             context.device,
@@ -167,8 +153,6 @@ Handler = Callable[[WorkerContext, object], object]
 
 
 def build_handlers() -> dict[TaskKind, Handler]:
-    """Return the task registry consumed by the generic GPU worker loop."""
-
     return {
         TaskKind.BVS: run_bvs,
         TaskKind.RIFE: run_rife,

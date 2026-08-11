@@ -70,6 +70,14 @@ class SchedulerState:
         self.rife_jobs = 0
         self.sr_jobs = 0
 
+        self.gpu_seconds_by_kind = {
+            TaskKind.BVS: 0.0,
+            TaskKind.RIFE: 0.0,
+            TaskKind.SR: 0.0,
+        }
+        self.gpu_seconds_by_worker = [0.0 for _ in self.gpu_ids]
+        self.gpu_timing_samples = 0
+
         self.timeout_by_kind = {
             TaskKind.BVS: 300.0,
             TaskKind.RIFE: 180.0,
@@ -80,6 +88,19 @@ class SchedulerState:
         value = self.next_task_id
         self.next_task_id += 1
         return value
+
+    def record_gpu_timing(
+        self,
+        worker_id: int,
+        kind: TaskKind,
+        seconds: float | None,
+    ) -> None:
+        if seconds is None:
+            return
+        value = max(0.0, float(seconds))
+        self.gpu_seconds_by_kind[kind] += value
+        self.gpu_seconds_by_worker[worker_id] += value
+        self.gpu_timing_samples += 1
 
     def claim_targets(self, targets: Sequence[int]) -> None:
         for target in targets:

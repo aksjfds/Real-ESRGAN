@@ -3,41 +3,33 @@
 from __future__ import annotations
 
 from fractions import Fraction
-import sys
-import time
 from pathlib import Path
+import time
 
 import numpy as np
-from tqdm import tqdm
 
-from . import pipeline as base_pipeline
 from . import runtime as base
 from .clip_source import ClipSource
 from .gpu_workers import UnifiedGPUWorkers
+from .output_runtime import OutputPump, create_progress
 from .scheduler_loop import run_scheduler
 from .scheduler_state import SchedulerState
 from .timeline import TimelinePlanner, ceil_fraction
 
 
 def process_video(args) -> None:
-    requested_gpu_ids = base_pipeline.base.parse_gpu_ids(args.gpu_ids)
+    requested_gpu_ids = base.parse_gpu_ids(args.gpu_ids)
     if len(requested_gpu_ids) < 2:
         raise RuntimeError(
             "Unified GPU scheduling requires at least two CUDA GPUs"
         )
     if any(gpu is None for gpu in requested_gpu_ids):
-        raise RuntimeError(
-            "Unified GPU scheduling requires CUDA GPUs"
-        )
-    if (
-        base_pipeline.base._require_encoder is None
-        or base_pipeline.base._writer_type is None
-    ):
+        raise RuntimeError("Unified GPU scheduling requires CUDA GPUs")
+    if base._require_encoder is None or base._writer_type is None:
         raise RuntimeError(
             "Encoding backend is not configured. Run through root inference.py."
         )
 
-    base = base_pipeline.base
     base.require_binary(args.ffmpeg_bin)
     base.require_binary(args.ffprobe_bin)
     base._require_encoder(args.ffmpeg_bin, args.video_codec)
@@ -195,6 +187,7 @@ def process_video(args) -> None:
         batch_size=batch_size,
         rife_enabled=rife_enabled,
         source_fps=source_fps,
+        gpu_timing=bool(args.gpu_timing),
     )
 
     writer = None
@@ -208,7 +201,7 @@ def process_video(args) -> None:
     worker_model_time = 0.0
     flush_time = 0.0
     audio_time = 0.0
-    scheduler_idle = 0.0
+    scheduler_wait = 0.0
     state = None
     clean = False
 
@@ -268,6 +261,7 @@ def process_video(args) -> None:
             dtype=dtype,
             input_slots=input_slots,
             frame_output_slots=frame_output_slots,
+            enable_gpu_timing=bool(args.gpu_timing),
         )
         worker_model_time = time.monotonic() - model_started
 
@@ -278,21 +272,14 @@ def process_video(args) -> None:
             flush=True,
         )
         print(
-            "Pipeline: locality-aware scheduling prefers the GPU that "
-            "already owns each FrameHandle",
+            "Pipeline: event-driven control IPC | locality-aware "
+            "FrameHandle scheduling",
             flush=True,
         )
         print(flush=True)
 
-        progress = tqdm(
-            total=expected_output,
-            desc="Real-ESRGAN",
-            unit="frame",
-            dynamic_ncols=True,
-            mininterval=1.0,
-            file=sys.stdout,
-        )
-        pump = base_pipeline.OutputPump(
+        progress = create_progress(expected_output)
+        pump = OutputPump(
             workers,
             writer,
             out_w,
@@ -310,7 +297,7 @@ def process_video(args) -> None:
             bvs_headroom=bvs_headroom,
             expected_output=expected_output,
         )
-        scheduler_idle = run_scheduler(
+        scheduler_wait = run_scheduler(
             state,
             pump,
             expected_output,
@@ -398,7 +385,7 @@ def process_video(args) -> None:
         worker_model_time=worker_model_time,
         decode_elapsed=decode_elapsed,
         state=state,
-        scheduler_idle=scheduler_idle,
+        scheduler_wait=scheduler_wait,
         pump=pump,
         flush_time=flush_time,
         audio_time=audio_time,

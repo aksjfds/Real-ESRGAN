@@ -1,6 +1,6 @@
 # Real-ESRGAN 动画视频推理
 
-当前 v6.2 流水线：
+当前 v6.3 流水线：
 
 ```text
 FFmpeg 解码
@@ -13,29 +13,30 @@ FFmpeg 解码
 
 ## 版本
 
-- v4.3 代码基线：`90208548939f7b59ae08ff7db7f338b41b703e22`
+- v4.3：早期代码基线。
 - v5.8：固定 BVS 参数 + selective channels_last。
 - v6.0：加入 Practical-RIFE 4.25。
-- v6.1：多 GPU 重构为一张 GPU 一个常驻 `spawn` 子进程，BVS / RIFE / SR 独立 task。
-- v6.2：调度模块拆分、typed task protocol、FrameHandle 引用计数与 locality-aware 调度；同 GPU 中间帧不再往返主进程复制。
+- v6.1：一张 GPU 一个常驻 `spawn` 子进程，BVS / RIFE / SR 独立 task。
+- v6.2：typed task protocol、FrameHandle 引用计数、locality-aware 调度。
+- v6.3：去除当前活动路径的运行时 monkey-patch，显式 BVS/RIFE/SR runtime，事件驱动 IPC，RIFE compact H2D/direct-slot 输出，原生 GPU timing 和显式 progress/output runtime。
 
-## 结构
+## 当前结构
 
-- `inference.py`：统一 CLI，BasicVSR++ / RIFE 参数校验。
-- `realesrgan.ipynb`：Kaggle Notebook。
-- `inference/basicvsrpp.py`：BasicVSR++ NTIRE Track 1 模型。
-- `inference/rife425.py`：Practical-RIFE 4.25 inference-only 模型与权重缓存。
-- `inference/v52_scheduler.py`：兼容入口，转发到模块化 scheduler。
-- `inference/scheduler.py`：视频编排；不直接执行 CUDA 模型。
-- `inference/scheduler_state.py` / `scheduler_loop.py`：调度状态、策略、结果处理与 watchdog。
+- `inference.py`：当前 CLI；只暴露 `RIFE_FPS`，不再构造或删除遗留 `--fps` 参数。
+- `inference/scheduler.py`：CPU 视频编排，不直接执行 CUDA 模型。
+- `inference/scheduler_state.py` / `scheduler_loop.py`：任务策略、状态、结果处理、watchdog 和事件驱动等待。
 - `inference/task_protocol.py`：BVS / RIFE / SR typed task/result protocol。
-- `inference/gpu_transport.py` / `gpu_worker_process.py`：一 GPU 一进程、共享内存与进程生命周期。
-- `inference/gpu_workers.py` / `frame_pool.py`：FrameHandle、slot 引用计数与 locality-aware 数据传递。
-- `inference/clip_source.py` / `timeline.py` / `scene_metrics.py`：CPU clip、目标时间轴和场景检测。
+- `inference/gpu_transport.py`：一 GPU 一进程、共享内存、Pipe 控制通道、worker 生命周期。
+- `inference/gpu_workers.py` / `frame_pool.py`：FrameHandle、slot 引用计数和 locality-aware 数据传递。
+- `inference/gpu_worker_process.py`：固定 CUDA device context 的 worker 主循环。
 - `inference/gpu_task_handlers.py`：GPU task handler registry。
-- `inference/v54_runtime.py`：BVS warp grid cache、临时张量削减、8-bit 紧凑 H2D、selective channels_last。
-- `inference/pipeline.py`：输出泵、FFmpeg 解码等基础能力。
-- `encode/`：HEVC / AV1 编码后端。
+- `inference/optimized_basicvsrpp.py`：显式 BasicVSR++ 执行优化类；替代 `v54_runtime` monkey-patch。
+- `inference/optimized_rife425.py`：RIFE 4.25 compact H2D 和 direct shared-slot 输出。
+- `inference/sr_runtime.py`：显式 Real-ESRGAN uint8 CUDA helper。
+- `inference/output_runtime.py`：输出 pump、Lanczos4 resize、交互/批处理 progress。
+- `inference/clip_source.py` / `timeline.py` / `scene_metrics.py`：CPU clip、目标时间轴、场景检测。
+
+旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留用于历史兼容，但当前 v6.3 主路径不再依赖它们。
 
 ## BasicVSR++ 固定参数
 
@@ -49,45 +50,26 @@ tile_pad=32
 scene_threshold=0.30
 ```
 
-不使用 `SOURCE_PROFILE` 或 autotuner。若 `tile=640` OOM，只向 `384 / 320 / 256` 回退。
+若 `tile=640` OOM，只向 `384 / 320 / 256` 回退。当前版本不包含 `torch.compile`。
 
 ## RIFE 4.25 / 输出帧率
 
-Notebook 只保留一个帧率参数：
+Notebook 只保留：
 
 ```python
 RIFE_FPS = 60
 ```
 
-不提供独立的 `FPS = "source"` / `--fps` 配置。`RIFE_FPS` 同时是 RIFE 目标帧率和最终输出帧率，并且必须大于或等于源视频帧率。
+`RIFE_FPS` 同时是插帧目标帧率和最终输出帧率，并且必须大于或等于源视频帧率。等于源帧率时绕过 RIFE；高于源帧率时按目标 CFR 时间轴生成真实 arbitrary timestep。
 
-当 `RIFE_FPS` 等于源帧率时绕过 RIFE；高于源帧率时，根据目标 CFR 时间轴计算真实 interpolation timestep。例如 24 → 60 FPS 直接生成 60 FPS 时间点所需的中间帧，不先升到 120 FPS 再丢帧。
+场景保护：
 
-RIFE 位于 BasicVSR++ 之后、Real-ESRGAN 之前：
+- `scene_difference <= 0.002`：近重复/静止，不调用 RIFE。
+- `scene_difference >= 0.30`：场景切换，不跨镜头插帧。
 
-- BasicVSR++ 仍只处理源帧率。
-- RIFE 只处理源分辨率恢复帧。
-- Real-ESRGAN 接收真实目标 FPS 帧流。
-- Writer 直接以目标帧率接收帧，不由 FFmpeg `fps` filter 补重复帧。
+RIFE 8-bit 输入现在保持 `uint8` 通过 H2D，再在 CUDA 上转换/归一化；生成的 8-bit 帧从 CUDA 直接复制到预留 shared-memory slot，不再经过额外 CPU ndarray 中间副本。10-bit 路径保持保守兼容实现。
 
-### 场景切换和重复帧
-
-- `scene_difference <= 0.002`：视为近重复/静止，不调用 RIFE。
-- `scene_difference >= 0.30`：视为场景切换，不跨镜头插帧。
-
-### 模型与 checkpoint
-
-Practical-RIFE 4.25 首次使用时下载 `RIFEv4.25_0919.zip`，提取 `flownet.pkl` 并缓存到：
-
-```text
-~/.cache/realesrgan/rife-v4.25/flownet.pkl
-```
-
-加载时只过滤官方 checkpoint 中已知的 training-only `teacher.*` / `caltime.*` 参数，剩余 IFNet 推理权重执行 strict 校验。
-
-## v6.2 多 GPU 调度
-
-稳定边界固定为：
+## 多 GPU 稳定边界
 
 ```text
 Main Scheduler
@@ -95,33 +77,17 @@ Main Scheduler
 └─ cuda:1 spawn process → BVS / RIFE / SR handlers
 ```
 
-每个 GPU 子进程在整个运行期间保持固定 CUDA affinity；不存在共享 CUDA `ThreadPoolExecutor`。BVS、RIFE、SR 是三个独立 task，新增 GPU 功能应新增 task/handler，而不是修改进程模型。
+每个 GPU 子进程在整个运行期间保持固定 `torch.cuda.device(...)` context。当前主路径不存在共享 CUDA `ThreadPoolExecutor`，也不在任务级反复 `torch.cuda.set_device()`。
 
-中间恢复帧由 `FrameHandle(worker_id, slot, generation)` 引用共享内存 slot。引用计数保证 slot 只有在所有消费者完成后才能复用，并检测 stale handle / refcount underflow。
+BVS、RIFE、SR 始终是独立 task。中间帧通过 `FrameHandle(worker_id, slot, generation)` 引用共享 slot；优先在已有数据的 GPU 上执行下一阶段，只有负载均衡需要时才进行跨 GPU CPU shared-memory copy。
 
-调度器优先把 RIFE / SR 派给已经持有输入 FrameHandle 的 GPU：
+控制 IPC 使用 per-worker Pipe + `multiprocessing.connection.wait()`；worker task queue 使用 `SimpleQueue`。scheduler 没有固定 10ms polling sleep，输出 slot 释放也会主动唤醒 scheduler。
 
-```text
-同 GPU：FrameHandle → worker-local shared slot → 下一 task
-跨 GPU：仅在负载均衡需要时复制一次到目标 worker input slot
-```
+启动前在 Linux 上检查 `/dev/shm` 可用容量，避免 shared-memory 不足时运行到中途才出现不明确故障。
 
-因此 v6.2 去除了 v6.1 `take_frames(copy=True) → 主进程 ndarray → 再复制回 worker` 的固定中间往返，同时保留跨 GPU 动态负载均衡。
+## GPU timing
 
-worker 会报告 `STARTED / RESULT / ERROR`；scheduler 检查进程存活和分阶段 timeout，并每 30 秒输出 `[gpu-status]`，避免静默卡在 0%。
-
-## v5.8 selective channels_last
-
-BasicVSR++ 仅对主要 Conv2d-heavy 区域转换 Conv2d 权重 memory format：
-
-- `feat_extract`
-- `backward_1`
-- `forward_1`
-- `backward_2`
-- `forward_2`
-- `reconstruction`
-
-SPyNet、deformable alignment / `deform_conv2d`、`conv_offset`、PixelShuffle、`conv_hr`、`conv_last` 保持原路径。当前版本不包含 `torch.compile`。
+`--gpu-timing` 现在直接在 GPU worker 内围绕 BVS/RIFE/SR handler 使用 CUDA Event，并通过 typed `TaskResult` 返回统计。关闭时不创建 CUDA Event；开启时因显式同步会产生 profiling 开销。
 
 ## Kaggle 参数
 
@@ -129,9 +95,7 @@ SPyNet、deformable alignment / `deform_conv2d`、`conv_offset`、PixelShuffle�
 MODEL = "realesr-animevideov3"
 SCALE = 2
 RIFE_FPS = 60
-
 GPU_IDS = "0,1"
-
 BVS_TILE_SIZE = 640
 BVS_CLIP_LENGTH = 13
 BVS_BATCH_SIZE = 1

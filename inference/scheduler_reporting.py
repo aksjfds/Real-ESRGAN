@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .task_protocol import TaskKind
+
 
 def print_run_header(
     *,
@@ -28,6 +30,7 @@ def print_run_header(
     batch_size: int,
     rife_enabled: bool,
     source_fps: float,
+    gpu_timing: bool,
 ) -> None:
     print("=== Real-ESRGAN ===", flush=True)
     print(
@@ -72,9 +75,10 @@ def print_run_header(
         "permanent CUDA affinity | BVS + RIFE + SR",
         flush=True,
     )
+    timing_text = "on" if gpu_timing else "off"
     print(
-        "Mode    : typed independent tasks | persistent FrameHandle slots | "
-        "same-GPU intermediate copy bypass",
+        "Mode    : typed independent tasks | FrameHandle locality | "
+        f"event-driven IPC | gpu_timing={timing_text}",
         flush=True,
     )
     print(flush=True)
@@ -91,7 +95,7 @@ def print_completed(
     worker_model_time: float,
     decode_elapsed: float,
     state,
-    scheduler_idle: float,
+    scheduler_wait: float,
     pump,
     flush_time: float,
     audio_time: float,
@@ -123,12 +127,28 @@ def print_completed(
         f"rife={state.rife_seconds:.1f}s/"
         f"{state.rife_frames} generated | "
         f"sr={state.sr_seconds:.1f}s/{state.sr_jobs} frames | "
-        f"scheduler_idle={scheduler_idle:.1f}s | "
+        f"scheduler_wait={scheduler_wait:.1f}s | "
         f"resize={pump.resize_seconds:.1f}s | "
         f"write={pump.write_seconds:.1f}s | "
         f"flush={flush_time:.1f}s | audio={audio_time:.1f}s",
         flush=True,
     )
+    if state.gpu_timing_samples:
+        per_worker = " | ".join(
+            f"cuda:{gpu_id}={seconds:.1f}s"
+            for gpu_id, seconds in zip(
+                state.gpu_ids,
+                state.gpu_seconds_by_worker,
+            )
+        )
+        print(
+            "GPU time: "
+            f"BVS={state.gpu_seconds_by_kind[TaskKind.BVS]:.1f}s | "
+            f"RIFE={state.gpu_seconds_by_kind[TaskKind.RIFE]:.1f}s | "
+            f"SR={state.gpu_seconds_by_kind[TaskKind.SR]:.1f}s | "
+            + per_worker,
+            flush=True,
+        )
     print(
         f"BasicVSR: tile={selected_tile} | clip={clip_length} | "
         f"batch={batch_size} | strength={strength:.2f} | "

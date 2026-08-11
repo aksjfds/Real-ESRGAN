@@ -1,102 +1,127 @@
 #!/usr/bin/env python3
 """Unified Real-ESRGAN video inference entry point."""
+
 from __future__ import annotations
 
+import argparse
 import multiprocessing as mp
-from pathlib import Path
 
 from encode import runtime as encode_runtime
 from inference import runtime as inference_runtime
 from inference import v52_scheduler as inference_pipeline
-from inference.progress_log import install_persistent_progress
-from inference.v51_runtime import install_pipeline_optimizations
 
 
-def _validate_basicvsrpp_args(args) -> None:
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="BVS + RIFE + Real-ESRGAN multi-GPU video inference.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--input", required=True, help="Input video path")
+    parser.add_argument("--output", required=True, help="Output MP4 path")
+    parser.add_argument(
+        "--model",
+        choices=tuple(inference_runtime.MODEL_URLS),
+        default="realesr-animevideov3",
+    )
+    parser.add_argument(
+        "--model-path",
+        default="",
+        help="Optional local .pth override",
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=2.0,
+        help="Final output scale",
+    )
+    parser.add_argument(
+        "--gpu-ids",
+        default="0,1",
+        help="Comma-separated CUDA GPU IDs",
+    )
+    parser.add_argument(
+        "--audio-codec",
+        choices=("aac", "copy"),
+        default="aac",
+    )
+    parser.add_argument("--audio-bitrate", default="192k")
+    parser.add_argument(
+        "--start-time",
+        type=float,
+        default=0.0,
+        help="Source start in seconds",
+    )
+    parser.add_argument(
+        "--test-seconds",
+        type=float,
+        default=0.0,
+        help="0 processes to end; use 10 for a test",
+    )
+    parser.add_argument("--ffmpeg-bin", default="ffmpeg")
+    parser.add_argument("--ffprobe-bin", default="ffprobe")
+
+    parser.add_argument(
+        "--bvs-tile-size",
+        type=int,
+        default=640,
+        help="BasicVSR++ spatial tile size",
+    )
+    parser.add_argument(
+        "--bvs-clip-length",
+        type=int,
+        default=13,
+        help="BasicVSR++ temporal clip length",
+    )
+    parser.add_argument(
+        "--bvs-batch-size",
+        type=int,
+        default=1,
+        help="Independent BasicVSR++ clips per GPU task",
+    )
+    parser.add_argument(
+        "--bvs-strength",
+        type=float,
+        default=1.0,
+        help="BasicVSR++ residual blend strength in (0,1]",
+    )
+    parser.add_argument(
+        "--rife-fps",
+        type=float,
+        default=60.0,
+        help="Practical-RIFE 4.25 target/output FPS; must be >= source FPS",
+    )
+    parser.add_argument(
+        "--gpu-timing",
+        action="store_true",
+        help=(
+            "Enable native per-task CUDA Event timing. "
+            "Adds synchronization overhead only when enabled."
+        ),
+    )
+    encode_runtime.extend_parser(parser)
+    return parser
+
+
+def _validate_args(args) -> None:
     if not 0.0 < float(args.bvs_strength) <= 1.0:
         raise ValueError("--bvs-strength must be in (0, 1]")
     if int(args.bvs_clip_length) < 2:
         raise ValueError("--bvs-clip-length must be at least 2")
     if int(args.bvs_tile_size) < 256 or int(args.bvs_tile_size) % 4:
-        raise ValueError("--bvs-tile-size must be >=256 and divisible by 4")
+        raise ValueError(
+            "--bvs-tile-size must be >=256 and divisible by 4"
+        )
     if int(args.bvs_batch_size) < 1:
         raise ValueError("--bvs-batch-size must be at least 1")
     if float(args.rife_fps) <= 0:
         raise ValueError("--rife-fps must be positive")
 
 
-def _remove_legacy_fps_argument(parser) -> None:
-    """Remove the inherited --fps knob; v6.0 output FPS is owned by RIFE_FPS."""
-    for action in list(parser._actions):
-        if action.dest != "fps":
-            continue
-        parser._remove_action(action)
-        for option in action.option_strings:
-            parser._option_string_actions.pop(option, None)
-        break
-
-
-def _validate_rife_target(args) -> None:
-    """Reject down-FPS requests before loading any GPU model."""
-    input_path = Path(args.input).expanduser().resolve()
-    if not input_path.is_file():
-        raise FileNotFoundError(f"Input video not found: {input_path}")
-    inference_runtime.require_binary(args.ffprobe_bin)
-    info = inference_runtime.probe_video(input_path, args.ffprobe_bin)
-    source_fps = float(info.fps)
-    target_fps = float(args.rife_fps)
-    if target_fps + 1e-9 < source_fps:
-        raise ValueError(
-            f"--rife-fps must be >= source FPS; got target={target_fps:g}, "
-            f"source={source_fps:.6g}"
-        )
-    # v52_scheduler still consumes the shared runtime's legacy args.fps field.
-    # Keep it internal and fixed to source; users can no longer set it.
-    args.fps = "source"
-
-
 def main() -> None:
-    parser = inference_runtime.build_parser()
-    _remove_legacy_fps_argument(parser)
-    parser.add_argument("--bvs-tile-size", type=int, default=640,
-                        help="BasicVSR++ spatial tile size. Default: 640.")
-    parser.add_argument("--bvs-clip-length", type=int, default=13,
-                        help="BasicVSR++ temporal clip length. Default: 13.")
-    parser.add_argument("--bvs-batch-size", type=int, default=1,
-                        help="Independent BasicVSR++ clips per GPU task. Default: 1.")
-    parser.add_argument("--bvs-strength", type=float, default=1.0,
-                        help="BasicVSR++ residual blend strength in (0,1]. Default: 1.0.")
-    parser.add_argument(
-        "--rife-fps",
-        type=float,
-        default=60.0,
-        help="Practical-RIFE 4.25 target/output FPS; must be >= source FPS. Default: 60.",
-    )
-    parser.add_argument(
-        "--gpu-timing",
-        action="store_true",
-        help="Enable CUDA-event GPU busy/wait diagnostics (adds profiling overhead).",
-    )
-    encode_runtime.extend_parser(parser)
+    parser = _build_parser()
     args = parser.parse_args()
-    _validate_basicvsrpp_args(args)
-    _validate_rife_target(args)
+    _validate_args(args)
     encode_runtime.prepare_runtime(inference_runtime, args)
-
-    install_pipeline_optimizations()
-    install_persistent_progress()
-
-    from inference import basicvsrpp
-    from inference.checkpoint_parts import resolve_checkpoint
-    from inference.v54_runtime import install_basicvsrpp_execution_optimizations
-
-    basicvsrpp.download_checkpoint = resolve_checkpoint
-    install_basicvsrpp_execution_optimizations()
-
-    if args.gpu_timing:
-        from inference.gpu_timing import install_gpu_timing
-        install_gpu_timing(enable_bvs=True)
-
     inference_pipeline.process_video(args)
 
 
