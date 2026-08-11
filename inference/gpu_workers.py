@@ -195,8 +195,8 @@ class UnifiedGPUWorkers(GPUWorkerTransport):
         task_id: int,
         frame_id: int,
         frame: FrameHandle,
-    ) -> tuple[FrameHandle, ...]:
-        self.claim_sr_output(worker_id)
+    ) -> tuple[tuple[FrameHandle, ...], int]:
+        output_slot = self.claim_sr_output(worker_id)
         deferred: tuple[FrameHandle, ...] = ()
 
         try:
@@ -210,12 +210,12 @@ class UnifiedGPUWorkers(GPUWorkerTransport):
                     task_id=int(task_id),
                     frame_id=int(frame_id),
                     frame=frame_input,
+                    output_slot=int(output_slot),
                 )
             )
         except Exception:
-            with self._sr_lock:
-                self._sr_available[worker_id] = True
+            self.release(worker_id, output_slot)
             self.frames.release_many(deferred)
             raise
 
-        return deferred
+        return deferred, output_slot

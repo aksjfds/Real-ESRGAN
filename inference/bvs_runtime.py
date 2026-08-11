@@ -10,11 +10,19 @@ import torch
 from torch.nn import functional as F
 
 from . import basicvsrpp_api as api
+from .frame_transport import PinnedH2DStager
 from .optimized_basicvsrpp import OptimizedBasicVSRPPPreprocessor
 
 
 class BasicVSRRuntime(OptimizedBasicVSRPPPreprocessor):
     """Preserve v5.8 math while keeping uint8 BVS results on CUDA."""
+
+    def _stage_h2d(self, clip_cpu: torch.Tensor) -> torch.Tensor:
+        stager = getattr(self, "_pinned_h2d_stager", None)
+        if stager is None:
+            stager = PinnedH2DStager(self.device)
+            self._pinned_h2d_stager = stager
+        return stager.copy(clip_cpu)
 
     def _run_model_device(self, clip_gpu: torch.Tensor) -> torch.Tensor:
         padded, original_h, original_w = api.pad_to_model_size(clip_gpu)
@@ -52,7 +60,7 @@ class BasicVSRRuntime(OptimizedBasicVSRPPPreprocessor):
         clip_cpu: torch.Tensor,
         tile_size: int,
     ) -> torch.Tensor:
-        original_u8 = clip_cpu.to(device=self.device, non_blocking=True)
+        original_u8 = self._stage_h2d(clip_cpu)
         original = original_u8.to(dtype=torch.float32)
         original.div_(255.0)
         del original_u8

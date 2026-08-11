@@ -1,9 +1,11 @@
-"""CUDA-to-shared-memory frame transport helpers.
+"""Pinned host/device transfer helpers for the GPU video pipeline.
 
-This module owns the GPU-to-host transport boundary used by GPU task handlers.
-Model runtimes return CUDA tensors; task handlers decide which frames are emitted;
-this helper performs one blocking D2H transfer per emitted batch and copies the
-result into pre-reserved shared-memory slots.
+CUDA model outputs are drained through reusable page-locked host buffers on
+non-default copy streams. H2D input staging likewise reuses pinned buffers so
+large shared-memory frames do not pay pageable-memory DMA staging on every task.
+The scheduler separates CUDA compute completion from transport completion, which
+lets the opposite stage overlap copy/CPU drain without running two heavy model
+compute phases at the same time.
 """
 
 from __future__ import annotations
@@ -14,10 +16,131 @@ import numpy as np
 import torch
 
 
+class _H2DSlot:
+    def __init__(self) -> None:
+        self.buffer: torch.Tensor | None = None
+        self.shape: tuple[int, ...] | None = None
+        self.dtype: torch.dtype | None = None
+        self.event: torch.cuda.Event | None = None
+
+
+class PinnedH2DStager:
+    """Reusable pinned CPU input staging and asynchronous H2D copy."""
+
+    def __init__(self, device: torch.device, slots: int = 1) -> None:
+        if device.type != "cuda":
+            raise ValueError("PinnedH2DStager requires a CUDA device")
+        if int(slots) < 1:
+            raise ValueError("PinnedH2DStager slots must be positive")
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self._slots = [_H2DSlot() for _ in range(int(slots))]
+        self._cursor = 0
+
+    @staticmethod
+    def _ensure(source: torch.Tensor, slot: _H2DSlot) -> torch.Tensor:
+        shape = tuple(int(value) for value in source.shape)
+        if (
+            slot.buffer is None
+            or slot.shape != shape
+            or slot.dtype != source.dtype
+        ):
+            slot.buffer = torch.empty(
+                shape,
+                dtype=source.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            slot.shape = shape
+            slot.dtype = source.dtype
+        return slot.buffer
+
+    def copy(self, source: torch.Tensor) -> torch.Tensor:
+        """Stage a CPU tensor in pinned memory and enqueue H2D on a copy stream."""
+        if source.device.type != "cpu":
+            raise RuntimeError(
+                f"Expected CPU source, got device={source.device}"
+            )
+
+        slot = self._slots[self._cursor]
+        self._cursor = (self._cursor + 1) % len(self._slots)
+
+        # A pinned host buffer must not be modified while an async DMA still
+        # reads from it. Ring slots let paired RIFE inputs queue back-to-back;
+        # reuse waits only when the ring wraps around.
+        if slot.event is not None:
+            slot.event.synchronize()
+            slot.event = None
+
+        host = self._ensure(source, slot)
+        host.copy_(source, non_blocking=False)
+
+        with torch.cuda.stream(self.stream):
+            device_tensor = host.to(self.device, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(self.stream)
+
+        consumer = torch.cuda.current_stream(self.device)
+        consumer.wait_event(event)
+        device_tensor.record_stream(consumer)
+        slot.event = event
+        return device_tensor
+
+
+class PinnedD2HStager:
+    """Reusable pinned CPU staging for one CUDA worker process."""
+
+    def __init__(self, device: torch.device) -> None:
+        if device.type != "cuda":
+            raise ValueError("PinnedD2HStager requires a CUDA device")
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self.buffer: torch.Tensor | None = None
+        self._shape: tuple[int, ...] | None = None
+        self._dtype: torch.dtype | None = None
+
+    def _ensure(self, source: torch.Tensor) -> torch.Tensor:
+        shape = tuple(int(value) for value in source.shape)
+        if (
+            self.buffer is None
+            or self._shape != shape
+            or self._dtype != source.dtype
+        ):
+            self.buffer = torch.empty(
+                shape,
+                dtype=source.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._shape = shape
+            self._dtype = source.dtype
+        return self.buffer
+
+    def copy(self, source: torch.Tensor) -> np.ndarray:
+        """Drain one contiguous CUDA tensor to pinned host memory."""
+        if source.device.type != "cuda":
+            raise RuntimeError(
+                f"Expected CUDA source, got device={source.device}"
+            )
+        if not source.is_contiguous():
+            raise RuntimeError(
+                "D2H source must be contiguous before the compute boundary"
+            )
+        host = self._ensure(source)
+
+        producer = torch.cuda.current_stream(self.device)
+        self.stream.wait_stream(producer)
+        with torch.cuda.stream(self.stream):
+            host.copy_(source, non_blocking=True)
+        self.stream.synchronize()
+        return host.numpy()
+
+
 def copy_cuda_frames_to_slots(
     frames: torch.Tensor,
     output_view: np.ndarray,
     slots: Sequence[int],
+    stager: PinnedD2HStager | None = None,
 ) -> None:
     """Copy one CUDA frame batch into shared-memory slots with one D2H sync."""
     if frames.device.type != "cuda":
@@ -64,10 +187,8 @@ def copy_cuda_frames_to_slots(
     if count == 0:
         return
 
-    # GPU -> CPU in the reverse direction is only safe to consume after the
-    # transfer completes. A single blocking batch copy avoids the previous
-    # per-frame synchronization while keeping correctness explicit.
-    frames_cpu = frames.contiguous().cpu().numpy()
+    transfer = stager or PinnedD2HStager(frames.device)
+    frames_cpu = transfer.copy(frames)
     if frames_cpu.dtype != output_view.dtype:
         raise TypeError(
             "BVS transport dtype changed during D2H: "
@@ -76,3 +197,28 @@ def copy_cuda_frames_to_slots(
 
     for slot, frame in zip(slot_ids, frames_cpu):
         np.copyto(output_view[slot], frame, casting="no")
+
+
+def copy_cuda_frame_to_array(
+    frame: torch.Tensor,
+    output_view: np.ndarray,
+    stager: PinnedD2HStager,
+) -> None:
+    """Drain one CUDA HWC frame into an existing shared-memory ndarray."""
+    if frame.device.type != "cuda":
+        raise RuntimeError(
+            f"Expected CUDA SR output, got device={frame.device}"
+        )
+    expected_shape = tuple(int(value) for value in output_view.shape)
+    actual_shape = tuple(int(value) for value in frame.shape)
+    if actual_shape != expected_shape:
+        raise RuntimeError(
+            f"SR transport shape mismatch: {actual_shape} != {expected_shape}"
+        )
+
+    frame_cpu = stager.copy(frame)
+    if frame_cpu.dtype != output_view.dtype:
+        raise TypeError(
+            f"SR transport dtype mismatch: {frame_cpu.dtype} != {output_view.dtype}"
+        )
+    np.copyto(output_view, frame_cpu, casting="no")

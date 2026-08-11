@@ -43,7 +43,7 @@ class SchedulerState:
         self.bvs_headroom = int(bvs_headroom)
         self.expected_output = int(expected_output)
 
-        self.pending: dict[int, int] = {}
+        self.pending: dict[int, tuple[int, int]] = {}
         self.next_output = 0
         self.next_source_id = 0
         self.next_interval = 0
@@ -55,7 +55,15 @@ class SchedulerState:
         self.restored_sources: dict[int, FrameHandle] = {}
         self.restored_heap: list[tuple[int, FrameHandle]] = []
         self.rife_queue = deque()
-        self.active: list[ActiveTask | None] = [
+
+        # Each physical GPU owns two persistent process roles. A role stays
+        # occupied until its complete TaskResult arrives, but compute_done=True
+        # releases the physical CUDA compute lane so the opposite role may run
+        # while this task drains D2H / shared-memory / CPU transport.
+        self.temporal_active: list[ActiveTask | None] = [
+            None for _ in self.gpu_ids
+        ]
+        self.sr_active: list[ActiveTask | None] = [
             None for _ in self.gpu_ids
         ]
 
@@ -88,6 +96,53 @@ class SchedulerState:
         value = self.next_task_id
         self.next_task_id += 1
         return value
+
+    def active_for_kind(
+        self,
+        worker_id: int,
+        kind: TaskKind,
+    ) -> ActiveTask | None:
+        if kind is TaskKind.SR:
+            return self.sr_active[worker_id]
+        return self.temporal_active[worker_id]
+
+    def clear_active(self, worker_id: int, kind: TaskKind) -> None:
+        if kind is TaskKind.SR:
+            self.sr_active[worker_id] = None
+        else:
+            self.temporal_active[worker_id] = None
+
+    def compute_busy(self, worker_id: int) -> bool:
+        return any(
+            item is not None and not item.compute_done
+            for item in (
+                self.temporal_active[worker_id],
+                self.sr_active[worker_id],
+            )
+        )
+
+    def mark_compute_done(
+        self,
+        worker_id: int,
+        task_id: int,
+        kind: TaskKind,
+    ) -> None:
+        active = self.active_for_kind(worker_id, kind)
+        if (
+            active is None
+            or active.task_id != task_id
+            or active.kind is not kind
+        ):
+            raise RuntimeError(
+                "Unexpected worker compute completion: "
+                f"gpu={worker_id} task={task_id}/{kind.value}"
+            )
+        if active.compute_done:
+            raise RuntimeError(
+                "Duplicate worker compute completion: "
+                f"gpu={worker_id} task={task_id}/{kind.value}"
+            )
+        active.compute_done = True
 
     def record_gpu_timing(
         self,
@@ -194,6 +249,10 @@ class SchedulerState:
     def schedule_bvs(self, worker_id: int) -> bool:
         if self.bvs_eof:
             return False
+        if self.temporal_active[worker_id] is not None:
+            return False
+        if self.compute_busy(worker_id):
+            return False
         if (
             self.workers.available_frame_slots(worker_id)
             < self.bvs_headroom
@@ -226,7 +285,7 @@ class SchedulerState:
             task_id,
             groups,
         )
-        self.active[worker_id] = ActiveTask(
+        self.temporal_active[worker_id] = ActiveTask(
             task_id=task_id,
             kind=TaskKind.BVS,
             submitted_at=time.monotonic(),
@@ -245,6 +304,11 @@ class SchedulerState:
         *,
         local_only: bool,
     ) -> bool:
+        if self.temporal_active[worker_id] is not None:
+            return False
+        if self.compute_busy(worker_id):
+            return False
+
         job = pop_preferred_rife(
             self.rife_queue,
             worker_id,
@@ -262,7 +326,7 @@ class SchedulerState:
             job.frame1,
             job.timesteps,
         )
-        self.active[worker_id] = ActiveTask(
+        self.temporal_active[worker_id] = ActiveTask(
             task_id=task_id,
             kind=TaskKind.RIFE,
             submitted_at=time.monotonic(),
@@ -282,6 +346,10 @@ class SchedulerState:
         *,
         local_only: bool,
     ) -> bool:
+        if self.sr_active[worker_id] is not None:
+            return False
+        if self.compute_busy(worker_id):
+            return False
         if not self.workers.can_submit_sr(worker_id):
             return False
 
@@ -295,19 +363,20 @@ class SchedulerState:
 
         frame_id, handle = item
         task_id = self.next_id()
-        deferred = self.workers.submit_sr(
+        deferred, output_slot = self.workers.submit_sr(
             worker_id,
             task_id,
             frame_id,
             handle,
         )
-        self.active[worker_id] = ActiveTask(
+        self.sr_active[worker_id] = ActiveTask(
             task_id=task_id,
             kind=TaskKind.SR,
             submitted_at=time.monotonic(),
             started_at=None,
             meta=SRActive(
                 frame_id=frame_id,
+                output_slot=output_slot,
                 release_on_result=deferred,
             ),
         )
@@ -317,11 +386,13 @@ class SchedulerState:
     def bvs_running(self) -> bool:
         return any(
             item is not None and item.kind is TaskKind.BVS
-            for item in self.active
+            for item in self.temporal_active
         )
 
     def schedule_idle_worker(self, worker_id: int) -> bool:
-        if self.active[worker_id] is not None:
+        # At most one role may own CUDA compute at a time. The opposite role
+        # may be active only when its compute_done flag says it is draining.
+        if self.compute_busy(worker_id):
             return False
 
         if (
@@ -343,7 +414,13 @@ class SchedulerState:
         return False
 
     def all_idle(self) -> bool:
-        return all(item is None for item in self.active)
+        return all(
+            temporal is None and sr is None
+            for temporal, sr in zip(
+                self.temporal_active,
+                self.sr_active,
+            )
+        )
 
     def generation_done(self) -> bool:
         return (

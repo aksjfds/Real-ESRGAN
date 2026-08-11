@@ -20,6 +20,7 @@ from .gpu_task_handlers import (
 )
 from .optimized_rife425 import OptimizedRIFE425Interpolator
 from .task_protocol import (
+    TaskComputeDone,
     TaskError,
     TaskResult,
     TaskStarted,
@@ -67,19 +68,33 @@ def _run_task_loop(
 
         send(TaskStarted(worker_id, task.task_id, task.kind))
         started = time.monotonic()
-        start_event = end_event = None
+        start_event = None
         if enable_gpu_timing:
             start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
 
-        payload = handler(context, task)
+        compute_notified = False
+        gpu_seconds: float | None = None
 
-        gpu_seconds = None
-        if start_event is not None and end_event is not None:
-            end_event.record()
-            end_event.synchronize()
-            gpu_seconds = start_event.elapsed_time(end_event) / 1000.0
+        def notify_compute_done() -> None:
+            nonlocal compute_notified, gpu_seconds
+            if compute_notified:
+                return
+
+            boundary = torch.cuda.Event(enable_timing=enable_gpu_timing)
+            boundary.record()
+            boundary.synchronize()
+            if start_event is not None:
+                gpu_seconds = start_event.elapsed_time(boundary) / 1000.0
+
+            compute_notified = True
+            send(TaskComputeDone(worker_id, task.task_id, task.kind))
+
+        context.compute_done = notify_compute_done
+        payload = handler(context, task)
+        if not compute_notified:
+            notify_compute_done()
+        context.compute_done = None
 
         send(
             TaskResult(
@@ -207,13 +222,13 @@ def gpu_sr_worker_main(
     gpu_id: int,
     task_queue,
     result_conn,
-    sr_output_slot,
     config_dict: dict[str, object],
     input_name: str,
     frame_output_name: str,
     sr_output_name: str,
     input_slots: int,
     frame_output_slots: int,
+    sr_output_buffers: int,
     input_shape: tuple[int, int, int],
     sr_output_shape: tuple[int, int, int],
     dtype_str: str,
@@ -254,7 +269,7 @@ def gpu_sr_worker_main(
                 buffer=frame_output_shm.buf,
             )
             sr_output_view = np.ndarray(
-                sr_output_shape,
+                (sr_output_buffers, *sr_output_shape),
                 dtype=dtype,
                 buffer=sr_output_shm.buf,
             )
@@ -265,8 +280,6 @@ def gpu_sr_worker_main(
                 frame_output_view=frame_output_view,
                 sr_model=sr_model,
                 sr_output_view=sr_output_view,
-                sr_output_tensor=torch.from_numpy(sr_output_view),
-                sr_output_slot=sr_output_slot,
             )
             _run_task_loop(
                 worker_id=worker_id,

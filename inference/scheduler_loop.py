@@ -11,6 +11,7 @@ from .task_protocol import (
     BVSResult,
     RIFEResult,
     SRResult,
+    TaskComputeDone,
     TaskError,
     TaskKind,
     TaskResult,
@@ -22,7 +23,7 @@ def _handle_started(
     state: SchedulerState,
     message: TaskStarted,
 ) -> None:
-    active = state.active[message.worker_id]
+    active = state.active_for_kind(message.worker_id, message.kind)
     if (
         active is None
         or active.task_id != message.task_id
@@ -36,6 +37,17 @@ def _handle_started(
     active.started_at = time.monotonic()
 
 
+def _handle_compute_done(
+    state: SchedulerState,
+    message: TaskComputeDone,
+) -> None:
+    state.mark_compute_done(
+        message.worker_id,
+        message.task_id,
+        message.kind,
+    )
+
+
 def _handle_bvs_result(
     state: SchedulerState,
     message: TaskResult,
@@ -43,7 +55,7 @@ def _handle_bvs_result(
     if not isinstance(message.payload, BVSResult):
         raise RuntimeError("BVS worker returned an invalid payload")
 
-    active = state.active[message.worker_id]
+    active = state.active_for_kind(message.worker_id, message.kind)
     if active is None or not isinstance(active.meta, BVSActive):
         raise RuntimeError("BVS scheduler metadata mismatch")
 
@@ -103,7 +115,7 @@ def _handle_rife_result(
     if not isinstance(message.payload, RIFEResult):
         raise RuntimeError("RIFE worker returned an invalid payload")
 
-    active = state.active[message.worker_id]
+    active = state.active_for_kind(message.worker_id, message.kind)
     if active is None or not isinstance(active.meta, RIFEActive):
         raise RuntimeError("RIFE scheduler metadata mismatch")
 
@@ -133,7 +145,7 @@ def _handle_sr_result(
     if not isinstance(message.payload, SRResult):
         raise RuntimeError("SR worker returned an invalid payload")
 
-    active = state.active[message.worker_id]
+    active = state.active_for_kind(message.worker_id, message.kind)
     if active is None or not isinstance(active.meta, SRActive):
         raise RuntimeError("SR scheduler metadata mismatch")
 
@@ -143,8 +155,15 @@ def _handle_sr_result(
         raise RuntimeError(
             "SR worker returned an unexpected frame id"
         )
+    if message.payload.output_slot != meta.output_slot:
+        raise RuntimeError(
+            "SR worker returned an unexpected output slot"
+        )
 
-    state.pending[meta.frame_id] = message.worker_id
+    state.pending[meta.frame_id] = (
+        message.worker_id,
+        meta.output_slot,
+    )
     state.sr_seconds += message.seconds
 
 
@@ -152,7 +171,7 @@ def _handle_result(
     state: SchedulerState,
     message: TaskResult,
 ) -> None:
-    active = state.active[message.worker_id]
+    active = state.active_for_kind(message.worker_id, message.kind)
     if (
         active is None
         or active.task_id != message.task_id
@@ -160,6 +179,12 @@ def _handle_result(
     ):
         raise RuntimeError(
             "Unexpected worker result: "
+            f"gpu={message.worker_id} "
+            f"task={message.task_id}/{message.kind.value}"
+        )
+    if not active.compute_done:
+        raise RuntimeError(
+            "Worker returned a result before its compute boundary: "
             f"gpu={message.worker_id} "
             f"task={message.task_id}/{message.kind.value}"
         )
@@ -181,41 +206,47 @@ def _handle_result(
             f"Unknown result kind: {message.kind!r}"
         )
 
-    state.active[message.worker_id] = None
+    state.clear_active(message.worker_id, message.kind)
 
 
 def _watchdog(
     state: SchedulerState,
     now: float,
 ) -> None:
-    for worker_id, active in enumerate(state.active):
+    for worker_id in range(len(state.gpu_ids)):
         if not state.workers.is_alive(worker_id):
             raise RuntimeError(
                 f"cuda:{state.gpu_ids[worker_id]} worker process "
                 "exited unexpectedly"
             )
-        if active is None:
-            continue
 
-        reference = (
-            active.started_at
-            if active.started_at is not None
-            else active.submitted_at
-        )
-        limit = state.timeout_by_kind[active.kind]
-        if now - reference <= limit:
-            continue
+        for active in (
+            state.temporal_active[worker_id],
+            state.sr_active[worker_id],
+        ):
+            if active is None:
+                continue
 
-        phase = (
-            "running"
-            if active.started_at is not None
-            else "queued"
-        )
-        raise TimeoutError(
-            f"cuda:{state.gpu_ids[worker_id]} "
-            f"{active.kind.value.upper()} task {active.task_id} "
-            f"stalled while {phase} for {now - reference:.1f}s"
-        )
+            reference = (
+                active.started_at
+                if active.started_at is not None
+                else active.submitted_at
+            )
+            limit = state.timeout_by_kind[active.kind]
+            if now - reference <= limit:
+                continue
+
+            if active.compute_done:
+                phase = "draining transport"
+            elif active.started_at is not None:
+                phase = "running compute"
+            else:
+                phase = "queued"
+            raise TimeoutError(
+                f"cuda:{state.gpu_ids[worker_id]} "
+                f"{active.kind.value.upper()} task {active.task_id} "
+                f"stalled while {phase} for {now - reference:.1f}s"
+            )
 
 
 def _schedule_idle_worker_without_rife(
@@ -224,14 +255,12 @@ def _schedule_idle_worker_without_rife(
 ) -> bool:
     """Keep BVS parallel until the restored-frame backlog reaches one emit batch.
 
-    BVS dominates this pipeline. When interpolation is disabled, immediately
-    draining every restored frame through SR causes one GPU to spend long bursts
-    on SR while the other is the only GPU still producing BVS clips. The stable
-    pre-process scheduler used a high-water mark equal to one normal BVS emit
-    batch before letting SR preempt the second BVS lane; preserve that behavior
-    here while retaining the process-isolated worker boundary.
+    A task whose CUDA compute is complete no longer blocks the opposite role:
+    BVS/SR transport drain can overlap the other role's CUDA compute. Heavy
+    model compute itself remains exclusive per physical GPU for predictable
+    VRAM use and to avoid inter-process kernel contention.
     """
-    if state.active[worker_id] is not None:
+    if state.compute_busy(worker_id):
         return False
 
     if (
@@ -295,6 +324,10 @@ def run_scheduler(
                 _handle_started(state, message)
                 made_progress = True
                 continue
+            if isinstance(message, TaskComputeDone):
+                _handle_compute_done(state, message)
+                made_progress = True
+                continue
             if not isinstance(message, TaskResult):
                 raise RuntimeError(
                     "Unexpected unified GPU message: "
@@ -310,8 +343,12 @@ def run_scheduler(
             made_progress = True
 
         while state.next_output in state.pending:
-            worker_id = state.pending.pop(state.next_output)
-            pump.put(state.next_output, worker_id)
+            worker_id, output_slot = state.pending.pop(state.next_output)
+            pump.put(
+                state.next_output,
+                worker_id,
+                output_slot,
+            )
             state.next_output += 1
             made_progress = True
 

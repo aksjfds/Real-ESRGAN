@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol, Sequence
+from typing import Callable, Protocol, Sequence
 
 import numpy as np
 import torch
@@ -36,6 +36,8 @@ class RIFEExecutor(Protocol):
         timesteps: Sequence[float],
         output_view: np.ndarray,
         output_slots: Sequence[int],
+        *,
+        compute_done: Callable[[], None] | None = None,
     ) -> int: ...
 
     def close(self) -> None: ...

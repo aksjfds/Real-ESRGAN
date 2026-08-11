@@ -77,8 +77,8 @@ def print_run_header(
     )
     timing_text = "on" if gpu_timing else "off"
     print(
-        "Mode    : typed independent tasks | FrameHandle locality | "
-        f"event-driven IPC | gpu_timing={timing_text}",
+        "Mode    : compute-exclusive per GPU | pinned H2D/D2H copy streams | "
+        f"transport overlap | SR double-buffer | gpu_timing={timing_text}",
         flush=True,
     )
     print(flush=True)

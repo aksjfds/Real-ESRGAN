@@ -33,6 +33,7 @@ class RIFEActive:
 @dataclass(frozen=True)
 class SRActive:
     frame_id: int
+    output_slot: int
     release_on_result: tuple[FrameHandle, ...]
 
 
@@ -43,6 +44,7 @@ class ActiveTask:
     submitted_at: float
     started_at: float | None
     meta: object
+    compute_done: bool = False
 
 
 def pop_preferred_frame(

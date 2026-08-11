@@ -75,6 +75,14 @@ def resize_frame(frame: np.ndarray, width: int, height: int) -> np.ndarray:
 
 
 class OutputPump:
+    """Encode from explicit per-GPU SR output slots.
+
+    Each GPU has two shared SR buffers. The writer may retain one slot while the
+    SR worker fills the other, so resize/encoder backpressure no longer blocks
+    every next SR inference and no extra native-resolution CPU staging copy is
+    required.
+    """
+
     def __init__(
         self,
         workers,
@@ -91,8 +99,8 @@ class OutputPump:
         self.height = int(height)
         self.progress = progress
         self.started = float(started)
-        self.queue: queue.Queue[tuple[int, int] | None] = queue.Queue(
-            maxsize=max(2, workers.count * 2)
+        self.queue: queue.Queue[tuple[int, int, int] | None] = queue.Queue(
+            maxsize=max(2, workers.count * workers.sr_output_buffers)
         )
         self.processed = 0
         self.resize_seconds = 0.0
@@ -150,11 +158,11 @@ class OutputPump:
                 if item is None:
                     self.queue.task_done()
                     break
-                _frame_id, worker_id = item
+                _frame_id, worker_id, output_slot = item
                 try:
                     mark = time.monotonic()
                     frame = resize_frame(
-                        self.workers.output(worker_id),
+                        self.workers.output(worker_id, output_slot),
                         self.width,
                         self.height,
                     )
@@ -178,7 +186,7 @@ class OutputPump:
                         refresh=False,
                     )
                 finally:
-                    self.workers.release(worker_id)
+                    self.workers.release(worker_id, output_slot)
                     self.queue.task_done()
         except Exception as error:
             self.error = error
@@ -233,7 +241,7 @@ class OutputPump:
                 f"Output pipeline failed: {self.error!r}\n{self.traceback_text}"
             ) from self.error
 
-    def _enqueue(self, item: tuple[int, int] | None) -> None:
+    def _enqueue(self, item: tuple[int, int, int] | None) -> None:
         """Enqueue without allowing a dead output thread to strand the scheduler."""
         while True:
             self.check()
@@ -245,8 +253,8 @@ class OutputPump:
             except queue.Full:
                 continue
 
-    def put(self, frame_id: int, worker_id: int) -> None:
-        self._enqueue((int(frame_id), int(worker_id)))
+    def put(self, frame_id: int, worker_id: int, output_slot: int) -> None:
+        self._enqueue((int(frame_id), int(worker_id), int(output_slot)))
         self.check()
 
     def finish(self) -> None:

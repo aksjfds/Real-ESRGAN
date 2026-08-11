@@ -66,6 +66,7 @@ class SRTask:
     task_id: int
     frame_id: int
     frame: FrameInput
+    output_slot: int = 0
     kind: TaskKind = TaskKind.SR
 
 
@@ -81,6 +82,15 @@ class WorkerReady:
 
 @dataclass(frozen=True)
 class TaskStarted:
+    worker_id: int
+    task_id: int
+    kind: TaskKind
+
+
+@dataclass(frozen=True)
+class TaskComputeDone:
+    """The task finished CUDA model compute and is draining transport/CPU work."""
+
     worker_id: int
     task_id: int
     kind: TaskKind
@@ -110,6 +120,7 @@ class RIFEResult:
 @dataclass(frozen=True)
 class SRResult:
     frame_id: int
+    output_slot: int = 0
 
 
 ResultPayload: TypeAlias = BVSResult | RIFEResult | SRResult
@@ -125,4 +136,6 @@ class TaskResult:
     gpu_seconds: float | None = None
 
 
-WorkerMessage: TypeAlias = WorkerReady | TaskStarted | TaskResult | TaskError
+WorkerMessage: TypeAlias = (
+    WorkerReady | TaskStarted | TaskComputeDone | TaskResult | TaskError
+)

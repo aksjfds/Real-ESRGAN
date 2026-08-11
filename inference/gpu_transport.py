@@ -23,14 +23,18 @@ from .gpu_worker_process import (
 from .task_protocol import TaskError, WorkerReady, WorkerRole
 
 _TASK_TIMEOUT = 300.0
+_SR_OUTPUT_BUFFERS = 2
 
 
 class GPUWorkerTransport:
-    """Two permanent CUDA processes per GPU: temporal and SR.
+    """Stage-isolated CUDA processes with double-buffered SR output.
 
-    The scheduler still permits only one heavy task per logical GPU at a time.
-    Splitting the processes isolates model/allocator/cuDNN state without changing
-    task ordering or allowing uncontrolled same-GPU concurrency.
+    Temporal and SR processes remain permanently bound to each physical GPU.
+    The scheduler keeps heavy model compute exclusive per device but can overlap
+    one role's host/device transport with the opposite role's CUDA compute.
+    Two SR shared output buffers per GPU detach encoder ownership from the next
+    SR inference without an extra full-frame CPU staging copy. Environments with
+    insufficient /dev/shm automatically retain the original single-buffer bound.
     """
 
     def __init__(
@@ -54,6 +58,7 @@ class GPUWorkerTransport:
         self.sr_output_shape = tuple(int(x) for x in sr_output_shape)
         self.input_slots = int(input_slots)
         self.frame_output_slots = int(frame_output_slots)
+        self.sr_output_buffers = _SR_OUTPUT_BUFFERS
         self.enable_gpu_timing = bool(enable_gpu_timing)
         self.closed = False
 
@@ -87,11 +92,10 @@ class GPUWorkerTransport:
         )
         self._pending_messages = deque()
 
-        self.sr_output_slots = [
-            self.context.Semaphore(1)
+        self._sr_free_slots = [
+            deque(range(self.sr_output_buffers))
             for _ in self.gpu_ids
         ]
-        self._sr_available = [True] * self.count
         self._sr_lock = threading.Lock()
 
         self.input_shms: list[shared_memory.SharedMemory] = []
@@ -117,9 +121,29 @@ class GPUWorkerTransport:
         required_bytes = self.count * (
             frame_bytes * self.input_slots
             + frame_bytes * self.frame_output_slots
-            + sr_bytes
+            + sr_bytes * self.sr_output_buffers
         )
-        self._check_shared_memory_capacity(required_bytes)
+        try:
+            self._check_shared_memory_capacity(required_bytes)
+        except RuntimeError:
+            if self.sr_output_buffers <= 1:
+                raise
+            self.sr_output_buffers = 1
+            self._sr_free_slots = [
+                deque(range(self.sr_output_buffers))
+                for _ in self.gpu_ids
+            ]
+            fallback_required = self.count * (
+                frame_bytes * self.input_slots
+                + frame_bytes * self.frame_output_slots
+                + sr_bytes
+            )
+            self._check_shared_memory_capacity(fallback_required)
+            print(
+                "[gpu] /dev/shm cannot hold SR double buffers; "
+                "falling back to one SR output buffer per GPU",
+                flush=True,
+            )
 
         try:
             self._create_shared_memory(frame_bytes, sr_bytes)
@@ -148,7 +172,7 @@ class GPUWorkerTransport:
             )
             sr_output_shm = shared_memory.SharedMemory(
                 create=True,
-                size=sr_bytes,
+                size=sr_bytes * self.sr_output_buffers,
             )
             self.input_shms.append(input_shm)
             self.frame_output_shms.append(frame_output_shm)
@@ -169,7 +193,7 @@ class GPUWorkerTransport:
             )
             self.sr_output_views.append(
                 np.ndarray(
-                    self.sr_output_shape,
+                    (self.sr_output_buffers, *self.sr_output_shape),
                     dtype=self.dtype,
                     buffer=sr_output_shm.buf,
                 )
@@ -226,13 +250,13 @@ class GPUWorkerTransport:
                     gpu_id,
                     self.sr_task_queues[worker_id],
                     self._sender_for(worker_id, WorkerRole.SR),
-                    self.sr_output_slots[worker_id],
                     config_dict,
                     self.input_shms[worker_id].name,
                     self.frame_output_shms[worker_id].name,
                     self.sr_output_shms[worker_id].name,
                     self.input_slots,
                     self.frame_output_slots,
+                    self.sr_output_buffers,
                     self.input_shape,
                     self.sr_output_shape,
                     self.dtype.str,
@@ -421,15 +445,15 @@ class GPUWorkerTransport:
 
     def can_submit_sr(self, worker_id: int) -> bool:
         with self._sr_lock:
-            return self._sr_available[worker_id]
+            return bool(self._sr_free_slots[worker_id])
 
-    def claim_sr_output(self, worker_id: int) -> None:
+    def claim_sr_output(self, worker_id: int) -> int:
         with self._sr_lock:
-            if not self._sr_available[worker_id]:
+            if not self._sr_free_slots[worker_id]:
                 raise RuntimeError(
-                    f"cuda:{self.gpu_ids[worker_id]} SR output slot is busy"
+                    f"cuda:{self.gpu_ids[worker_id]} has no free SR output buffer"
                 )
-            self._sr_available[worker_id] = False
+            return int(self._sr_free_slots[worker_id].popleft())
 
     def result(self, block: bool = False):
         if not self._pending_messages:
@@ -448,13 +472,28 @@ class GPUWorkerTransport:
             raise queue.Empty
         return self._pending_messages.popleft()
 
-    def output(self, worker_id: int) -> np.ndarray:
-        return self.sr_output_views[worker_id]
+    def output(self, worker_id: int, output_slot: int) -> np.ndarray:
+        slot = int(output_slot)
+        if slot < 0 or slot >= self.sr_output_buffers:
+            raise ValueError(
+                f"Invalid SR output slot {slot}/{self.sr_output_buffers}"
+            )
+        return self.sr_output_views[worker_id][slot]
 
-    def release(self, worker_id: int) -> None:
-        self.sr_output_slots[worker_id].release()
+    def release(self, worker_id: int, output_slot: int) -> None:
+        slot = int(output_slot)
+        if slot < 0 or slot >= self.sr_output_buffers:
+            raise ValueError(
+                f"Invalid SR output slot {slot}/{self.sr_output_buffers}"
+            )
         with self._sr_lock:
-            self._sr_available[worker_id] = True
+            free = self._sr_free_slots[worker_id]
+            if slot in free:
+                raise RuntimeError(
+                    f"cuda:{self.gpu_ids[worker_id]} SR output slot {slot} "
+                    "was released twice"
+                )
+            free.append(slot)
         try:
             self._wakeup_sender.send_bytes(b"1")
         except (BrokenPipeError, OSError):
@@ -470,12 +509,6 @@ class GPUWorkerTransport:
         if self.closed:
             return
         self.closed = True
-
-        for slot in self.sr_output_slots:
-            try:
-                slot.release()
-            except Exception:
-                pass
 
         for task_queue in self.temporal_task_queues + self.sr_task_queues:
             try:
