@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone v8 media bypass/audio enhancement entry point."""
+"""Standalone v8.1 media bypass / AI audio enhancement entry point."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from .runtime import process_media
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Copy video unchanged and optionally enhance its audio.",
+        description="Copy video unchanged and optionally run v8.1 AI dialogue enhancement.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--input", required=True)
