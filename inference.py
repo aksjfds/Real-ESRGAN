@@ -14,7 +14,7 @@ from inference.run_lock import exclusive_output_run
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="BVS + RIFE + Real-ESRGAN multi-GPU video inference.",
+        description="BVS + RIFE + Real-ESRGAN GPU video inference.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--input", required=True, help="Input video path")
@@ -37,8 +37,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--gpu-ids",
-        default="0,1",
-        help="Comma-separated CUDA GPU IDs",
+        default="0",
+        help="Comma-separated CUDA GPU IDs; v7 defaults to one GPU",
     )
     parser.add_argument(
         "--audio-codec",
