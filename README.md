@@ -13,19 +13,19 @@ FFmpeg 解码
 
 ## 版本
 
-- v4.3：早期代码基线。
-- v5.8：固定 BVS 参数 + selective channels_last。
-- v6.0：加入 Practical-RIFE 4.25。
-- v6.1：一张 GPU 一个常驻 `spawn` 子进程，BVS / RIFE / SR 独立 task。
-- v6.2：typed task protocol、FrameHandle 引用计数、locality-aware 调度。
-- v6.3：去除活动路径 monkey-patch，显式 runtime、事件驱动 IPC、RIFE direct-slot、原生 GPU timing。
-- v6.4：OutputPump/Pipe fail-fast、BVS CUDA direct-slot、scene signature cache、runtime API 边界和更严格 task/runtime 类型协议。
-- v6.5：`RIFE_FPS=0` 关闭插帧并保持源帧率；RIFE 优先使用仓库内模型归档；离线 `[progress]` 使用固定 heartbeat。
-- v6.6：BVS emit group 使用一次 batch D2H，再复制到 FrameHandle shared-memory slots，避免逐帧 blocking D2H。
-- v6.7：RIFE 关闭时恢复 BVS/SR 高水位调度，避免 SR 过早抢占第二条 BVS GPU lane；同输出路径增加单实例进程锁；Kaggle Notebook 将子进程 stdout/stderr 合并后由 notebook kernel 单路转发，避免离线日志重复。
-- v6.8：每张 GPU 拆为常驻 temporal(BVS/RIFE) 与 SR 两个 `spawn` 进程；任务生命周期拆为 CUDA compute / transport drain 两阶段，保持同卡重模型 compute 互斥但允许另一阶段在 D2H/CPU drain 期间接管 compute lane；BVS/RIFE/SR 使用可复用 pinned H2D/D2H staging 与独立 copy stream，BVS/RIFE 合并批量 D2H；SR 使用显式双 shared-output slot 解耦 resize/encoder 反压，`/dev/shm` 紧张时自动回退单 slot。
-- v6.9：保持 v6.8 调度/画质数学不变，进一步收窄 runtime 边界：活动 RIFE runtime 只返回 packed CUDA batch，不再接收 scheduler compute callback，compute-boundary 与 D2H/shared-slot transport 统一回到 task handler；H2D ring slot、D2H 和 worker compute-boundary CUDA Event 改为常驻复用，去除 per-task Event 分配；连续 FrameHandle slots 使用单次 NumPy batch copy，减少逐帧 Python scatter 开销；已 pinned 的外部 CPU tensor 可绕过额外 pinned staging memcpy。
-- v6.10：worker 对长期 POSIX shared-memory 映射尝试 `cudaHostRegister()` 原地 page-lock，8-bit H2D 可从 shared slot 直接异步进入 CUDA、8-bit D2H 可直接写注册后的 shared output，注册不支持/失败时自动回退 v6.9 pinned staging；D2H 在 compute handoff 前先排入独立 copy stream，使 copy engine 可在 model/packing compute 完成后立即启动，再由 compute-boundary Event 保持同卡重模型互斥；FrameSlotPool 优先预留连续 slot，使 BVS/RIFE packed CUDA batch 在常见路径下通过一次 direct batched D2H 写入连续 shared-memory slice，碎片化时保持原有安全回退。
+- v4.3-9020854 [Dev] 🔧：早期代码基线。
+- v5.8-f5eca71 [Dev] 🔧：固定 BVS 参数 + selective channels_last。
+- v6.0-63e28d8 [Dev] 🔧：加入 Practical-RIFE 4.25。
+- v6.1-e66ae69 [Dev] 🔧：一张 GPU 一个常驻 `spawn` 子进程，BVS / RIFE / SR 独立 task。
+- v6.2-0c2109d [Dev] 🔧：typed task protocol、FrameHandle 引用计数、locality-aware 调度。
+- v6.3-5474432 [Dev] 🔧：去除活动路径 monkey-patch，显式 runtime、事件驱动 IPC、RIFE direct-slot、原生 GPU timing。
+- v6.4-ea40744 [Dev] 🔧：OutputPump/Pipe fail-fast、BVS CUDA direct-slot、scene signature cache、runtime API 边界和更严格 task/runtime 类型协议。
+- v6.5-ecce8f1 [Dev] 🔧：`RIFE_FPS=0` 关闭插帧并保持源帧率；RIFE 优先使用仓库内模型归档；离线 `[progress]` 使用固定 heartbeat。
+- v6.6-fc61dcf [Dev] 🔧：BVS emit group 使用一次 batch D2H，再复制到 FrameHandle shared-memory slots，避免逐帧 blocking D2H。
+- v6.7-5a15af7 [Dev] 🔧：RIFE 关闭时恢复 BVS/SR 高水位调度，避免 SR 过早抢占第二条 BVS GPU lane；同输出路径增加单实例进程锁；Kaggle Notebook 将子进程 stdout/stderr 合并后由 notebook kernel 单路转发，避免离线日志重复。
+- v6.8-f3f35f9 [Dev] 🔧：每张 GPU 拆为常驻 temporal(BVS/RIFE) 与 SR 两个 `spawn` 进程；任务生命周期拆为 CUDA compute / transport drain 两阶段，保持同卡重模型 compute 互斥但允许另一阶段在 D2H/CPU drain 期间接管 compute lane；BVS/RIFE/SR 使用可复用 pinned H2D/D2H staging 与独立 copy stream，BVS/RIFE 合并批量 D2H；SR 使用显式双 shared-output slot 解耦 resize/encoder 反压，`/dev/shm` 紧张时自动回退单 slot。
+- v6.9-f116bff [Dev] 🔧：保持 v6.8 调度/画质数学不变，进一步收窄 runtime 边界：活动 RIFE runtime 只返回 packed CUDA batch，不再接收 scheduler compute callback，compute-boundary 与 D2H/shared-slot transport 统一回到 task handler；H2D ring slot、D2H 和 worker compute-boundary CUDA Event 改为常驻复用，去除 per-task Event 分配；连续 FrameHandle slots 使用单次 NumPy batch copy，减少逐帧 Python scatter 开销；已 pinned 的外部 CPU tensor 可绕过额外 pinned staging memcpy。
+- v6.10-2ca1203 [Release] ✅：`cudaHostRegister()` direct shared-memory transport；NPP Lanczos CUDA 在 D2H 前完成最终倍率缩放；SR micro-batch≤2；SR 按连续 frame_id 严格有序 dispatch，避免 output-slot starvation/deadlock。
 
 ## 当前结构
 
