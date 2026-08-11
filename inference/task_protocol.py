@@ -13,6 +13,11 @@ class TaskKind(str, Enum):
     SR = "sr"
 
 
+class WorkerRole(str, Enum):
+    TEMPORAL = "temporal"
+    SR = "sr"
+
+
 class FrameStorage(str, Enum):
     INPUT = "input"
     OUTPUT = "output"
@@ -71,6 +76,7 @@ WorkerTask: TypeAlias = BVSTask | RIFETask | SRTask
 class WorkerReady:
     worker_id: int
     gpu_id: int
+    role: WorkerRole
 
 
 @dataclass(frozen=True)
@@ -85,6 +91,7 @@ class TaskError:
     worker_id: int
     error: str
     traceback_text: str
+    role: WorkerRole | None = None
 
 
 @dataclass(frozen=True)

@@ -7,7 +7,7 @@ from typing import Sequence
 import numpy as np
 
 from .frame_pool import FrameSlotPool
-from .stable_gpu_transport import StableGPUWorkerTransport
+from .gpu_transport import GPUWorkerTransport
 from .task_protocol import (
     BVSGroup,
     BVSTask,
@@ -19,7 +19,7 @@ from .task_protocol import (
 )
 
 
-class UnifiedGPUWorkers(StableGPUWorkerTransport):
+class UnifiedGPUWorkers(GPUWorkerTransport):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.frames = FrameSlotPool(
@@ -136,7 +136,7 @@ class UnifiedGPUWorkers(StableGPUWorkerTransport):
             output_slots=tuple(handle.slot for handle in outputs),
         )
         try:
-            self.task_queues[worker_id].put(task)
+            self.temporal_task_queues[worker_id].put(task)
         except Exception:
             self.frames.release_many(outputs)
             raise
@@ -170,7 +170,7 @@ class UnifiedGPUWorkers(StableGPUWorkerTransport):
             )
             deferred.extend(deferred0)
             deferred.extend(deferred1)
-            self.task_queues[worker_id].put(
+            self.temporal_task_queues[worker_id].put(
                 RIFETask(
                     task_id=int(task_id),
                     frame0=input0,
@@ -205,7 +205,7 @@ class UnifiedGPUWorkers(StableGPUWorkerTransport):
                 frame,
                 0,
             )
-            self.task_queues[worker_id].put(
+            self.sr_task_queues[worker_id].put(
                 SRTask(
                     task_id=int(task_id),
                     frame_id=int(frame_id),

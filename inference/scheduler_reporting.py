@@ -71,8 +71,8 @@ def print_run_header(
         )
 
     print(
-        "GPU     : one spawned process per device | "
-        "permanent CUDA affinity | BVS + RIFE + SR",
+        "GPU     : stage-isolated spawn processes | "
+        "temporal(BVS/RIFE) + SR per device | permanent CUDA affinity",
         flush=True,
     )
     timing_text = "on" if gpu_timing else "off"

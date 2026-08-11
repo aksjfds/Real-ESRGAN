@@ -1,4 +1,4 @@
-"""GPU task handlers used by the process-isolated worker core."""
+"""GPU task handlers used by stage-isolated worker processes."""
 
 from __future__ import annotations
 
@@ -31,14 +31,14 @@ from .worker_protocols import BasicVSRExecutor, RIFEExecutor
 class WorkerContext:
     device: torch.device
     dtype: np.dtype
-    bvs: BasicVSRExecutor
-    rife: RIFEExecutor | None
-    sr_model: torch.nn.Module
     input_view: np.ndarray
     frame_output_view: np.ndarray
-    sr_output_view: np.ndarray
-    sr_output_tensor: torch.Tensor
-    sr_output_slot: object
+    bvs: BasicVSRExecutor | None = None
+    rife: RIFEExecutor | None = None
+    sr_model: torch.nn.Module | None = None
+    sr_output_view: np.ndarray | None = None
+    sr_output_tensor: torch.Tensor | None = None
+    sr_output_slot: object | None = None
 
 
 def resolve_frame(context: WorkerContext, frame: FrameInput) -> np.ndarray:
@@ -47,6 +47,12 @@ def resolve_frame(context: WorkerContext, frame: FrameInput) -> np.ndarray:
     if frame.storage is FrameStorage.OUTPUT:
         return context.frame_output_view[frame.slot]
     raise RuntimeError(f"Unsupported frame storage: {frame.storage!r}")
+
+
+def _require_bvs(context: WorkerContext) -> BasicVSRExecutor:
+    if context.bvs is None:
+        raise RuntimeError("BVS task submitted to a worker without BasicVSR++")
+    return context.bvs
 
 
 def _copy_bvs_device_groups(
@@ -112,6 +118,7 @@ def _copy_bvs_cpu_groups(
 
 
 def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
+    bvs = _require_bvs(context)
     clips: list[list[np.ndarray]] = []
     cursor = 0
     for group in task.groups:
@@ -123,8 +130,8 @@ def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
         )
         cursor += group.count
 
-    before_tiles = int(context.bvs.tiles)
-    device_groups = context.bvs.enhance_clips_device(clips)
+    before_tiles = int(bvs.tiles)
+    device_groups = bvs.enhance_clips_device(clips)
     if device_groups is not None:
         emitted_counts = _copy_bvs_device_groups(
             context,
@@ -133,9 +140,9 @@ def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
         )
     else:
         if len(clips) > 1:
-            enhanced_groups = context.bvs.enhance_clips(clips)
+            enhanced_groups = bvs.enhance_clips(clips)
         else:
-            enhanced_groups = [context.bvs.enhance_clip(clips[0])]
+            enhanced_groups = [bvs.enhance_clip(clips[0])]
         emitted_counts = _copy_bvs_cpu_groups(
             context,
             task,
@@ -144,8 +151,8 @@ def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
 
     return BVSResult(
         emitted_counts=emitted_counts,
-        tile_size=int(context.bvs.tile_size),
-        tiles=int(context.bvs.tiles) - before_tiles,
+        tile_size=int(bvs.tile_size),
+        tiles=int(bvs.tiles) - before_tiles,
         clips=len(clips),
     )
 
@@ -171,6 +178,13 @@ def run_rife(context: WorkerContext, task: RIFETask) -> RIFEResult:
 
 
 def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
+    if context.sr_model is None:
+        raise RuntimeError("SR task submitted to a worker without Real-ESRGAN")
+    if context.sr_output_slot is None:
+        raise RuntimeError("SR worker output semaphore is unavailable")
+    if context.sr_output_view is None or context.sr_output_tensor is None:
+        raise RuntimeError("SR worker output shared memory is unavailable")
+
     frame = resolve_frame(context, task.frame)
 
     if context.dtype == np.dtype(np.uint8):
@@ -205,9 +219,14 @@ def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
 Handler = Callable[[WorkerContext, WorkerTask], ResultPayload]
 
 
-def build_handlers() -> dict[TaskKind, Handler]:
+def build_temporal_handlers() -> dict[TaskKind, Handler]:
     return {
         TaskKind.BVS: cast(Handler, run_bvs),
         TaskKind.RIFE: cast(Handler, run_rife),
+    }
+
+
+def build_sr_handlers() -> dict[TaskKind, Handler]:
+    return {
         TaskKind.SR: cast(Handler, run_sr),
     }

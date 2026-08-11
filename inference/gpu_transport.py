@@ -1,4 +1,4 @@
-"""Shared-memory and event-driven process lifecycle for per-GPU workers."""
+"""Shared-memory and event-driven lifecycle for stage-isolated GPU workers."""
 
 from __future__ import annotations
 
@@ -16,13 +16,23 @@ from typing import Sequence
 import numpy as np
 
 from . import runtime as base
-from .gpu_worker_process import gpu_worker_main
-from .task_protocol import TaskError, WorkerReady
+from .gpu_worker_process import (
+    gpu_sr_worker_main,
+    gpu_temporal_worker_main,
+)
+from .task_protocol import TaskError, WorkerReady, WorkerRole
 
 _TASK_TIMEOUT = 300.0
 
 
 class GPUWorkerTransport:
+    """Two permanent CUDA processes per GPU: temporal and SR.
+
+    The scheduler still permits only one heavy task per logical GPU at a time.
+    Splitting the processes isolates model/allocator/cuDNN state without changing
+    task ordering or allowing uncontrolled same-GPU concurrency.
+    """
+
     def __init__(
         self,
         gpu_ids: Sequence[int],
@@ -52,17 +62,26 @@ class GPUWorkerTransport:
                 "GPUWorkerTransport requires at least one CUDA GPU"
             )
 
-        self.task_queues = [
+        self.temporal_task_queues = [
             self.context.SimpleQueue()
             for _ in self.gpu_ids
         ]
+        self.sr_task_queues = [
+            self.context.SimpleQueue()
+            for _ in self.gpu_ids
+        ]
+
         self.result_receivers = []
         self.result_senders = []
-        for _ in self.gpu_ids:
-            receiver, sender = self.context.Pipe(duplex=False)
-            self.result_receivers.append(receiver)
-            self.result_senders.append(sender)
+        self.receiver_meta: list[tuple[int, WorkerRole]] = []
+        for worker_id in range(self.count):
+            for role in (WorkerRole.TEMPORAL, WorkerRole.SR):
+                receiver, sender = self.context.Pipe(duplex=False)
+                self.result_receivers.append(receiver)
+                self.result_senders.append(sender)
+                self.receiver_meta.append((worker_id, role))
 
+        self._closed_result_receivers: set[int] = set()
         self._wakeup_receiver, self._wakeup_sender = self.context.Pipe(
             duplex=False
         )
@@ -81,7 +100,11 @@ class GPUWorkerTransport:
         self.input_views: list[np.ndarray] = []
         self.frame_output_views: list[np.ndarray] = []
         self.sr_output_views: list[np.ndarray] = []
+
+        self.temporal_processes = []
+        self.sr_processes = []
         self.processes = []
+        self.process_meta: list[tuple[int, WorkerRole]] = []
 
         frame_bytes = (
             int(np.prod(self.input_shape, dtype=np.int64))
@@ -99,71 +122,8 @@ class GPUWorkerTransport:
         self._check_shared_memory_capacity(required_bytes)
 
         try:
-            for _ in self.gpu_ids:
-                input_shm = shared_memory.SharedMemory(
-                    create=True,
-                    size=frame_bytes * self.input_slots,
-                )
-                frame_output_shm = shared_memory.SharedMemory(
-                    create=True,
-                    size=frame_bytes * self.frame_output_slots,
-                )
-                sr_output_shm = shared_memory.SharedMemory(
-                    create=True,
-                    size=sr_bytes,
-                )
-                self.input_shms.append(input_shm)
-                self.frame_output_shms.append(frame_output_shm)
-                self.sr_output_shms.append(sr_output_shm)
-                self.input_views.append(
-                    np.ndarray(
-                        (self.input_slots, *self.input_shape),
-                        dtype=self.dtype,
-                        buffer=input_shm.buf,
-                    )
-                )
-                self.frame_output_views.append(
-                    np.ndarray(
-                        (self.frame_output_slots, *self.input_shape),
-                        dtype=self.dtype,
-                        buffer=frame_output_shm.buf,
-                    )
-                )
-                self.sr_output_views.append(
-                    np.ndarray(
-                        self.sr_output_shape,
-                        dtype=self.dtype,
-                        buffer=sr_output_shm.buf,
-                    )
-                )
-
-            for worker_id, gpu_id in enumerate(self.gpu_ids):
-                process = self.context.Process(
-                    target=gpu_worker_main,
-                    args=(
-                        worker_id,
-                        gpu_id,
-                        self.task_queues[worker_id],
-                        self.result_senders[worker_id],
-                        self.sr_output_slots[worker_id],
-                        asdict(config),
-                        dict(bvs_config),
-                        str(rife_weights or ""),
-                        self.input_shms[worker_id].name,
-                        self.frame_output_shms[worker_id].name,
-                        self.sr_output_shms[worker_id].name,
-                        self.input_slots,
-                        self.frame_output_slots,
-                        self.input_shape,
-                        self.sr_output_shape,
-                        self.dtype.str,
-                        self.enable_gpu_timing,
-                    ),
-                    daemon=True,
-                )
-                process.start()
-                self.processes.append(process)
-
+            self._create_shared_memory(frame_bytes, sr_bytes)
+            self._start_processes(config, bvs_config, rife_weights)
             for sender in self.result_senders:
                 sender.close()
             self.result_senders = []
@@ -171,6 +131,119 @@ class GPUWorkerTransport:
         except Exception:
             self.close()
             raise
+
+    def _create_shared_memory(
+        self,
+        frame_bytes: int,
+        sr_bytes: int,
+    ) -> None:
+        for _ in self.gpu_ids:
+            input_shm = shared_memory.SharedMemory(
+                create=True,
+                size=frame_bytes * self.input_slots,
+            )
+            frame_output_shm = shared_memory.SharedMemory(
+                create=True,
+                size=frame_bytes * self.frame_output_slots,
+            )
+            sr_output_shm = shared_memory.SharedMemory(
+                create=True,
+                size=sr_bytes,
+            )
+            self.input_shms.append(input_shm)
+            self.frame_output_shms.append(frame_output_shm)
+            self.sr_output_shms.append(sr_output_shm)
+            self.input_views.append(
+                np.ndarray(
+                    (self.input_slots, *self.input_shape),
+                    dtype=self.dtype,
+                    buffer=input_shm.buf,
+                )
+            )
+            self.frame_output_views.append(
+                np.ndarray(
+                    (self.frame_output_slots, *self.input_shape),
+                    dtype=self.dtype,
+                    buffer=frame_output_shm.buf,
+                )
+            )
+            self.sr_output_views.append(
+                np.ndarray(
+                    self.sr_output_shape,
+                    dtype=self.dtype,
+                    buffer=sr_output_shm.buf,
+                )
+            )
+
+    def _sender_for(
+        self,
+        worker_id: int,
+        role: WorkerRole,
+    ):
+        for sender, meta in zip(self.result_senders, self.receiver_meta):
+            if meta == (worker_id, role):
+                return sender
+        raise RuntimeError(
+            f"Missing result sender for cuda:{worker_id}/{role.value}"
+        )
+
+    def _start_processes(
+        self,
+        config: base.WorkerConfig,
+        bvs_config: dict[str, object],
+        rife_weights: str,
+    ) -> None:
+        config_dict = asdict(config)
+        for worker_id, gpu_id in enumerate(self.gpu_ids):
+            temporal = self.context.Process(
+                target=gpu_temporal_worker_main,
+                args=(
+                    worker_id,
+                    gpu_id,
+                    self.temporal_task_queues[worker_id],
+                    self._sender_for(worker_id, WorkerRole.TEMPORAL),
+                    dict(bvs_config),
+                    str(rife_weights or ""),
+                    self.input_shms[worker_id].name,
+                    self.frame_output_shms[worker_id].name,
+                    self.input_slots,
+                    self.frame_output_slots,
+                    self.input_shape,
+                    self.dtype.str,
+                    self.enable_gpu_timing,
+                ),
+                daemon=True,
+            )
+            temporal.start()
+            self.temporal_processes.append(temporal)
+            self.processes.append(temporal)
+            self.process_meta.append((worker_id, WorkerRole.TEMPORAL))
+
+            sr = self.context.Process(
+                target=gpu_sr_worker_main,
+                args=(
+                    worker_id,
+                    gpu_id,
+                    self.sr_task_queues[worker_id],
+                    self._sender_for(worker_id, WorkerRole.SR),
+                    self.sr_output_slots[worker_id],
+                    config_dict,
+                    self.input_shms[worker_id].name,
+                    self.frame_output_shms[worker_id].name,
+                    self.sr_output_shms[worker_id].name,
+                    self.input_slots,
+                    self.frame_output_slots,
+                    self.input_shape,
+                    self.sr_output_shape,
+                    self.dtype.str,
+                    self.enable_gpu_timing,
+                ),
+                daemon=True,
+            )
+            sr.start()
+            self.sr_processes.append(sr)
+            self.processes.append(sr)
+            self.process_meta.append((worker_id, WorkerRole.SR))
 
     @staticmethod
     def _check_shared_memory_capacity(required_bytes: int) -> None:
@@ -184,7 +257,7 @@ class GPUWorkerTransport:
         reserve = max(64 * 2**20, int(required_bytes * 0.05))
         if required_bytes + reserve > free:
             raise RuntimeError(
-                "Insufficient /dev/shm capacity for unified GPU workers: "
+                "Insufficient /dev/shm capacity for GPU workers: "
                 f"need about {(required_bytes + reserve) / 2**20:.0f} MiB, "
                 f"available {free / 2**20:.0f} MiB"
             )
@@ -204,11 +277,30 @@ class GPUWorkerTransport:
         )
 
     def _connection_set(self):
+        receivers = [
+            receiver
+            for receiver in self.result_receivers
+            if id(receiver) not in self._closed_result_receivers
+        ]
         return (
-            list(self.result_receivers)
+            receivers
             + [self._wakeup_receiver]
             + [process.sentinel for process in self.processes]
         )
+
+    def _drain_result_receiver(self, receiver) -> bool:
+        changed = False
+        while True:
+            try:
+                if not receiver.poll():
+                    break
+                self._pending_messages.append(receiver.recv())
+                changed = True
+            except (EOFError, OSError):
+                self._closed_result_receivers.add(id(receiver))
+                changed = True
+                break
+        return changed
 
     def _drain_ready(self, ready) -> bool:
         changed = False
@@ -216,29 +308,33 @@ class GPUWorkerTransport:
             id(receiver): receiver
             for receiver in self.result_receivers
         }
-        sentinel_to_worker = {
-            process.sentinel: worker_id
-            for worker_id, process in enumerate(self.processes)
+        sentinel_meta = {
+            process.sentinel: meta
+            for process, meta in zip(self.processes, self.process_meta)
         }
+
         for item in ready:
             receiver = receiver_ids.get(id(item))
             if receiver is not None:
-                while receiver.poll():
-                    self._pending_messages.append(receiver.recv())
-                    changed = True
+                changed |= self._drain_result_receiver(receiver)
                 continue
+
             if item is self._wakeup_receiver:
                 while self._wakeup_receiver.poll():
                     try:
                         self._wakeup_receiver.recv_bytes()
-                    except EOFError:
+                    except (EOFError, OSError):
                         break
                     changed = True
                 continue
-            worker_id = sentinel_to_worker.get(item)
-            if worker_id is not None:
-                if not self.processes[worker_id].is_alive():
+
+            meta = sentinel_meta.get(item)
+            if meta is not None:
+                worker_id, role = meta
+                process = self._process_for(worker_id, role)
+                if not process.is_alive():
                     changed = True
+
         return changed
 
     def wait_for_event(self, timeout: float | None) -> bool:
@@ -249,27 +345,79 @@ class GPUWorkerTransport:
             return False
         return self._drain_ready(ready)
 
+    def _process_for(
+        self,
+        worker_id: int,
+        role: WorkerRole,
+    ):
+        processes = (
+            self.temporal_processes
+            if role is WorkerRole.TEMPORAL
+            else self.sr_processes
+        )
+        return processes[worker_id]
+
+    def _startup_exit_error(
+        self,
+        ready_workers: set[tuple[int, WorkerRole]],
+    ) -> RuntimeError | None:
+        for process, meta in zip(self.processes, self.process_meta):
+            if meta in ready_workers:
+                continue
+            if not process.is_alive():
+                worker_id, role = meta
+                return RuntimeError(
+                    f"cuda:{self.gpu_ids[worker_id]} {role.value} worker "
+                    f"exited before READY (exitcode={process.exitcode})"
+                )
+        return None
+
     def _wait_ready(self) -> None:
-        ready_workers: set[int] = set()
+        expected = {
+            (worker_id, role)
+            for worker_id in range(self.count)
+            for role in (WorkerRole.TEMPORAL, WorkerRole.SR)
+        }
+        ready_workers: set[tuple[int, WorkerRole]] = set()
         deadline = time.monotonic() + _TASK_TIMEOUT
-        while len(ready_workers) < self.count:
+
+        while ready_workers != expected:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("Timed out loading unified GPU workers")
+                missing = sorted(
+                    f"{worker}:{role.value}"
+                    for worker, role in expected - ready_workers
+                )
+                raise TimeoutError(
+                    "Timed out loading GPU workers; missing=" + ",".join(missing)
+                )
+
             self.wait_for_event(remaining)
             while self._pending_messages:
                 message = self._pending_messages.popleft()
                 if isinstance(message, TaskError):
+                    role = (
+                        message.role.value
+                        if message.role is not None
+                        else "unknown"
+                    )
                     raise RuntimeError(
-                        f"GPU worker {message.worker_id} failed during startup: "
-                        f"{message.error}\n{message.traceback_text}"
+                        f"GPU worker {message.worker_id}/{role} failed "
+                        f"during startup: {message.error}\n"
+                        f"{message.traceback_text}"
                     )
                 if not isinstance(message, WorkerReady):
                     raise RuntimeError(
-                        "Unexpected unified GPU startup message: "
+                        "Unexpected GPU startup message: "
                         f"{type(message).__name__}"
                     )
-                ready_workers.add(message.worker_id)
+                ready_workers.add(
+                    (message.worker_id, message.role)
+                )
+
+            startup_error = self._startup_exit_error(ready_workers)
+            if startup_error is not None:
+                raise startup_error
 
     def can_submit_sr(self, worker_id: int) -> bool:
         with self._sr_lock:
@@ -291,7 +439,7 @@ class GPUWorkerTransport:
                     left = deadline - time.monotonic()
                     if left <= 0:
                         raise TimeoutError(
-                            "Timed out waiting for unified GPU worker"
+                            "Timed out waiting for GPU worker"
                         )
                     self.wait_for_event(left)
             else:
@@ -313,7 +461,10 @@ class GPUWorkerTransport:
             pass
 
     def is_alive(self, worker_id: int) -> bool:
-        return self.processes[worker_id].is_alive()
+        return (
+            self.temporal_processes[worker_id].is_alive()
+            and self.sr_processes[worker_id].is_alive()
+        )
 
     def close(self) -> None:
         if self.closed:
@@ -325,22 +476,25 @@ class GPUWorkerTransport:
                 slot.release()
             except Exception:
                 pass
-        for task_queue in self.task_queues:
+
+        for task_queue in self.temporal_task_queues + self.sr_task_queues:
             try:
                 task_queue.put(None)
             except Exception:
                 pass
+
         for process in self.processes:
             process.join(timeout=10)
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=5)
 
-        for task_queue in self.task_queues:
+        for task_queue in self.temporal_task_queues + self.sr_task_queues:
             try:
                 task_queue.close()
             except Exception:
                 pass
+
         for receiver in self.result_receivers:
             try:
                 receiver.close()
