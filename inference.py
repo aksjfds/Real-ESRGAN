@@ -49,7 +49,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-enhance",
         action="store_true",
-        help="Enable v8.1 Mel-Band RoFormer + adaptive PyTorch dialogue enhancement",
+        help="Enable v8 FFmpeg dialogue-focused audio enhancement",
     )
     parser.add_argument(
         "--start-time",
