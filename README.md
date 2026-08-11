@@ -1,14 +1,18 @@
 # Real-ESRGAN 动画视频推理
 
-当前 v7.0 流水线：
+当前 v8.0 流水线：
 
 ```text
+视频增强（可关闭）：
 FFmpeg 解码
 → BasicVSR++ NTIRE Track 1 同分辨率时序恢复
 → Practical-RIFE 4.25 任意 timestep 插帧（可关闭）
 → Real-ESRGAN full-frame 超分
 → Lanczos4 最终倍率调整
 → HEVC / AV1 编码
+
+音频增强（可关闭）：
+FFmpeg EQ → Compressor → De-esser → EBU R128 Loudness → AAC
 ```
 
 ## 项目原则（必须遵守）
@@ -23,6 +27,7 @@ FFmpeg 解码
 
 ## 版本
 
+- v8.0 - 978fe39 [Dev] 🔧：Notebook 独立视频/音频增强开关，音频 FFmpeg DSP 独立模块。
 - v7.0 - 5ec12df [Release] ✅：单 GPU（目标 RTX 4090），其余沿用 v6.10 推理链路。
 - v6.10 - 2ca1203 [Release] ✅：shared-memory 直传、CUDA Lanczos、SR 微批与有序调度。
 - v6.9 - f116bff [Dev] 🔧：复用 CUDA Event，优化 H2D/D2H 与连续 slot 拷贝。
@@ -40,8 +45,8 @@ FFmpeg 解码
 
 ## 当前结构
 
-- `inference.py`：当前 CLI；v7 默认 `--gpu-ids 0`，只暴露 `RIFE_FPS`，不提供遗留 `--fps` 参数，并在入口持有同输出路径单实例锁。
-- `inference/scheduler.py`：CPU 视频编排，支持至少一张 CUDA GPU，不直接执行 CUDA 模型。
+- `inference.py`：当前视频增强 CLI；默认 `--gpu-ids 0`，支持 `--audio-enhance`，并在入口持有同输出路径单实例锁。
+- `inference/scheduler.py`：CPU 视频编排，支持至少一张 CUDA GPU，不直接执行 CUDA 模型；最终音频阶段只通过 `audio.runtime` 窄接口完成 mux/增强。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：任务策略、compute/drain 状态、结果处理、watchdog 和事件驱动等待。
 - `inference/task_protocol.py`：BVS / RIFE / SR typed task/result protocol，以及 compute-boundary 消息。
 - `inference/worker_protocols.py`：GPU runtime 结构化接口；活动 RIFE 接口只暴露 CUDA batch 计算，不暴露 scheduler/transport callback。
@@ -60,8 +65,10 @@ FFmpeg 解码
 - `inference/output_runtime.py`：fail-fast 输出 pump、SR shared-output slot 消费、Lanczos4 resize、交互/批处理 progress。
 - `inference/clip_source.py` / `timeline.py` / `scene_metrics.py`：CPU clip、目标时间轴和缓存 scene signature。
 - `inference/run_lock.py`：同一输出路径的进程级单实例锁，避免重复运行争抢 GPU/输出文件。
+- `audio/runtime.py`：v8 FFmpeg 音频增强、原音频 mux、视频旁路与音频滤镜 fail-fast 边界。
+- `audio/process.py`：`VIDEO_ENHANCE=False` 时的视频 stream-copy / 音频处理入口。
 
-旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留历史兼容；当前 v7.0 主路径不依赖这些旧安装器。
+旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留历史兼容；当前 v8.0 视频增强主路径不依赖这些旧安装器。
 
 ## BasicVSR++ 固定参数
 
@@ -79,7 +86,7 @@ scene_threshold=0.30
 
 8-bit BVS 结果保持 CUDA `uint8` 到 handler；多个 emit group 在 CUDA 侧合并为连续 batch。FrameSlotPool 优先分配连续输出 slot；对应 shared-memory 映射成功 CUDA host registration 时，packed batch 通过一次异步 D2H 直接写入连续 shared-memory slice，不再经过 pinned staging → `np.copyto`。若 host registration 不可用或 slots 已碎片化，则自动回退 v6.9 的 pinned staging / scatter 路径。10-bit 路径保持保守兼容实现。
 
-v7.0 保留 v6.10 的 frame-slot headroom 与 backpressure 逻辑；单 GPU 下 BVS/RIFE/SR 共享同一 heavy-compute lane，frame pool 空间不足时现有 slot 约束会阻止继续提交 BVS，并让已就绪的 RIFE/SR 消化 backlog，不引入另一套单 GPU scheduler。
+v8.0 的视频增强路径完整保留 v7.0 / v6.10 的 frame-slot headroom 与 backpressure 逻辑；单 GPU 下 BVS/RIFE/SR 共享同一 heavy-compute lane，frame pool 空间不足时现有 slot 约束会阻止继续提交 BVS，并让已就绪的 RIFE/SR 消化 backlog，不引入另一套单 GPU scheduler。
 
 ## RIFE 4.25 / 输出帧率
 
@@ -115,7 +122,7 @@ RIFE 8-bit 输入保持 `uint8`；若来源 shared slot 已注册为 CUDA pinned
 
 ## GPU 稳定边界
 
-v7.0 目标运行环境为单张 RTX 4090；代码仍保留通用多 GPU 数据结构，不新增平行的单 GPU pipeline。
+v8.0 视频增强目标运行环境仍为单张 RTX 4090；代码保留通用多 GPU 数据结构，不新增平行的单 GPU pipeline。
 
 ```text
 Main Scheduler
@@ -126,9 +133,9 @@ Main Scheduler
 
 每个 GPU 子进程在整个运行期间保持固定 `torch.cuda.device(...)` context。当前主路径不存在共享 CUDA `ThreadPoolExecutor`，也不在任务级反复 `torch.cuda.set_device()`。
 
-BVS、RIFE、SR 始终是独立 task。同一物理 GPU 的 heavy model compute 保持互斥。v7.0 沿用 v6.10 handler：在 compute boundary 前先把依赖当前 producer stream 的 D2H 排入独立 copy stream；copy stream 只等待当时已经提交的 model/packing work。worker 随后同步常驻 compute-boundary Event 并发送 `TaskComputeDone`，scheduler 才允许同卡另一 role 开始 heavy compute。因此 D2H 可在 boundary 到达后立即启动并与后续另一阶段 compute 重叠，但不会无控制地并发两个重模型 kernel。
+BVS、RIFE、SR 始终是独立 task。同一物理 GPU 的 heavy model compute 保持互斥。v8.0 视频路径沿用 v7.0 handler：在 compute boundary 前先把依赖当前 producer stream 的 D2H 排入独立 copy stream；copy stream 只等待当时已经提交的 model/packing work。worker 随后同步常驻 compute-boundary Event并发送 `TaskComputeDone`，scheduler 才允许同卡另一 role 开始 heavy compute。因此 D2H 可在 boundary 到达后立即启动并与后续另一阶段 compute 重叠，但不会无控制地并发两个重模型 kernel。
 
-中间帧通过 `FrameHandle(worker_id, slot, generation)` 引用共享 slot。单 GPU v7.0 中所有 FrameHandle 都保持本地，不进入跨 GPU CPU shared-memory copy；通用 non-local 路径仅为兼容多 GPU 配置保留。
+中间帧通过 `FrameHandle(worker_id, slot, generation)` 引用共享 slot。单 GPU v8.0 中所有 FrameHandle 都保持本地，不进入跨 GPU CPU shared-memory copy；通用 non-local 路径仅为兼容多 GPU 配置保留。
 
 SR 每张 GPU 优先使用两个显式 shared-output slot。OutputPump 可持有旧 slot 做 Lanczos4/编码，同时 SR worker 写另一个 slot；若 `/dev/shm` 不足以维持双 slot，则启动时自动回退到单 slot。
 
@@ -144,9 +151,17 @@ OutputPump 的有界队列使用 timeout + error check 循环。若 resize/write
 
 当前跨进程 frame pool 仍基于 POSIX shared memory，但每个 CUDA worker 会对自己长期使用的 input / frame-output / SR-output 映射尝试 `cudaHostRegister()`。注册成功后，这些映射由 CUDA 视为 page-locked host memory：8-bit H2D 可以直接从 shared slot 异步 DMA，8-bit D2H 也可以直接写 shared output，因此活动主路径不再需要 shared-memory ↔ pinned-staging 的第二次 CPU memcpy。
 
-`cudaHostRegister()` 是启动期、长期持有的优化，而不是逐帧注册。若当前 CUDA/OS/驱动不支持注册，或注册失败，worker 只打印一次对应映射的 fallback 信息并继续使用 v6.9 可复用 pinned staging，不改变功能正确性。由于 page-locked memory 是有限系统资源，v7.0 只注册推理进程已经固定分配的 frame pools，不创建额外同尺寸 pinned 副本。
+`cudaHostRegister()` 是启动期、长期持有的优化，而不是逐帧注册。若当前 CUDA/OS/驱动不支持注册，或注册失败，worker 只打印一次对应映射的 fallback 信息并继续使用 v6.9 可复用 pinned staging，不改变功能正确性。由于 page-locked memory 是有限系统资源，v8.0 视频路径只注册推理进程已经固定分配的 frame pools，不创建额外同尺寸 pinned 副本。
 
 连续 FrameHandle slot 会直接形成一个 NumPy/Torch shared-memory slice，一次 packed CUDA batch 对应一次异步 D2H。只有 frame pool 碎片化导致无法取得连续 run 时，才回退 staging + scatter；slot allocator 会优先寻找足够长的连续空闲区来减少这种情况。
+
+## 音频处理边界
+
+Notebook 将 `VIDEO_ENHANCE` 放在视频参数单元，将 `AUDIO_ENHANCE` 放在独立音频参数单元。`AUDIO_ENHANCE=False` 时强制使用原音频 stream copy，不执行音频 DSP；`AUDIO_ENHANCE=True` 时使用独立 `audio/` 模块完成 EQ、温和压缩、de-esser、EBU R128 loudness normalization，并以 AAC 输出。音频增强只使用 FFmpeg/CPU，不进入 BVS/RIFE/SR CUDA worker。
+
+启用音频增强时，程序会在加载 GPU 模型之前检查 FFmpeg 是否具备所需滤镜；缺失时立即 fail-fast，避免视频推理完成后才失败。
+
+`VIDEO_ENHANCE=False` 时不创建 GPU worker，`audio.process` 直接 stream-copy 视频并按 `AUDIO_ENHANCE` 决定复制或处理音频。
 
 ## 离线进度
 
@@ -160,15 +175,11 @@ Kaggle Notebook 使用 `subprocess.Popen(..., stdout=PIPE, stderr=STDOUT)` 捕�
 
 ## Kaggle 参数
 
+视频参数与音频参数在 Notebook 中分属独立单元格，核心开关为：
+
 ```python
-MODEL = "realesr-animevideov3"
-SCALE = 2
-RIFE_FPS = 60  # 0 = 关闭 RIFE
-GPU_IDS = "0"
-BVS_TILE_SIZE = 640
-BVS_CLIP_LENGTH = 13
-BVS_BATCH_SIZE = 1
-BVS_STRENGTH = 1.0
+VIDEO_ENHANCE = True
+AUDIO_ENHANCE = True
 ```
 
 ## 编码
