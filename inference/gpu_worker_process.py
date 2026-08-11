@@ -49,7 +49,18 @@ def _register_shared_views(
     registrations: list[CudaHostRegistration] = []
     for name, view in views:
         try:
-            registrations.append(CudaHostRegistration(view))
+            registration = CudaHostRegistration(view)
+            registrations.append(registration)
+            status = (
+                "cudaHostRegister=success"
+                if registration.owned
+                else "already-pinned"
+            )
+            print(
+                f"[gpu] cuda:{gpu_id}/{role.value} {name} host registration "
+                f"ready | {status} | {registration.nbytes / 2**20:.1f} MiB",
+                flush=True,
+            )
         except Exception as error:
             print(
                 f"[gpu] cuda:{gpu_id}/{role.value} {name} host registration "
