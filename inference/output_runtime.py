@@ -1,4 +1,4 @@
-"""Explicit output resize, progress, and encode-pump runtime."""
+"""Explicit output resize, progress, and fail-fast encode-pump runtime."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from tqdm import tqdm as _tqdm
 
 _HEARTBEAT_INTERVAL = 60.0
 _RATE_WINDOW = 120.0
+_QUEUE_PUT_TIMEOUT = 0.25
 
 
 class _InteractiveTqdm(_tqdm):
@@ -23,14 +24,8 @@ class _InteractiveTqdm(_tqdm):
         kwargs["file"] = sys.stderr
         kwargs["disable"] = False
         kwargs["miniters"] = 1
-        kwargs["mininterval"] = min(
-            float(kwargs.get("mininterval", 0.5)),
-            0.5,
-        )
-        kwargs["maxinterval"] = min(
-            float(kwargs.get("maxinterval", 2.0)),
-            2.0,
-        )
+        kwargs["mininterval"] = min(float(kwargs.get("mininterval", 0.5)), 0.5)
+        kwargs["maxinterval"] = min(float(kwargs.get("maxinterval", 2.0)), 2.0)
         super().__init__(*args, **kwargs)
 
 
@@ -42,9 +37,7 @@ class _SilentTqdm(_tqdm):
 
 def create_progress(total: int):
     interactive = (
-        os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "")
-        .strip()
-        .lower()
+        os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "").strip().lower()
         == "interactive"
     )
     cls = _InteractiveTqdm if interactive else _SilentTqdm
@@ -54,10 +47,7 @@ def create_progress(total: int):
         unit="frame",
         dynamic_ncols=True,
         mininterval=1.0,
-        bar_format=(
-            "{l_bar}{bar}| {n_fmt}/{total_fmt} "
-            "[{elapsed}{postfix}]"
-        ),
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}{postfix}]",
     )
 
 
@@ -72,7 +62,7 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def _resize(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+def resize_frame(frame: np.ndarray, width: int, height: int) -> np.ndarray:
     if frame.shape[1] == width and frame.shape[0] == height:
         return np.ascontiguousarray(frame)
     return np.ascontiguousarray(
@@ -148,8 +138,7 @@ class OutputPump:
             return 0.0
         return max(
             0.0,
-            (self.processed - 1)
-            / max(now - self.first_output_at, 1e-6),
+            (self.processed - 1) / max(now - self.first_output_at, 1e-6),
         )
 
     def _run(self) -> None:
@@ -164,7 +153,7 @@ class OutputPump:
                 _frame_id, worker_id = item
                 try:
                     mark = time.monotonic()
-                    frame = _resize(
+                    frame = resize_frame(
                         self.workers.output(worker_id),
                         self.width,
                         self.height,
@@ -183,14 +172,9 @@ class OutputPump:
                     rate = self._stable_rate(now)
                     total = int(self.progress.total or 0)
                     remaining = max(0, total - self.processed)
-                    eta = (
-                        remaining / rate
-                        if rate > 1e-9
-                        else float("inf")
-                    )
+                    eta = remaining / rate if rate > 1e-9 else float("inf")
                     self.progress.set_postfix_str(
-                        f"{rate:.3f} frame/s | "
-                        f"ETA {_format_duration(eta)}",
+                        f"{rate:.3f} frame/s | ETA {_format_duration(eta)}",
                         refresh=False,
                     )
                 finally:
@@ -204,11 +188,7 @@ class OutputPump:
         now = time.monotonic()
         total = int(self.progress.total or 0)
         rate = self._stable_rate(now)
-        percent = (
-            100.0 * self.processed / total
-            if total > 0
-            else 0.0
-        )
+        percent = 100.0 * self.processed / total if total > 0 else 0.0
         remaining = max(0, total - self.processed)
         eta = remaining / rate if rate > 1e-9 else float("inf")
         speed = (
@@ -250,27 +230,38 @@ class OutputPump:
     def check(self) -> None:
         if self.error is not None:
             raise RuntimeError(
-                f"Output pipeline failed: {self.error!r}\n"
-                f"{self.traceback_text}"
+                f"Output pipeline failed: {self.error!r}\n{self.traceback_text}"
             ) from self.error
 
+    def _enqueue(self, item: tuple[int, int] | None) -> None:
+        """Enqueue without allowing a dead output thread to strand the scheduler."""
+        while True:
+            self.check()
+            if not self.thread.is_alive():
+                raise RuntimeError("Output pipeline thread exited unexpectedly")
+            try:
+                self.queue.put(item, timeout=_QUEUE_PUT_TIMEOUT)
+                return
+            except queue.Full:
+                continue
+
     def put(self, frame_id: int, worker_id: int) -> None:
-        self.check()
-        self.queue.put((int(frame_id), int(worker_id)))
+        self._enqueue((int(frame_id), int(worker_id)))
         self.check()
 
     def finish(self) -> None:
         self.check()
-        self.queue.put(None)
+        self._enqueue(None)
         self.thread.join()
         self.check()
         self._stop_heartbeat(final=True)
 
     def stop(self) -> None:
         self._stop_heartbeat(final=False)
-        if self.thread.is_alive():
-            try:
-                self.queue.put(None, timeout=5)
-            except queue.Full:
-                return
-            self.thread.join(timeout=10)
+        if not self.thread.is_alive():
+            return
+        try:
+            self._enqueue(None)
+        except Exception:
+            return
+        self.thread.join(timeout=10)

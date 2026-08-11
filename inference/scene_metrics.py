@@ -1,9 +1,17 @@
-"""CPU-only scene-difference metric shared by clip and interpolation planning."""
+"""CPU-only scene signatures shared by clip and interpolation planning."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
+
+
+@dataclass(frozen=True)
+class SceneSignature:
+    luma: np.ndarray
+    histogram: np.ndarray
 
 
 def _frame_to_float_rgb(frame: np.ndarray) -> np.ndarray:
@@ -18,25 +26,41 @@ def _frame_to_float_rgb(frame: np.ndarray) -> np.ndarray:
     raise TypeError(f"Unsupported scene metric dtype: {frame.dtype}")
 
 
-def scene_difference(previous: np.ndarray, current: np.ndarray) -> float:
-    prev = _frame_to_float_rgb(previous)
-    curr = _frame_to_float_rgb(current)
-    prev_small = cv2.resize(prev, (64, 64), interpolation=cv2.INTER_AREA)
-    curr_small = cv2.resize(curr, (64, 64), interpolation=cv2.INTER_AREA)
-    prev_luma = (
-        0.2126 * prev_small[..., 0]
-        + 0.7152 * prev_small[..., 1]
-        + 0.0722 * prev_small[..., 2]
+def scene_signature(frame: np.ndarray) -> SceneSignature:
+    """Compute the exact 64x64 representation used by the existing metric."""
+    rgb = _frame_to_float_rgb(frame)
+    small = cv2.resize(rgb, (64, 64), interpolation=cv2.INTER_AREA)
+    luma = (
+        0.2126 * small[..., 0]
+        + 0.7152 * small[..., 1]
+        + 0.0722 * small[..., 2]
     )
-    curr_luma = (
-        0.2126 * curr_small[..., 0]
-        + 0.7152 * curr_small[..., 1]
-        + 0.0722 * curr_small[..., 2]
+    histogram, _ = np.histogram(
+        luma,
+        bins=32,
+        range=(0.0, 1.0),
+        density=False,
     )
-    mad = float(np.mean(np.abs(prev_luma - curr_luma)))
-    hist_prev, _ = np.histogram(prev_luma, bins=32, range=(0.0, 1.0), density=False)
-    hist_curr, _ = np.histogram(curr_luma, bins=32, range=(0.0, 1.0), density=False)
-    hist_prev = hist_prev.astype(np.float64) / max(hist_prev.sum(), 1)
-    hist_curr = hist_curr.astype(np.float64) / max(hist_curr.sum(), 1)
-    hist_distance = 0.5 * float(np.abs(hist_prev - hist_curr).sum())
+    histogram = histogram.astype(np.float64) / max(histogram.sum(), 1)
+    return SceneSignature(
+        luma=np.ascontiguousarray(luma),
+        histogram=histogram,
+    )
+
+
+def scene_difference_from_signatures(
+    previous: SceneSignature,
+    current: SceneSignature,
+) -> float:
+    mad = float(np.mean(np.abs(previous.luma - current.luma)))
+    hist_distance = 0.5 * float(
+        np.abs(previous.histogram - current.histogram).sum()
+    )
     return 0.7 * mad + 0.3 * hist_distance
+
+
+def scene_difference(previous: np.ndarray, current: np.ndarray) -> float:
+    return scene_difference_from_signatures(
+        scene_signature(previous),
+        scene_signature(current),
+    )

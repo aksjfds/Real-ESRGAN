@@ -1,6 +1,6 @@
 # Real-ESRGAN 动画视频推理
 
-当前 v6.3 流水线：
+当前 v6.4 流水线：
 
 ```text
 FFmpeg 解码
@@ -18,25 +18,31 @@ FFmpeg 解码
 - v6.0：加入 Practical-RIFE 4.25。
 - v6.1：一张 GPU 一个常驻 `spawn` 子进程，BVS / RIFE / SR 独立 task。
 - v6.2：typed task protocol、FrameHandle 引用计数、locality-aware 调度。
-- v6.3：去除当前活动路径的运行时 monkey-patch，显式 BVS/RIFE/SR runtime，事件驱动 IPC，RIFE compact H2D/direct-slot 输出，原生 GPU timing 和显式 progress/output runtime。
+- v6.3：去除活动路径 monkey-patch，显式 runtime、事件驱动 IPC、RIFE direct-slot、原生 GPU timing。
+- v6.4：OutputPump/Pipe fail-fast、BVS CUDA direct-slot、scene signature cache、runtime API 边界和更严格 task/runtime 类型协议。
 
 ## 当前结构
 
-- `inference.py`：当前 CLI；只暴露 `RIFE_FPS`，不再构造或删除遗留 `--fps` 参数。
+- `inference.py`：当前 CLI；只暴露 `RIFE_FPS`，不提供遗留 `--fps` 参数。
 - `inference/scheduler.py`：CPU 视频编排，不直接执行 CUDA 模型。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：任务策略、状态、结果处理、watchdog 和事件驱动等待。
 - `inference/task_protocol.py`：BVS / RIFE / SR typed task/result protocol。
-- `inference/gpu_transport.py`：一 GPU 一进程、共享内存、Pipe 控制通道、worker 生命周期。
+- `inference/worker_protocols.py`：GPU runtime 结构化接口。
+- `inference/runtime_api.py`：当前调度路径与 legacy `runtime.py` 之间的窄兼容边界。
+- `inference/basicvsrpp_api.py` / `rife425_api.py`：模型内部兼容边界，活动 runtime 不直接访问私有符号。
+- `inference/gpu_transport.py`：基础一 GPU 一进程、共享内存和 Pipe 生命周期。
+- `inference/stable_gpu_transport.py`：Pipe EOF/startup fail-fast 语义。
 - `inference/gpu_workers.py` / `frame_pool.py`：FrameHandle、slot 引用计数和 locality-aware 数据传递。
 - `inference/gpu_worker_process.py`：固定 CUDA device context 的 worker 主循环。
-- `inference/gpu_task_handlers.py`：GPU task handler registry。
-- `inference/optimized_basicvsrpp.py`：显式 BasicVSR++ 执行优化类；替代 `v54_runtime` monkey-patch。
+- `inference/gpu_task_handlers.py`：GPU task handler registry 和 direct-slot transport。
+- `inference/bvs_runtime.py`：当前 BasicVSR++ uint8 CUDA direct-slot runtime。
+- `inference/optimized_basicvsrpp.py`：v5.8 BasicVSR++ 数值/执行优化基础类。
 - `inference/optimized_rife425.py`：RIFE 4.25 compact H2D 和 direct shared-slot 输出。
 - `inference/sr_runtime.py`：显式 Real-ESRGAN uint8 CUDA helper。
-- `inference/output_runtime.py`：输出 pump、Lanczos4 resize、交互/批处理 progress。
-- `inference/clip_source.py` / `timeline.py` / `scene_metrics.py`：CPU clip、目标时间轴、场景检测。
+- `inference/output_runtime.py`：fail-fast 输出 pump、Lanczos4 resize、交互/批处理 progress。
+- `inference/clip_source.py` / `timeline.py` / `scene_metrics.py`：CPU clip、目标时间轴和缓存 scene signature。
 
-旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留用于历史兼容，但当前 v6.3 主路径不再依赖它们。
+旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留历史兼容；当前 v6.4 主路径不依赖这些旧安装器。
 
 ## BasicVSR++ 固定参数
 
@@ -51,6 +57,8 @@ scene_threshold=0.30
 ```
 
 若 `tile=640` OOM，只向 `384 / 320 / 256` 回退。当前版本不包含 `torch.compile`。
+
+8-bit BVS 结果保持 CUDA `uint8` 到 handler，由 handler 只把需要 emit 的帧直接复制到预留 FrameHandle shared-memory slot；不再先构造完整 CPU clip ndarray 再做第二次 CPU memcpy。10-bit 路径保持保守兼容实现。
 
 ## RIFE 4.25 / 输出帧率
 
@@ -67,7 +75,9 @@ RIFE_FPS = 60
 - `scene_difference <= 0.002`：近重复/静止，不调用 RIFE。
 - `scene_difference >= 0.30`：场景切换，不跨镜头插帧。
 
-RIFE 8-bit 输入现在保持 `uint8` 通过 H2D，再在 CUDA 上转换/归一化；生成的 8-bit 帧从 CUDA 直接复制到预留 shared-memory slot，不再经过额外 CPU ndarray 中间副本。10-bit 路径保持保守兼容实现。
+v6.4 将原有 scene metric 拆成可缓存 `SceneSignature`。计算顺序仍为 `float32 → 64×64 INTER_AREA → luma → histogram`，阈值数学不变；连续帧只复用已经计算过的 signature，避免重复整帧 float32 转换。
+
+RIFE 8-bit 输入保持 `uint8` 通过 H2D，再在 CUDA 上转换/归一化；生成的 8-bit 帧从 CUDA 直接复制到预留 shared-memory slot。10-bit 路径保持保守兼容实现。
 
 ## 多 GPU 稳定边界
 
@@ -81,13 +91,15 @@ Main Scheduler
 
 BVS、RIFE、SR 始终是独立 task。中间帧通过 `FrameHandle(worker_id, slot, generation)` 引用共享 slot；优先在已有数据的 GPU 上执行下一阶段，只有负载均衡需要时才进行跨 GPU CPU shared-memory copy。
 
-控制 IPC 使用 per-worker Pipe + `multiprocessing.connection.wait()`；worker task queue 使用 `SimpleQueue`。scheduler 没有固定 10ms polling sleep，输出 slot 释放也会主动唤醒 scheduler。
+控制 IPC 使用 per-worker Pipe + `multiprocessing.connection.wait()`；worker task queue 使用 `SimpleQueue`。结果 Pipe 对端关闭时显式处理 EOF，并结合 worker sentinel 进入 fail-fast 路径，不再把 EOF 当作普通 `recv()` 失败。
 
-启动前在 Linux 上检查 `/dev/shm` 可用容量，避免 shared-memory 不足时运行到中途才出现不明确故障。
+OutputPump 的有界队列使用 timeout + error check 循环。若 resize/writer 线程异常，主 scheduler 会立即收到错误，不会永久阻塞在满队列 `put()`。
+
+启动前在 Linux 上检查 `/dev/shm` 可用容量，避免 shared-memory 不足运行到中途才出现不明确故障。
 
 ## GPU timing
 
-`--gpu-timing` 现在直接在 GPU worker 内围绕 BVS/RIFE/SR handler 使用 CUDA Event，并通过 typed `TaskResult` 返回统计。关闭时不创建 CUDA Event；开启时因显式同步会产生 profiling 开销。
+`--gpu-timing` 直接在 GPU worker 内围绕 BVS/RIFE/SR handler 使用 CUDA Event，并通过 typed `TaskResult` 返回统计。关闭时不创建 CUDA Event；开启时因显式同步会产生 profiling 开销。
 
 ## Kaggle 参数
 

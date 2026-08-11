@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, cast
 
 import numpy as np
 import torch
 
-from . import runtime as base
+from . import runtime_api as base
 from .sr_runtime import infer_cuda_u8_tensor
 from .task_protocol import (
     BVSResult,
@@ -17,18 +17,21 @@ from .task_protocol import (
     FrameStorage,
     RIFEResult,
     RIFETask,
+    ResultPayload,
     SRResult,
     SRTask,
     TaskKind,
+    WorkerTask,
 )
+from .worker_protocols import BasicVSRExecutor, RIFEExecutor
 
 
 @dataclass
 class WorkerContext:
     device: torch.device
     dtype: np.dtype
-    bvs: object
-    rife: object | None
+    bvs: BasicVSRExecutor
+    rife: RIFEExecutor | None
     sr_model: torch.nn.Module
     input_view: np.ndarray
     frame_output_view: np.ndarray
@@ -45,27 +48,41 @@ def resolve_frame(context: WorkerContext, frame: FrameInput) -> np.ndarray:
     raise RuntimeError(f"Unsupported frame storage: {frame.storage!r}")
 
 
-def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
-    clips: list[list[np.ndarray]] = []
-    cursor = 0
-    for group in task.groups:
-        clips.append(
-            [
-                context.input_view[cursor + index]
-                for index in range(group.count)
-            ]
-        )
-        cursor += group.count
+def _copy_bvs_device_groups(
+    context: WorkerContext,
+    task: BVSTask,
+    device_groups: list[torch.Tensor],
+) -> tuple[int, ...]:
+    if len(device_groups) != len(task.groups):
+        raise RuntimeError("BVS device output group count mismatch")
 
-    before_tiles = int(getattr(context.bvs, "tiles", 0))
-    if len(clips) > 1 and hasattr(context.bvs, "enhance_clips"):
-        enhanced_groups = context.bvs.enhance_clips(clips)
-    else:
-        enhanced_groups = [
-            context.bvs.enhance_clip(frames)
-            for frames in clips
-        ]
+    output_cursor = 0
+    emitted_counts: list[int] = []
+    for group, enhanced in zip(task.groups, device_groups):
+        emitted = enhanced[group.emit_start : group.emit_end]
+        emitted_count = int(emitted.shape[0])
+        emitted_counts.append(emitted_count)
 
+        end = output_cursor + emitted_count
+        slots = task.output_slots[output_cursor:end]
+        if len(slots) != emitted_count:
+            raise RuntimeError("BVS task output-slot accounting mismatch")
+
+        for slot, frame_cuda in zip(slots, emitted):
+            target = torch.from_numpy(context.frame_output_view[slot])
+            target.copy_(frame_cuda, non_blocking=False)
+        output_cursor = end
+
+    if output_cursor != len(task.output_slots):
+        raise RuntimeError("BVS task did not fill all reserved output slots")
+    return tuple(emitted_counts)
+
+
+def _copy_bvs_cpu_groups(
+    context: WorkerContext,
+    task: BVSTask,
+    enhanced_groups: list[list[np.ndarray]],
+) -> tuple[int, ...]:
     output_cursor = 0
     emitted_counts: list[int] = []
     for group, enhanced in zip(task.groups, enhanced_groups):
@@ -88,11 +105,44 @@ def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
 
     if output_cursor != len(task.output_slots):
         raise RuntimeError("BVS task did not fill all reserved output slots")
+    return tuple(emitted_counts)
+
+
+def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
+    clips: list[list[np.ndarray]] = []
+    cursor = 0
+    for group in task.groups:
+        clips.append(
+            [
+                context.input_view[cursor + index]
+                for index in range(group.count)
+            ]
+        )
+        cursor += group.count
+
+    before_tiles = int(context.bvs.tiles)
+    device_groups = context.bvs.enhance_clips_device(clips)
+    if device_groups is not None:
+        emitted_counts = _copy_bvs_device_groups(
+            context,
+            task,
+            device_groups,
+        )
+    else:
+        if len(clips) > 1:
+            enhanced_groups = context.bvs.enhance_clips(clips)
+        else:
+            enhanced_groups = [context.bvs.enhance_clip(clips[0])]
+        emitted_counts = _copy_bvs_cpu_groups(
+            context,
+            task,
+            enhanced_groups,
+        )
 
     return BVSResult(
-        emitted_counts=tuple(emitted_counts),
-        tile_size=int(getattr(context.bvs, "tile_size", 0)),
-        tiles=int(getattr(context.bvs, "tiles", 0)) - before_tiles,
+        emitted_counts=emitted_counts,
+        tile_size=int(context.bvs.tile_size),
+        tiles=int(context.bvs.tiles) - before_tiles,
         clips=len(clips),
     )
 
@@ -149,12 +199,12 @@ def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
     return SRResult(frame_id=task.frame_id)
 
 
-Handler = Callable[[WorkerContext, object], object]
+Handler = Callable[[WorkerContext, WorkerTask], ResultPayload]
 
 
 def build_handlers() -> dict[TaskKind, Handler]:
     return {
-        TaskKind.BVS: run_bvs,
-        TaskKind.RIFE: run_rife,
-        TaskKind.SR: run_sr,
+        TaskKind.BVS: cast(Handler, run_bvs),
+        TaskKind.RIFE: cast(Handler, run_rife),
+        TaskKind.SR: cast(Handler, run_sr),
     }

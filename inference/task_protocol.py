@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import TypeAlias
 
 
 class TaskKind(str, Enum):
@@ -64,6 +64,9 @@ class SRTask:
     kind: TaskKind = TaskKind.SR
 
 
+WorkerTask: TypeAlias = BVSTask | RIFETask | SRTask
+
+
 @dataclass(frozen=True)
 class WorkerReady:
     worker_id: int
@@ -75,16 +78,6 @@ class TaskStarted:
     worker_id: int
     task_id: int
     kind: TaskKind
-
-
-@dataclass(frozen=True)
-class TaskResult:
-    worker_id: int
-    task_id: int
-    kind: TaskKind
-    seconds: float
-    payload: Any
-    gpu_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -110,3 +103,19 @@ class RIFEResult:
 @dataclass(frozen=True)
 class SRResult:
     frame_id: int
+
+
+ResultPayload: TypeAlias = BVSResult | RIFEResult | SRResult
+
+
+@dataclass(frozen=True)
+class TaskResult:
+    worker_id: int
+    task_id: int
+    kind: TaskKind
+    seconds: float
+    payload: ResultPayload
+    gpu_seconds: float | None = None
+
+
+WorkerMessage: TypeAlias = WorkerReady | TaskStarted | TaskResult | TaskError

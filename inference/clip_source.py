@@ -6,7 +6,11 @@ import time
 
 import numpy as np
 
-from .scene_metrics import scene_difference
+from .scene_metrics import (
+    SceneSignature,
+    scene_difference_from_signatures,
+    scene_signature,
+)
 
 
 class ClipSource:
@@ -33,11 +37,23 @@ class ClipSource:
         self.scene_cuts = 0
         self.closed = False
 
+        self._last_signature: SceneSignature | None = None
+        self._pending_signature: SceneSignature | None = None
+
     def _read_source(self) -> np.ndarray | None:
         started = time.monotonic()
         frame = self.reader.read()
         self.decode_elapsed += time.monotonic() - started
         return frame
+
+    def _adopt_pending(self) -> None:
+        if self.pending is None:
+            self._last_signature = None
+            return
+        self.buffer.append(self.pending)
+        self.pending = None
+        self._last_signature = self._pending_signature
+        self._pending_signature = None
 
     def next_task(self) -> tuple[list[np.ndarray], int, int] | None:
         while True:
@@ -49,15 +65,12 @@ class ClipSource:
                     self.buffer = []
                     self.first_chunk = True
                     self.segment_end = False
-                    if self.pending is not None:
-                        self.buffer.append(self.pending)
-                        self.pending = None
+                    self._adopt_pending()
                     return frames, emit_start, emit_end
 
                 self.segment_end = False
                 if self.pending is not None:
-                    self.buffer.append(self.pending)
-                    self.pending = None
+                    self._adopt_pending()
                     continue
                 if self.eof:
                     return None
@@ -67,17 +80,29 @@ class ClipSource:
                 self.eof = True
                 continue
 
-            if (
-                self.buffer
-                and self.scene_threshold > 0
-                and scene_difference(self.buffer[-1], frame) >= self.scene_threshold
-            ):
-                self.pending = frame
-                self.segment_end = True
-                self.scene_cuts += 1
-                continue
+            current_signature = (
+                scene_signature(frame)
+                if self.scene_threshold > 0
+                else None
+            )
+            if self.buffer and self.scene_threshold > 0:
+                previous_signature = self._last_signature
+                if previous_signature is None:
+                    previous_signature = scene_signature(self.buffer[-1])
+                assert current_signature is not None
+                difference = scene_difference_from_signatures(
+                    previous_signature,
+                    current_signature,
+                )
+                if difference >= self.scene_threshold:
+                    self.pending = frame
+                    self._pending_signature = current_signature
+                    self.segment_end = True
+                    self.scene_cuts += 1
+                    continue
 
             self.buffer.append(frame)
+            self._last_signature = current_signature
             if len(self.buffer) != self.clip_length:
                 continue
 
@@ -92,6 +117,8 @@ class ClipSource:
 
             retain = 2 * self.overlap
             self.buffer = self.buffer[-retain:] if retain else []
+            if not self.buffer:
+                self._last_signature = None
             return frames, emit_start, emit_end
 
     def close(self) -> None:

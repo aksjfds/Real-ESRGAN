@@ -8,7 +8,7 @@ import time
 
 import numpy as np
 
-from . import runtime as base
+from . import runtime_api as base
 from .clip_source import ClipSource
 from .gpu_workers import UnifiedGPUWorkers
 from .output_runtime import OutputPump, create_progress
@@ -25,14 +25,11 @@ def process_video(args) -> None:
         )
     if any(gpu is None for gpu in requested_gpu_ids):
         raise RuntimeError("Unified GPU scheduling requires CUDA GPUs")
-    if base._require_encoder is None or base._writer_type is None:
-        raise RuntimeError(
-            "Encoding backend is not configured. Run through root inference.py."
-        )
 
+    require_encoder, writer_type = base.get_encoding_backend()
     base.require_binary(args.ffmpeg_bin)
     base.require_binary(args.ffprobe_bin)
-    base._require_encoder(args.ffmpeg_bin, args.video_codec)
+    require_encoder(args.ffmpeg_bin, args.video_codec)
 
     input_path = Path(args.input).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
@@ -95,7 +92,7 @@ def process_video(args) -> None:
     overlap = 2
     scene_threshold = 0.30
 
-    native_scale = base._model_native_scale(args.model)
+    native_scale = base.model_native_scale(args.model)
     config = base.WorkerConfig(
         args.model,
         base.resolve_model_paths(args),
@@ -119,7 +116,7 @@ def process_video(args) -> None:
     )
     rife_weights = ""
     if rife_enabled:
-        from .rife425 import resolve_rife425_weights
+        from .rife425_api import resolve_rife425_weights
 
         rife_weights = str(resolve_rife425_weights())
 
@@ -169,7 +166,7 @@ def process_video(args) -> None:
         out_h=out_h,
         output_fps=output_fps,
         video_codec=args.video_codec,
-        output_pix_fmt=base._output_pixel_format(
+        output_pix_fmt=base.output_pixel_format(
             args.video_codec,
             info.bit_depth,
         ),
@@ -206,7 +203,7 @@ def process_video(args) -> None:
     clean = False
 
     try:
-        writer = base._writer_type(
+        writer = writer_type(
             temp_video,
             args.ffmpeg_bin,
             out_w,

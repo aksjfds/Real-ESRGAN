@@ -10,9 +10,9 @@ import traceback
 import numpy as np
 import torch
 
-from . import runtime as base
+from . import runtime_api as base
+from .bvs_runtime import BasicVSRRuntime
 from .gpu_task_handlers import WorkerContext, build_handlers
-from .optimized_basicvsrpp import OptimizedBasicVSRPPPreprocessor
 from .optimized_rife425 import OptimizedRIFE425Interpolator
 from .task_protocol import TaskError, TaskResult, TaskStarted, WorkerReady
 
@@ -55,11 +55,11 @@ def gpu_worker_main(
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cuda.matmul.allow_tf32 = True
 
-            from .basicvsrpp import BasicVSRPPConfig
+            from .basicvsrpp_api import BasicVSRPPConfig
 
             local_bvs_config = dict(bvs_config_dict)
             local_bvs_config["gpu_id"] = int(gpu_id)
-            bvs = OptimizedBasicVSRPPPreprocessor(
+            bvs = BasicVSRRuntime(
                 BasicVSRPPConfig(**local_bvs_config),
                 checkpoint_dir=Path(__file__).resolve().parent / "weights",
             )

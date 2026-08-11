@@ -7,7 +7,11 @@ from fractions import Fraction
 
 import numpy as np
 
-from .scene_metrics import scene_difference
+from .scene_metrics import (
+    SceneSignature,
+    scene_difference_from_signatures,
+    scene_signature,
+)
 
 
 @dataclass(frozen=True)
@@ -63,6 +67,31 @@ class TimelinePlanner:
         self.scene_threshold = float(scene_threshold)
         self.rife_enabled = output_rate > source_rate
 
+        self._cached_signature_source: int | None = None
+        self._cached_signature: SceneSignature | None = None
+
+    def _interval_difference(
+        self,
+        source_id: int,
+        current: np.ndarray,
+        nxt: np.ndarray,
+    ) -> float:
+        if (
+            self._cached_signature_source == source_id
+            and self._cached_signature is not None
+        ):
+            current_signature = self._cached_signature
+        else:
+            current_signature = scene_signature(current)
+
+        next_signature = scene_signature(nxt)
+        self._cached_signature_source = source_id + 1
+        self._cached_signature = next_signature
+        return scene_difference_from_signatures(
+            current_signature,
+            next_signature,
+        )
+
     def plan_interval(
         self,
         source_id: int,
@@ -87,24 +116,16 @@ class TimelinePlanner:
                 rife_times.append(alpha)
 
         if not rife_targets:
-            return IntervalPlan(
-                tuple(direct_targets),
-                (),
-                (),
-            )
+            return IntervalPlan(tuple(direct_targets), (), ())
 
-        difference = scene_difference(current, nxt)
+        difference = self._interval_difference(source_id, current, nxt)
         if (
             not self.rife_enabled
             or difference <= self.duplicate_threshold
             or difference >= self.scene_threshold
         ):
             direct_targets.extend(rife_targets)
-            return IntervalPlan(
-                tuple(direct_targets),
-                (),
-                (),
-            )
+            return IntervalPlan(tuple(direct_targets), (), ())
 
         return IntervalPlan(
             tuple(direct_targets),

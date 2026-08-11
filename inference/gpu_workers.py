@@ -7,7 +7,7 @@ from typing import Sequence
 import numpy as np
 
 from .frame_pool import FrameSlotPool
-from .gpu_transport import GPUWorkerTransport
+from .stable_gpu_transport import StableGPUWorkerTransport
 from .task_protocol import (
     BVSGroup,
     BVSTask,
@@ -19,7 +19,7 @@ from .task_protocol import (
 )
 
 
-class UnifiedGPUWorkers(GPUWorkerTransport):
+class UnifiedGPUWorkers(StableGPUWorkerTransport):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.frames = FrameSlotPool(

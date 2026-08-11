@@ -10,15 +10,15 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from .rife425 import _IFNet425, _load_state
+from .rife425_api import IFNet425, load_rife425_state
 
 
 class OptimizedRIFE425Interpolator:
     def __init__(self, gpu_id: int, weights: Path) -> None:
         self.gpu_id = int(gpu_id)
         self.device = torch.device(f"cuda:{self.gpu_id}")
-        self.model = _IFNet425().eval().requires_grad_(False)
-        state, ignored_teacher, ignored_caltime = _load_state(weights)
+        self.model = IFNet425().eval().requires_grad_(False)
+        state, ignored_teacher, ignored_caltime = load_rife425_state(weights)
         try:
             self.model.load_state_dict(state, strict=True)
         except RuntimeError as error:
