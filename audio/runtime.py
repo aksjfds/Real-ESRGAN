@@ -4,8 +4,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
+import shutil
 import subprocess
 from typing import Sequence
+
+_REQUIRED_FILTERS = (
+    "highpass",
+    "equalizer",
+    "highshelf",
+    "acompressor",
+    "deesser",
+    "loudnorm",
+    "aresample",
+)
 
 
 def _run_checked(command: Sequence[str], label: str) -> subprocess.CompletedProcess:
@@ -19,6 +31,26 @@ def _run_checked(command: Sequence[str], label: str) -> subprocess.CompletedProc
         detail = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f"{label} failed (exit {result.returncode}):\n{detail}")
     return result
+
+
+def validate_runtime(ffmpeg_bin: str) -> None:
+    """Fail before expensive video inference if required audio filters are absent."""
+    if shutil.which(ffmpeg_bin) is None:
+        raise FileNotFoundError(f"Required executable '{ffmpeg_bin}' was not found.")
+    result = _run_checked(
+        [ffmpeg_bin, "-hide_banner", "-filters"],
+        "FFmpeg audio filter probe",
+    )
+    listing = result.stdout
+    missing = [
+        name
+        for name in _REQUIRED_FILTERS
+        if re.search(rf"\b{re.escape(name)}\b", listing) is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "FFmpeg is missing required v8 audio filters: " + ", ".join(missing)
+        )
 
 
 def _voice_filter() -> str:
@@ -226,6 +258,8 @@ def process_media(
             "Audio enhancement requires AUDIO_CODEC='aac' because filtered audio "
             "must be re-encoded."
         )
+    if enhance:
+        validate_runtime(ffmpeg_bin)
 
     total_duration, has_audio = _probe_media(input_path, ffprobe_bin)
     if start < 0 or start >= total_duration:
