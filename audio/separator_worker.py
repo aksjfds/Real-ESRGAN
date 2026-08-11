@@ -45,6 +45,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
 
+    args.model_dir = args.model_dir.resolve()
     args.model_dir.mkdir(parents=True, exist_ok=True)
     if args.prepare:
         _separator(args.model_dir)
@@ -52,22 +53,29 @@ def main() -> None:
     if args.input is None or args.output_dir is None:
         parser.error("--input and --output-dir are required unless --prepare is used")
 
+    args.input = args.input.resolve()
+    args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     separator = _separator(args.model_dir, args.output_dir)
     output_files = separator.separate(
         str(args.input),
         {"Vocals": "dialogue_v81"},
     )
-    candidates = [Path(path) for path in output_files]
+    candidates = []
+    for value in output_files:
+        path = Path(value)
+        if not path.is_absolute():
+            path = args.output_dir / path.name
+        candidates.append(path.resolve())
     dialogue = next(
         (path for path in candidates if "dialogue_v81" in path.name.lower()),
         None,
     )
     if dialogue is None and len(candidates) == 1:
         dialogue = candidates[0]
-    if dialogue is None:
+    if dialogue is None or not dialogue.is_file():
         raise RuntimeError(f"Unable to identify dialogue stem from: {output_files}")
-    print(json.dumps({"dialogue": str(dialogue.resolve())}), flush=True)
+    print(json.dumps({"dialogue": str(dialogue)}), flush=True)
 
 
 if __name__ == "__main__":
