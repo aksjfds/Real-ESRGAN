@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Protocol, Sequence
+from typing import Protocol, Sequence
 
 import numpy as np
 import torch
@@ -29,15 +29,11 @@ class BasicVSRExecutor(Protocol):
 
 
 class RIFEExecutor(Protocol):
-    def interpolate_into(
+    def interpolate_device(
         self,
         frame0: np.ndarray,
         frame1: np.ndarray,
         timesteps: Sequence[float],
-        output_view: np.ndarray,
-        output_slots: Sequence[int],
-        *,
-        compute_done: Callable[[], None] | None = None,
-    ) -> int: ...
+    ) -> torch.Tensor | None: ...
 
     def close(self) -> None: ...

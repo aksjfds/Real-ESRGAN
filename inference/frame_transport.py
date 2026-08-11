@@ -17,11 +17,12 @@ import torch
 
 
 class _H2DSlot:
-    def __init__(self) -> None:
+    def __init__(self, event: torch.cuda.Event) -> None:
         self.buffer: torch.Tensor | None = None
         self.shape: tuple[int, ...] | None = None
         self.dtype: torch.dtype | None = None
-        self.event: torch.cuda.Event | None = None
+        self.event = event
+        self.in_flight = False
 
 
 class PinnedH2DStager:
@@ -34,7 +35,10 @@ class PinnedH2DStager:
             raise ValueError("PinnedH2DStager slots must be positive")
         self.device = device
         self.stream = torch.cuda.Stream(device=device)
-        self._slots = [_H2DSlot() for _ in range(int(slots))]
+        self._slots = [
+            _H2DSlot(torch.cuda.Event())
+            for _ in range(int(slots))
+        ]
         self._cursor = 0
 
     @staticmethod
@@ -56,34 +60,44 @@ class PinnedH2DStager:
         return slot.buffer
 
     def copy(self, source: torch.Tensor) -> torch.Tensor:
-        """Stage a CPU tensor in pinned memory and enqueue H2D on a copy stream."""
+        """Stage a CPU tensor and enqueue H2D on the reusable copy stream."""
         if source.device.type != "cpu":
             raise RuntimeError(
                 f"Expected CPU source, got device={source.device}"
             )
 
+        # If a caller already owns page-locked memory, avoid the otherwise
+        # unavoidable CPU staging memcpy. The caller remains responsible for
+        # keeping that host tensor alive until its consumer stream has waited.
+        if source.is_pinned():
+            with torch.cuda.stream(self.stream):
+                device_tensor = source.to(self.device, non_blocking=True)
+            consumer = torch.cuda.current_stream(self.device)
+            consumer.wait_stream(self.stream)
+            device_tensor.record_stream(consumer)
+            return device_tensor
+
         slot = self._slots[self._cursor]
         self._cursor = (self._cursor + 1) % len(self._slots)
 
         # A pinned host buffer must not be modified while an async DMA still
-        # reads from it. Ring slots let paired RIFE inputs queue back-to-back;
-        # reuse waits only when the ring wraps around.
-        if slot.event is not None:
+        # reads from it. Reuse the slot-local CUDA Event instead of allocating
+        # a fresh Event for every frame/task.
+        if slot.in_flight:
             slot.event.synchronize()
-            slot.event = None
+            slot.in_flight = False
 
         host = self._ensure(source, slot)
         host.copy_(source, non_blocking=False)
 
         with torch.cuda.stream(self.stream):
             device_tensor = host.to(self.device, non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(self.stream)
+            slot.event.record(self.stream)
 
         consumer = torch.cuda.current_stream(self.device)
-        consumer.wait_event(event)
+        consumer.wait_event(slot.event)
         device_tensor.record_stream(consumer)
-        slot.event = event
+        slot.in_flight = True
         return device_tensor
 
 
@@ -95,6 +109,7 @@ class PinnedD2HStager:
             raise ValueError("PinnedD2HStager requires a CUDA device")
         self.device = device
         self.stream = torch.cuda.Stream(device=device)
+        self.done_event = torch.cuda.Event()
         self.buffer: torch.Tensor | None = None
         self._shape: tuple[int, ...] | None = None
         self._dtype: torch.dtype | None = None
@@ -132,8 +147,38 @@ class PinnedD2HStager:
         self.stream.wait_stream(producer)
         with torch.cuda.stream(self.stream):
             host.copy_(source, non_blocking=True)
-        self.stream.synchronize()
+            self.done_event.record(self.stream)
+        self.done_event.synchronize()
         return host.numpy()
+
+
+def copy_host_frames_to_slots(
+    frames: np.ndarray,
+    output_view: np.ndarray,
+    slots: Sequence[int],
+) -> None:
+    """Copy a host frame batch to shared slots, using one copy when contiguous."""
+    count = int(frames.shape[0])
+    slot_ids = tuple(int(slot) for slot in slots)
+    if count != len(slot_ids):
+        raise RuntimeError(
+            f"Host transport frame/slot mismatch: frames={count}, slots={len(slot_ids)}"
+        )
+    if count == 0:
+        return
+
+    first = slot_ids[0]
+    contiguous = slot_ids == tuple(range(first, first + count))
+    if contiguous:
+        np.copyto(
+            output_view[first : first + count],
+            frames,
+            casting="no",
+        )
+        return
+
+    for slot, frame in zip(slot_ids, frames):
+        np.copyto(output_view[slot], frame, casting="no")
 
 
 def copy_cuda_frames_to_slots(
@@ -195,8 +240,7 @@ def copy_cuda_frames_to_slots(
             f"{frames_cpu.dtype} != {output_view.dtype}"
         )
 
-    for slot, frame in zip(slot_ids, frames_cpu):
-        np.copyto(output_view[slot], frame, casting="no")
+    copy_host_frames_to_slots(frames_cpu, output_view, slot_ids)
 
 
 def copy_cuda_frame_to_array(

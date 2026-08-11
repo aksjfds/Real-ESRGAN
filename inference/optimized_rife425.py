@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Sequence
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 
-from .frame_transport import PinnedD2HStager, PinnedH2DStager
+from .frame_transport import (
+    PinnedD2HStager,
+    PinnedH2DStager,
+    copy_host_frames_to_slots,
+)
 from .rife425_api import IFNet425, load_rife425_state
 
 
@@ -34,6 +38,8 @@ class OptimizedRIFE425Interpolator:
             # RIFE stages two source frames back-to-back. Two pinned host slots
             # avoid overwriting a buffer while its async H2D is still in flight.
             self.h2d_stager = PinnedH2DStager(self.device, slots=2)
+            # Retained only for the compatibility interpolate_into() API. The
+            # active v6.9 task path owns D2H in gpu_task_handlers instead.
             self.d2h_stager = PinnedD2HStager(self.device)
 
         self.elapsed = 0.0
@@ -75,26 +81,18 @@ class OptimizedRIFE425Interpolator:
             f"RIFE supports uint8/uint16 frames, got {frame.dtype}"
         )
 
-    def interpolate_into(
+    def interpolate_device(
         self,
         frame0: np.ndarray,
         frame1: np.ndarray,
         timesteps: Sequence[float],
-        output_view: np.ndarray,
-        output_slots: Sequence[int],
-        *,
-        compute_done: Callable[[], None] | None = None,
-    ) -> int:
+    ) -> torch.Tensor | None:
+        """Run RIFE and return a packed CUDA frame batch without host transport."""
         if not timesteps:
-            if compute_done is not None:
-                compute_done()
-            return 0
-        if len(timesteps) != len(output_slots):
-            raise ValueError("RIFE timesteps/output slots must have equal length")
+            return None
         if frame0.shape != frame1.shape or frame0.dtype != frame1.dtype:
             raise ValueError("RIFE frame pairs must have identical shape/dtype")
 
-        started = time.monotonic()
         ta, scale_value = self._compact_to_cuda(frame0)
         tb, _ = self._compact_to_cuda(frame1)
         h, w = frame0.shape[:2]
@@ -124,29 +122,36 @@ class OptimizedRIFE425Interpolator:
                         .contiguous()
                     )
 
-            # Stack is also a CUDA operation; keep it before the compute
-            # boundary so no device-side packing work leaks into the drain phase.
+            # Keep CUDA packing inside the model-compute phase so the handler
+            # can place one precise compute boundary before host transport.
             batch = torch.stack(device_outputs, dim=0)
 
-        # All RIFE model/output-conversion/packing kernels are now enqueued.
-        # The callback synchronizes this boundary and releases the physical
-        # compute lane before the batched D2H/shared-slot drain below.
-        if compute_done is not None:
-            compute_done()
+        self.frames += len(timesteps)
+        return batch
+
+    def interpolate_into(
+        self,
+        frame0: np.ndarray,
+        frame1: np.ndarray,
+        timesteps: Sequence[float],
+        output_view: np.ndarray,
+        output_slots: Sequence[int],
+    ) -> int:
+        """Compatibility API; active scheduling uses interpolate_device()."""
+        if len(timesteps) != len(output_slots):
+            raise ValueError("RIFE timesteps/output slots must have equal length")
+
+        started = time.monotonic()
+        batch = self.interpolate_device(frame0, frame1, timesteps)
+        if batch is None:
+            return 0
 
         frames_cpu = self.d2h_stager.copy(batch)
         if frame0.dtype != np.uint8:
             frames_cpu = frames_cpu.astype(frame0.dtype, copy=False)
-
-        for slot, frame in zip(output_slots, frames_cpu):
-            np.copyto(
-                output_view[int(slot)],
-                frame,
-                casting="no",
-            )
+        copy_host_frames_to_slots(frames_cpu, output_view, output_slots)
 
         self.elapsed += time.monotonic() - started
-        self.frames += len(timesteps)
         return len(timesteps)
 
     def close(self) -> None:

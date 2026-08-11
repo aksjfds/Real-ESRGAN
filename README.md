@@ -1,6 +1,6 @@
 # Real-ESRGAN 动画视频推理
 
-当前 v6.8 流水线：
+当前 v6.9 流水线：
 
 ```text
 FFmpeg 解码
@@ -24,6 +24,7 @@ FFmpeg 解码
 - v6.6：BVS emit group 使用一次 batch D2H，再复制到 FrameHandle shared-memory slots，避免逐帧 blocking D2H。
 - v6.7：RIFE 关闭时恢复 BVS/SR 高水位调度，避免 SR 过早抢占第二条 BVS GPU lane；同输出路径增加单实例进程锁；Kaggle Notebook 将子进程 stdout/stderr 合并后由 notebook kernel 单路转发，避免离线日志重复。
 - v6.8：每张 GPU 拆为常驻 temporal(BVS/RIFE) 与 SR 两个 `spawn` 进程；任务生命周期拆为 CUDA compute / transport drain 两阶段，保持同卡重模型 compute 互斥但允许另一阶段在 D2H/CPU drain 期间接管 compute lane；BVS/RIFE/SR 使用可复用 pinned H2D/D2H staging 与独立 copy stream，BVS/RIFE 合并批量 D2H；SR 使用显式双 shared-output slot 解耦 resize/encoder 反压，`/dev/shm` 紧张时自动回退单 slot。
+- v6.9：保持 v6.8 调度/画质数学不变，进一步收窄 runtime 边界：活动 RIFE runtime 只返回 packed CUDA batch，不再接收 scheduler compute callback，compute-boundary 与 D2H/shared-slot transport 统一回到 task handler；H2D ring slot、D2H 和 worker compute-boundary CUDA Event 改为常驻复用，去除 per-task Event 分配；连续 FrameHandle slots 使用单次 NumPy batch copy，减少逐帧 Python scatter 开销；已 pinned 的外部 CPU tensor 可绕过额外 pinned staging memcpy。
 
 ## 当前结构
 
@@ -31,24 +32,24 @@ FFmpeg 解码
 - `inference/scheduler.py`：CPU 视频编排，不直接执行 CUDA 模型。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：任务策略、compute/drain 状态、结果处理、watchdog 和事件驱动等待。
 - `inference/task_protocol.py`：BVS / RIFE / SR typed task/result protocol，以及 compute-boundary 消息。
-- `inference/worker_protocols.py`：GPU runtime 结构化接口。
+- `inference/worker_protocols.py`：GPU runtime 结构化接口；活动 RIFE 接口只暴露 CUDA batch 计算，不暴露 scheduler/transport callback。
 - `inference/runtime_api.py`：当前调度路径与 legacy `runtime.py` 之间的窄兼容边界。
 - `inference/basicvsrpp_api.py` / `rife425_api.py`：模型内部兼容边界，活动 runtime 不直接访问私有符号。
 - `inference/gpu_transport.py`：每张 GPU 的 temporal/SR 常驻进程、共享内存、SR 双输出 slot 和 Pipe 生命周期。
 - `inference/stable_gpu_transport.py`：Pipe EOF/startup fail-fast 语义。
 - `inference/gpu_workers.py` / `frame_pool.py`：FrameHandle、slot 引用计数和 locality-aware 数据传递。
-- `inference/gpu_worker_process.py`：固定 CUDA device context 的 worker 主循环和 compute-boundary 通知。
-- `inference/gpu_task_handlers.py`：GPU task handler registry、compute/drain 边界和 transport 调用。
-- `inference/frame_transport.py`：可复用 pinned H2D/D2H staging、独立 CUDA copy stream、batch D2H 与严格 shape/dtype/slot 校验。
+- `inference/gpu_worker_process.py`：固定 CUDA device context 的 worker 主循环、常驻 compute-boundary Event 和通知。
+- `inference/gpu_task_handlers.py`：GPU task handler registry、compute/drain 边界和所有活动 host transport。
+- `inference/frame_transport.py`：可复用 pinned H2D/D2H staging、常驻 CUDA Event、独立 CUDA copy stream、batch D2H、连续 shared-slot batch copy 与严格 shape/dtype/slot 校验。
 - `inference/bvs_runtime.py`：当前 BasicVSR++ uint8 CUDA runtime。
 - `inference/optimized_basicvsrpp.py`：v5.8 BasicVSR++ 数值/执行优化基础类。
-- `inference/optimized_rife425.py`：RIFE 4.25 compact pinned H2D、batched D2H 和 shared-slot 输出。
+- `inference/optimized_rife425.py`：RIFE 4.25 compact pinned H2D 与 CUDA batch 生成；`interpolate_into()` 只作为兼容 API 保留。
 - `inference/sr_runtime.py`：显式 Real-ESRGAN uint8 CUDA helper。
 - `inference/output_runtime.py`：fail-fast 输出 pump、SR shared-output slot 消费、Lanczos4 resize、交互/批处理 progress。
 - `inference/clip_source.py` / `timeline.py` / `scene_metrics.py`：CPU clip、目标时间轴和缓存 scene signature。
 - `inference/run_lock.py`：同一输出路径的进程级单实例锁，避免重复运行争抢 GPU/输出文件。
 
-旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留历史兼容；当前 v6.8 主路径不依赖这些旧安装器。
+旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留历史兼容；当前 v6.9 主路径不依赖这些旧安装器。
 
 ## BasicVSR++ 固定参数
 
@@ -64,7 +65,7 @@ scene_threshold=0.30
 
 若 `tile=640` OOM，只向 `384 / 320 / 256` 回退。当前版本不包含 `torch.compile`。
 
-8-bit BVS 结果保持 CUDA `uint8` 到 handler；多个 emit group 在 CUDA 侧合并为连续 batch 后执行一次 pinned D2H，再由 CPU `np.copyto` 写入预留 FrameHandle shared-memory slots。10-bit 路径保持保守兼容实现。
+8-bit BVS 结果保持 CUDA `uint8` 到 handler；多个 emit group 在 CUDA 侧合并为连续 batch 后执行一次 pinned D2H。若预留 FrameHandle slots 连续，则 host batch 通过一次 `np.copyto` 写入连续 shared-memory 区间；slots 不连续时回退逐 slot copy。10-bit 路径保持保守兼容实现。
 
 当 RIFE 关闭时，scheduler 使用一个正常 BVS emit batch 作为 SR backlog 高水位：`clip_length - 2 * overlap`，当前固定参数下为 `9`。在 backlog 未达到高水位时优先保持两张 GPU 继续生产 BVS；达到高水位或 BVS EOF 后再让空闲 GPU 消化 SR，从而避免 SR 一出现就长期抢占第二条 BVS lane。
 
@@ -98,7 +99,7 @@ inference/weights/RIFEv4.25_0919.zip
 
 v6.4 将原有 scene metric 拆成可缓存 `SceneSignature`。计算顺序仍为 `float32 → 64×64 INTER_AREA → luma → histogram`，阈值数学不变；连续帧只复用已经计算过的 signature，避免重复整帧 float32 转换。
 
-RIFE 8-bit 输入保持 `uint8`，通过可复用 pinned H2D staging 与独立 copy stream 进入 CUDA；生成帧在 CUDA 侧打包后执行一次 batched pinned D2H，再写入预留 shared-memory slots。10-bit 路径保持保守兼容实现。
+RIFE 8-bit 输入保持 `uint8`，通过可复用 pinned H2D staging 与独立 copy stream 进入 CUDA；RIFE runtime 只生成 packed CUDA batch，task handler 在 compute boundary 后执行一次 batched pinned D2H 并写入预留 shared-memory slots。10-bit 路径保持保守兼容实现。
 
 ## 多 GPU 稳定边界
 
@@ -112,7 +113,7 @@ Main Scheduler
 
 每个 GPU 子进程在整个运行期间保持固定 `torch.cuda.device(...)` context。当前主路径不存在共享 CUDA `ThreadPoolExecutor`，也不在任务级反复 `torch.cuda.set_device()`。
 
-BVS、RIFE、SR 始终是独立 task。同一物理 GPU 的 heavy model compute 保持互斥；worker 在 CUDA Event 同步确认 compute boundary 后发送 `TaskComputeDone`，scheduler 才允许同卡另一 role 开始 heavy compute，因此 transport drain 可以与另一阶段 compute 重叠，但不会无控制地并发两个重模型 kernel。
+BVS、RIFE、SR 始终是独立 task。同一物理 GPU 的 heavy model compute 保持互斥；worker 使用常驻可重录 CUDA Event，同步确认 compute boundary 后发送 `TaskComputeDone`，scheduler 才允许同卡另一 role 开始 heavy compute，因此 transport drain 可以与另一阶段 compute 重叠，但不会无控制地并发两个重模型 kernel。
 
 中间帧通过 `FrameHandle(worker_id, slot, generation)` 引用共享 slot；优先在已有数据的 GPU 上执行下一阶段，只有负载均衡需要时才进行跨 GPU CPU shared-memory copy。
 
@@ -126,6 +127,12 @@ OutputPump 的有界队列使用 timeout + error check 循环。若 resize/write
 
 同一 `--output` 路径在 POSIX 上通过 `flock(LOCK_EX | LOCK_NB)` 只允许一个 inference 主进程持有；第二个重复运行会在加载 GPU 模型前直接报错，不会与第一个任务争抢 GPU 或同时写同一输出文件。
 
+## 传输边界
+
+当前跨进程 frame pool 仍基于 POSIX shared memory。普通 shared-memory NumPy/Torch view 不是 PyTorch pinned allocation，因此默认 H2D 仍先复制到复用的 pinned staging buffer，再异步 DMA 到 GPU；D2H 也先落到复用 pinned buffer，再写 shared-memory slot。v6.9 减少了 Event 分配和连续 slot scatter 开销，但没有宣称消除这一次 host memcpy。
+
+若未来输入已经来自真正的 page-locked CPU tensor，`PinnedH2DStager` 会直接异步 H2D，跳过额外 staging memcpy。不会默认把整块 `/dev/shm` 长期 `cudaHostRegister`，避免大规模 pinned memory 对系统 RAM/调度造成副作用。
+
 ## 离线进度
 
 非交互式运行时只打印 `[progress]`：启动时立即打印一条，之后每 60 秒一次；结束时可额外输出最终 `done` 状态。不会再输出 `[gpu-status]`。
@@ -134,7 +141,7 @@ Kaggle Notebook 使用 `subprocess.Popen(..., stdout=PIPE, stderr=STDOUT)` 捕�
 
 ## GPU timing
 
-`--gpu-timing` 在 GPU worker 内用 CUDA Event 记录 BVS/RIFE/SR compute boundary，并通过 typed `TaskResult` 返回统计。关闭时不记录 elapsed GPU timing；compute-boundary Event 仍用于保证同卡 heavy compute 互斥和安全 handoff。
+`--gpu-timing` 在 GPU worker 内用常驻 CUDA Event 记录 BVS/RIFE/SR compute boundary，并通过 typed `TaskResult` 返回统计。关闭时不记录 elapsed GPU timing；compute-boundary Event 仍用于保证同卡 heavy compute 互斥和安全 handoff，但不再为每个 task 动态创建 Event。
 
 ## Kaggle 参数
 

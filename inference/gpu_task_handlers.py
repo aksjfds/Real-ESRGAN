@@ -14,6 +14,7 @@ from .frame_transport import (
     PinnedH2DStager,
     copy_cuda_frame_to_array,
     copy_cuda_frames_to_slots,
+    copy_host_frames_to_slots,
 )
 from .sr_runtime import infer_cuda_u8_tensor
 from .task_protocol import (
@@ -208,19 +209,38 @@ def run_rife(context: WorkerContext, task: RIFETask) -> RIFEResult:
 
     frame0 = resolve_frame(context, task.frame0)
     frame1 = resolve_frame(context, task.frame1)
-    count = context.rife.interpolate_into(
+    batch = context.rife.interpolate_device(
         frame0,
         frame1,
         task.timesteps,
+    )
+
+    # RIFE runtime now owns model math only. The task handler owns the scheduler
+    # compute boundary and all host transport, matching the BVS/SR layering.
+    _notify_compute_done(context)
+
+    expected = len(task.output_slots)
+    if batch is None:
+        if expected != 0:
+            raise RuntimeError(
+                "RIFE returned no CUDA batch for reserved output slots"
+            )
+        return RIFEResult(count=0)
+
+    count = int(batch.shape[0])
+    if count != expected:
+        raise RuntimeError(
+            f"RIFE returned {count} frames for {expected} reserved output slots"
+        )
+
+    frames_cpu = _require_d2h_stager(context).copy(batch)
+    if frame0.dtype != np.uint8:
+        frames_cpu = frames_cpu.astype(frame0.dtype, copy=False)
+    copy_host_frames_to_slots(
+        frames_cpu,
         context.frame_output_view,
         task.output_slots,
-        compute_done=lambda: _notify_compute_done(context),
     )
-    _notify_compute_done(context)
-    if count != len(task.output_slots):
-        raise RuntimeError(
-            "RIFE returned a different frame count than reserved output slots"
-        )
     return RIFEResult(count=count)
 
 

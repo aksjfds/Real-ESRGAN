@@ -55,6 +55,16 @@ def _run_task_loop(
 
     send(WorkerReady(worker_id, gpu_id, role))
 
+    # These events are re-recordable after synchronization. Keeping one pair
+    # per persistent worker removes CUDA Event allocation/destruction from the
+    # per-task hot path without changing the compute-boundary semantics.
+    boundary_event = torch.cuda.Event(enable_timing=enable_gpu_timing)
+    start_event = (
+        torch.cuda.Event(enable_timing=True)
+        if enable_gpu_timing
+        else None
+    )
+
     while True:
         task = task_queue.get()
         if task is None:
@@ -68,9 +78,7 @@ def _run_task_loop(
 
         send(TaskStarted(worker_id, task.task_id, task.kind))
         started = time.monotonic()
-        start_event = None
-        if enable_gpu_timing:
-            start_event = torch.cuda.Event(enable_timing=True)
+        if start_event is not None:
             start_event.record()
 
         compute_notified = False
@@ -81,11 +89,10 @@ def _run_task_loop(
             if compute_notified:
                 return
 
-            boundary = torch.cuda.Event(enable_timing=enable_gpu_timing)
-            boundary.record()
-            boundary.synchronize()
+            boundary_event.record()
+            boundary_event.synchronize()
             if start_event is not None:
-                gpu_seconds = start_event.elapsed_time(boundary) / 1000.0
+                gpu_seconds = start_event.elapsed_time(boundary_event) / 1000.0
 
             compute_notified = True
             send(TaskComputeDone(worker_id, task.task_id, task.kind))
