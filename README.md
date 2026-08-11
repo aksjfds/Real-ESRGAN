@@ -14,13 +14,13 @@ FFmpeg 解码
 → HEVC / AV1 编码
 
 音频增强（可关闭）：
-48 kHz PCM
-→ Mel-Band RoFormer dialogue/vocal stem
-→ residual background = original - dialogue
-→ PyTorch 自适应 presence / de-ess / gentle compression
-→ voice-aware 1.5–5 kHz spectral ducking
-→ remix
-→ two-pass EBU R128 loudness / true-peak mastering
+原始音频
+→ 55 Hz high-pass
+→ 500 Hz -0.8 dB / 3 kHz +0.8 dB / 11 kHz high-shelf +0.8 dB
+→ 1.8:1 gentle compression
+→ de-esser
+→ EBU R128 loudnorm（-16 LUFS / -1.5 dBTP）
+→ 48 kHz
 → AAC
 ```
 
@@ -36,7 +36,7 @@ FFmpeg 解码
 
 ## 版本历史
 
-- v8.1 - e98604a [Dev] 🔧：Mel-Band RoFormer 分离 + PyTorch 自适应 dialogue DSP + spectral ducking。
+- v8.1 - b212afa [Dev] 🔧：音频回退到 v8.0 FFmpeg DSP；保留视频链和后续非音频改动。
 - v8.0 - d0908ea [Dev] 🔧：Notebook 独立视频/音频增强开关，音频 FFmpeg DSP 独立模块。
 - v7.0 - 5ec12df [Release] ✅：单 GPU（目标 RTX 4090），其余沿用 v6.10 推理链路。
 - v6.10 - 2ca1203 [Release] ✅：shared-memory 直传、CUDA Lanczos、SR 微批与有序调度。
@@ -55,7 +55,7 @@ FFmpeg 解码
 
 ## 当前结构
 
-- `realesrgan.ipynb`：Kaggle 入口；视频、音频参数分离，`VIDEO_ENHANCE` / `AUDIO_ENHANCE` 独立控制。
+- `realesrgan.ipynb`：Kaggle 入口；视频、音频参数分离，`VIDEO_ENHANCE` / `AUDIO_ENHANCE` 独立控制，当前默认 `DUAL_GPU=True`。
 - `inference.py`：视频增强 CLI 与总入口。
 - `inference/scheduler.py`：CPU 总编排与最终音频边界。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：调度状态、任务策略、结果处理与 watchdog。
@@ -66,13 +66,9 @@ FFmpeg 解码
 - `inference/rife425.py` / `optimized_rife425.py`：Practical-RIFE 4.25 runtime。
 - `inference/sr_runtime.py`：Real-ESRGAN SR runtime。
 - `inference/output_runtime.py`：NPP Lanczos、输出 pump、编码与进度日志。
-- `inference/weights/`：仓库内置模型权重/压缩包。
-- `audio/backend.py`：v8.1 隔离音频环境、RoFormer 模型准备与校验。
-- `audio/separator_worker.py`：Mel-Band RoFormer dialogue/vocal 分离。
-- `audio/dsp.py`：PyTorch 自适应 dialogue DSP 与 spectral ducking。
-- `audio/runtime.py`：音频提取、分离、DSP、mastering 与最终 mux。
-- `audio/prepare.py`：Notebook 推理前音频依赖/模型 fail-fast 预检。
-- `audio/process.py`：仅音频增强或视频 stream-copy 入口。
+- `inference/weights/`：仓库内置 BasicVSR++ 权重分片与 RIFE 模型压缩包。
+- `audio/runtime.py`：FFmpeg dialogue-focused DSP、音频旁路与最终 mux。
+- `audio/process.py`：`VIDEO_ENHANCE=False` 时的视频 stream-copy / 音频处理入口。
 
 ## 模型与资源
 
@@ -80,24 +76,17 @@ FFmpeg 解码
 
 | 文件 | 用途 | 官方来源 / 下载 |
 |---|---|---|
-| `basicvsr_plusplus_c128n25_ntire_decompress_track1_20210223-7b2eba02.pth.part01` | BasicVSR++ NTIRE 2021 压缩视频增强 Track 1 权重第 1 分片 | [OpenMMLab 完整权重](https://download.openmmlab.com/mmediting/restorers/basicvsr_plusplus/basicvsr_plusplus_c128n25_ntire_decompress_track1_20210223-7b2eba02.pth) |
+| `basicvsr_plusplus_c128n25_ntire_decompress_track1_20210223-7b2eba02.pth.part01` | BasicVSR++ NTIRE 2021 Decompression Track 1 权重第 1 分片 | [OpenMMLab 完整权重](https://download.openmmlab.com/mmediting/restorers/basicvsr_plusplus/basicvsr_plusplus_c128n25_ntire_decompress_track1_20210223-7b2eba02.pth) |
 | `basicvsr_plusplus_c128n25_ntire_decompress_track1_20210223-7b2eba02.pth.part02` | 同一 BasicVSR++ 权重第 2 分片；运行时合并并校验 SHA256 前缀 `7b2eba02` | [OpenMMLab 完整权重](https://download.openmmlab.com/mmediting/restorers/basicvsr_plusplus/basicvsr_plusplus_c128n25_ntire_decompress_track1_20210223-7b2eba02.pth) |
-| `RIFEv4.25_0919.zip` | Practical-RIFE 4.25 模型归档；运行时只提取 `flownet.pkl` | [Practical-RIFE](https://github.com/hzwer/Practical-RIFE) / [官方 Google Drive](https://drive.google.com/uc?export=download&id=1ZKjcbmt1hypiFprJPIKW0Tt0lr_2i7bg) |
+| `RIFEv4.25_0919.zip` | Practical-RIFE 4.25 模型归档；运行时提取 `flownet.pkl` | [Practical-RIFE](https://github.com/hzwer/Practical-RIFE) / [官方 Google Drive](https://drive.google.com/uc?export=download&id=1ZKjcbmt1hypiFprJPIKW0Tt0lr_2i7bg) |
 
-### 运行时下载 / 缓存
+### 运行时下载
 
 | 模型 / 文件 | 用途 | 下载链接 |
 |---|---|---|
-| `realesr-animevideov3.pth` | 当前 Notebook 默认 Real-ESRGAN 动画视频超分模型，原生 4× | [GitHub Release](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth) |
-| `RealESRGAN_x4plus.pth` | Real-ESRGAN 通用 4× | [GitHub Release](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth) |
-| `RealESRNet_x4plus.pth` | Real-ESRNet 通用 4× | [GitHub Release](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.1/RealESRNet_x4plus.pth) |
-| `RealESRGAN_x4plus_anime_6B.pth` | 较轻量的动漫图像 4× 模型 | [GitHub Release](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth) |
-| `RealESRGAN_x2plus.pth` | Real-ESRGAN 通用 2× | [GitHub Release](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth) |
-| `realesr-general-x4v3.pth` | Real-ESRGAN general v3 4× | [GitHub Release](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth) |
-| `vocals_mel_band_roformer.ckpt` | v8.1 dialogue/vocal stem 分离；Mel-Band RoFormer | [audio-separator Release](https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/vocals_mel_band_roformer.ckpt) |
-| `vocals_mel_band_roformer.yaml` | 上述 RoFormer 模型配置 | [audio-separator Release](https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/vocals_mel_band_roformer.yaml) |
+| `realesr-animevideov3.pth` | 当前 Notebook 默认 Real-ESRGAN 动画视频超分模型，原生 4× | [Real-ESRGAN 官方 Release](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth) |
 
-Real-ESRGAN 模型由代码在本地不存在时下载；Mel-Band RoFormer 由 `audio-separator` 在 `audio.prepare` 阶段下载到独立音频 cache。仓库已包含的 BasicVSR++ 分片和 RIFE ZIP 不需要联网下载。
+当前默认流水线只需要上述模型资源。若手动修改 `MODEL` 使用其他 Real-ESRGAN 模型，程序会按代码中的官方 URL 下载对应权重；README 不重复罗列非默认模型。当前 FFmpeg 音频增强不需要额外神经网络模型或权重。
 
 ## 编码
 
