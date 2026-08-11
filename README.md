@@ -23,7 +23,7 @@ FFmpeg 解码
 
 ## 版本
 
-- v7.0 - 5702808 [Dev] 🔧：单 GPU 默认（目标 RTX 4090），Notebook 可选双 GPU，沿用 v6.10 推理链路。
+- v7.0 - 5702808 [Dev] 🔧：单 GPU（目标 RTX 4090），其余沿用 v6.10 推理链路。
 - v6.10 - 2ca1203 [Release] ✅：shared-memory 直传、CUDA Lanczos、SR 微批与有序调度。
 - v6.9 - f116bff [Dev] 🔧：复用 CUDA Event，优化 H2D/D2H 与连续 slot 拷贝。
 - v6.8 - f3f35f9 [Dev] 🔧：temporal/SR 分进程，compute 与 transport drain 解耦。
@@ -40,7 +40,7 @@ FFmpeg 解码
 
 ## 当前结构
 
-- `inference.py`：当前 CLI；v7 默认 `--gpu-ids 0`，Notebook 可传 `0,1` 开启双 GPU；只暴露 `RIFE_FPS`，不提供遗留 `--fps` 参数，并在入口持有同输出路径单实例锁。
+- `inference.py`：当前 CLI；v7 默认 `--gpu-ids 0`，只暴露 `RIFE_FPS`，不提供遗留 `--fps` 参数，并在入口持有同输出路径单实例锁。
 - `inference/scheduler.py`：CPU 视频编排，支持至少一张 CUDA GPU，不直接执行 CUDA 模型。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：任务策略、compute/drain 状态、结果处理、watchdog 和事件驱动等待。
 - `inference/task_protocol.py`：BVS / RIFE / SR typed task/result protocol，以及 compute-boundary 消息。
@@ -115,26 +115,20 @@ RIFE 8-bit 输入保持 `uint8`；若来源 shared slot 已注册为 CUDA pinned
 
 ## GPU 稳定边界
 
-v7.0 默认运行单张 RTX 4090；Notebook 通过 `DUAL_GPU` 仅切换传给现有 `--gpu-ids` 的设备列表，核心 scheduler/worker 不新增单双 GPU 分支。
+v7.0 目标运行环境为单张 RTX 4090；代码仍保留通用多 GPU 数据结构，不新增平行的单 GPU pipeline。
 
 ```text
-单 GPU（DUAL_GPU=False）
 Main Scheduler
 └─ cuda:0
    ├─ temporal spawn process → BVS / RIFE
    └─ SR spawn process       → Real-ESRGAN / NPP Lanczos
-
-双 GPU（DUAL_GPU=True）
-Main Scheduler
-├─ cuda:0 → temporal + SR
-└─ cuda:1 → temporal + SR
 ```
 
 每个 GPU 子进程在整个运行期间保持固定 `torch.cuda.device(...)` context。当前主路径不存在共享 CUDA `ThreadPoolExecutor`，也不在任务级反复 `torch.cuda.set_device()`。
 
 BVS、RIFE、SR 始终是独立 task。同一物理 GPU 的 heavy model compute 保持互斥。v7.0 沿用 v6.10 handler：在 compute boundary 前先把依赖当前 producer stream 的 D2H 排入独立 copy stream；copy stream 只等待当时已经提交的 model/packing work。worker 随后同步常驻 compute-boundary Event 并发送 `TaskComputeDone`，scheduler 才允许同卡另一 role 开始 heavy compute。因此 D2H 可在 boundary 到达后立即启动并与后续另一阶段 compute 重叠，但不会无控制地并发两个重模型 kernel。
 
-中间帧通过 `FrameHandle(worker_id, slot, generation)` 引用共享 slot。单 GPU 时所有 FrameHandle 保持本地；双 GPU 时继续使用现有 locality-aware 调度，只有负载均衡需要时才进入 non-local shared-memory copy 路径。
+中间帧通过 `FrameHandle(worker_id, slot, generation)` 引用共享 slot。单 GPU v7.0 中所有 FrameHandle 都保持本地，不进入跨 GPU CPU shared-memory copy；通用 non-local 路径仅为兼容多 GPU 配置保留。
 
 SR 每张 GPU 优先使用两个显式 shared-output slot。OutputPump 可持有旧 slot 做 Lanczos4/编码，同时 SR worker 写另一个 slot；若 `/dev/shm` 不足以维持双 slot，则启动时自动回退到单 slot。
 
@@ -167,29 +161,15 @@ Kaggle Notebook 使用 `subprocess.Popen(..., stdout=PIPE, stderr=STDOUT)` 捕�
 ## Kaggle 参数
 
 ```python
-import torch
-
 MODEL = "realesr-animevideov3"
 SCALE = 2
 RIFE_FPS = 60  # 0 = 关闭 RIFE
-DUAL_GPU = False  # False=单 GPU；True=双 GPU
-
-GPU_COUNT = torch.cuda.device_count()
-if GPU_COUNT < 1:
-    raise RuntimeError("No CUDA GPU is visible to PyTorch")
-if DUAL_GPU and GPU_COUNT < 2:
-    raise RuntimeError(
-        f"DUAL_GPU=True requires at least 2 visible CUDA GPUs; got {GPU_COUNT}"
-    )
-GPU_IDS = "0,1" if DUAL_GPU else "0"
-
+GPU_IDS = "0"
 BVS_TILE_SIZE = 640
 BVS_CLIP_LENGTH = 13
 BVS_BATCH_SIZE = 1
 BVS_STRENGTH = 1.0
 ```
-
-Notebook 调用仍只需把 `GPU_IDS` 传给现有 `--gpu-ids` 参数；`DUAL_GPU` 不进入推理核心。
 
 ## 编码
 
