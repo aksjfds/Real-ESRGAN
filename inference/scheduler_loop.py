@@ -218,53 +218,13 @@ def _watchdog(
         )
 
 
-def _print_status(
-    state: SchedulerState,
-    expected_output: int,
-    frame_output_slots: int,
-    now: float,
-) -> None:
-    status: list[str] = []
-    for worker_id, active in enumerate(state.active):
-        if active is None:
-            task_text = "IDLE"
-        else:
-            reference = (
-                active.started_at
-                if active.started_at is not None
-                else active.submitted_at
-            )
-            phase = (
-                ""
-                if active.started_at is not None
-                else "/queued"
-            )
-            task_text = (
-                f"{active.kind.value.upper()}#{active.task_id}"
-                f"{phase} {now - reference:.1f}s"
-            )
-
-        status.append(
-            f"cuda:{state.gpu_ids[worker_id]}={task_text},"
-            f"slots={state.workers.available_frame_slots(worker_id)}"
-            f"/{frame_output_slots}"
-        )
-
-    print(
-        f"[gpu-status] output={state.next_output}/{expected_output} | "
-        + " | ".join(status),
-        flush=True,
-    )
-
-
 def run_scheduler(
     state: SchedulerState,
     pump,
     expected_output: int,
-    frame_output_slots: int,
+    _frame_output_slots: int,
 ) -> float:
     scheduler_wait = 0.0
-    last_status = time.monotonic()
 
     while True:
         pump.check()
@@ -312,23 +272,12 @@ def run_scheduler(
         now = time.monotonic()
         _watchdog(state, now)
 
-        if now - last_status >= 30.0:
-            _print_status(
-                state,
-                expected_output,
-                frame_output_slots,
-                now,
-            )
-            last_status = now
-
         if state.generation_done():
             break
 
         if not made_progress:
-            until_status = max(0.0, 30.0 - (now - last_status))
-            timeout = min(1.0, until_status if until_status > 0 else 1.0)
             wait_started = time.monotonic()
-            state.workers.wait_for_event(timeout)
+            state.workers.wait_for_event(1.0)
             scheduler_wait += time.monotonic() - wait_started
 
     if state.pending:
