@@ -13,6 +13,7 @@ import torch
 
 from . import runtime_api as base
 from .bvs_runtime import BasicVSRRuntime
+from .frame_transport import CudaHostRegistration
 from .gpu_task_handlers import (
     WorkerContext,
     build_sr_handlers,
@@ -39,6 +40,42 @@ def _configure_worker_cpu_threads() -> None:
         pass
 
 
+def _register_shared_views(
+    gpu_id: int,
+    role: WorkerRole,
+    views: tuple[tuple[str, np.ndarray], ...],
+) -> list[CudaHostRegistration]:
+    """Register long-lived shared mappings, falling back per mapping on failure."""
+    registrations: list[CudaHostRegistration] = []
+    for name, view in views:
+        try:
+            registrations.append(CudaHostRegistration(view))
+        except Exception as error:
+            print(
+                f"[gpu] cuda:{gpu_id}/{role.value} {name} host registration "
+                f"unavailable; using pinned staging fallback: {error!r}",
+                flush=True,
+            )
+    return registrations
+
+
+def _close_host_registrations(
+    gpu_id: int,
+    registrations: list[CudaHostRegistration],
+) -> None:
+    if not registrations:
+        return
+    try:
+        with torch.cuda.device(gpu_id):
+            for registration in reversed(registrations):
+                try:
+                    registration.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _run_task_loop(
     *,
     worker_id: int,
@@ -57,7 +94,8 @@ def _run_task_loop(
 
     # These events are re-recordable after synchronization. Keeping one pair
     # per persistent worker removes CUDA Event allocation/destruction from the
-    # per-task hot path without changing the compute-boundary semantics.
+    # per-task hot path. Handlers enqueue any D2H first; this fence then waits
+    # only for model/packing compute before releasing the physical compute lane.
     boundary_event = torch.cuda.Event(enable_timing=enable_gpu_timing)
     start_event = (
         torch.cuda.Event(enable_timing=True)
@@ -134,6 +172,7 @@ def gpu_temporal_worker_main(
     frame_output_shm = None
     bvs = None
     rife = None
+    host_registrations: list[CudaHostRegistration] = []
 
     try:
         _configure_worker_cpu_threads()
@@ -175,6 +214,14 @@ def gpu_temporal_worker_main(
                 dtype=dtype,
                 buffer=frame_output_shm.buf,
             )
+            host_registrations = _register_shared_views(
+                gpu_id,
+                WorkerRole.TEMPORAL,
+                (
+                    ("input", input_view),
+                    ("frame-output", frame_output_view),
+                ),
+            )
             context = WorkerContext(
                 device=device,
                 dtype=dtype,
@@ -212,6 +259,7 @@ def gpu_temporal_worker_main(
                     model.close()
             except Exception:
                 pass
+        _close_host_registrations(gpu_id, host_registrations)
         for shm in (input_shm, frame_output_shm):
             if shm is not None:
                 try:
@@ -245,6 +293,7 @@ def gpu_sr_worker_main(
     frame_output_shm = None
     sr_output_shm = None
     sr_model = None
+    host_registrations: list[CudaHostRegistration] = []
 
     try:
         _configure_worker_cpu_threads()
@@ -279,6 +328,15 @@ def gpu_sr_worker_main(
                 (sr_output_buffers, *sr_output_shape),
                 dtype=dtype,
                 buffer=sr_output_shm.buf,
+            )
+            host_registrations = _register_shared_views(
+                gpu_id,
+                WorkerRole.SR,
+                (
+                    ("input", input_view),
+                    ("frame-output", frame_output_view),
+                    ("sr-output", sr_output_view),
+                ),
             )
             context = WorkerContext(
                 device=device,
@@ -316,6 +374,7 @@ def gpu_sr_worker_main(
                 del sr_model
         except Exception:
             pass
+        _close_host_registrations(gpu_id, host_registrations)
         for shm in (input_shm, frame_output_shm, sr_output_shm):
             if shm is not None:
                 try:
