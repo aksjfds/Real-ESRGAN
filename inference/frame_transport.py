@@ -1,19 +1,65 @@
-"""Pinned host/device transfer helpers for the GPU video pipeline.
+"""Pinned/direct host-device transport helpers for the GPU video pipeline.
 
-CUDA model outputs are drained through reusable page-locked host buffers on
-non-default copy streams. H2D input staging likewise reuses pinned buffers so
-large shared-memory frames do not pay pageable-memory DMA staging on every task.
-The scheduler separates CUDA compute completion from transport completion, which
-lets the opposite stage overlap copy/CPU drain without running two heavy model
-compute phases at the same time.
+Long-lived shared-memory mappings may be registered in-place with CUDA so the
+active uint8 path can transfer directly between shared slots and CUDA without a
+second CPU staging memcpy. Registration is opportunistic: unsupported platforms
+fall back to the reusable pinned staging path. D2H is enqueued before the worker
+publishes its compute boundary, allowing the copy engine to start as soon as the
+producer stream finishes while preserving heavy-compute exclusivity.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import torch
+
+
+class CudaHostRegistration:
+    """Own one cudaHostRegister() registration for a long-lived NumPy mapping."""
+
+    def __init__(self, array: np.ndarray) -> None:
+        if not array.flags.c_contiguous:
+            raise ValueError("cudaHostRegister requires a contiguous NumPy mapping")
+        if int(array.nbytes) <= 0:
+            raise ValueError("cudaHostRegister requires a non-empty mapping")
+
+        self.array = array
+        self.tensor = torch.from_numpy(array)
+        self.ptr = int(self.tensor.data_ptr())
+        self.nbytes = int(array.nbytes)
+        self.owned = False
+        self.closed = False
+
+        if self.tensor.is_pinned():
+            return
+
+        cudart = torch.cuda.cudart()
+        torch.cuda.check_error(cudart.cudaHostRegister(self.ptr, self.nbytes, 0))
+        self.owned = True
+
+        if not self.tensor.is_pinned():
+            try:
+                torch.cuda.check_error(cudart.cudaHostUnregister(self.ptr))
+            finally:
+                self.owned = False
+            raise RuntimeError(
+                "cudaHostRegister succeeded but PyTorch does not report the mapping as pinned"
+            )
+
+    @property
+    def registered(self) -> bool:
+        return bool(self.tensor.is_pinned())
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if not self.owned:
+            return
+        torch.cuda.check_error(torch.cuda.cudart().cudaHostUnregister(self.ptr))
+        self.owned = False
 
 
 class _H2DSlot:
@@ -26,7 +72,7 @@ class _H2DSlot:
 
 
 class PinnedH2DStager:
-    """Reusable pinned CPU input staging and asynchronous H2D copy."""
+    """Asynchronous H2D with direct registered-memory fast path and fallback."""
 
     def __init__(self, device: torch.device, slots: int = 1) -> None:
         if device.type != "cuda":
@@ -60,15 +106,12 @@ class PinnedH2DStager:
         return slot.buffer
 
     def copy(self, source: torch.Tensor) -> torch.Tensor:
-        """Stage a CPU tensor and enqueue H2D on the reusable copy stream."""
+        """Enqueue H2D, avoiding the staging memcpy for registered/pinned input."""
         if source.device.type != "cpu":
             raise RuntimeError(
                 f"Expected CPU source, got device={source.device}"
             )
 
-        # If a caller already owns page-locked memory, avoid the otherwise
-        # unavoidable CPU staging memcpy. The caller remains responsible for
-        # keeping that host tensor alive until its consumer stream has waited.
         if source.is_pinned():
             with torch.cuda.stream(self.stream):
                 device_tensor = source.to(self.device, non_blocking=True)
@@ -80,9 +123,6 @@ class PinnedH2DStager:
         slot = self._slots[self._cursor]
         self._cursor = (self._cursor + 1) % len(self._slots)
 
-        # A pinned host buffer must not be modified while an async DMA still
-        # reads from it. Reuse the slot-local CUDA Event instead of allocating
-        # a fresh Event for every frame/task.
         if slot.in_flight:
             slot.event.synchronize()
             slot.in_flight = False
@@ -101,8 +141,36 @@ class PinnedH2DStager:
         return device_tensor
 
 
+class PendingD2H:
+    """One enqueued D2H transfer whose completion is synchronized exactly once."""
+
+    def __init__(
+        self,
+        owner: "PinnedD2HStager",
+        host_tensor: torch.Tensor,
+        host_array: np.ndarray,
+        finalize: Callable[[np.ndarray], None] | None,
+        direct: bool,
+    ) -> None:
+        self._owner = owner
+        self._host_tensor = host_tensor
+        self._host_array = host_array
+        self._finalize = finalize
+        self.direct = bool(direct)
+        self._done = False
+
+    def wait(self) -> np.ndarray:
+        if self._done:
+            return self._host_array
+        self._owner._finish(self)
+        self._done = True
+        if self._finalize is not None:
+            self._finalize(self._host_array)
+        return self._host_array
+
+
 class PinnedD2HStager:
-    """Reusable pinned CPU staging for one CUDA worker process."""
+    """Reusable D2H copy stream with registered-shared-memory direct path."""
 
     def __init__(self, device: torch.device) -> None:
         if device.type != "cuda":
@@ -113,6 +181,7 @@ class PinnedD2HStager:
         self.buffer: torch.Tensor | None = None
         self._shape: tuple[int, ...] | None = None
         self._dtype: torch.dtype | None = None
+        self._pending: PendingD2H | None = None
 
     def _ensure(self, source: torch.Tensor) -> torch.Tensor:
         shape = tuple(int(value) for value in source.shape)
@@ -131,8 +200,30 @@ class PinnedD2HStager:
             self._dtype = source.dtype
         return self.buffer
 
-    def copy(self, source: torch.Tensor) -> np.ndarray:
-        """Drain one contiguous CUDA tensor to pinned host memory."""
+    @staticmethod
+    def _direct_target(
+        source: torch.Tensor,
+        target: np.ndarray | None,
+    ) -> torch.Tensor | None:
+        if target is None or not target.flags.c_contiguous:
+            return None
+        target_tensor = torch.from_numpy(target)
+        if tuple(target_tensor.shape) != tuple(source.shape):
+            return None
+        if target_tensor.dtype != source.dtype:
+            return None
+        if not target_tensor.is_pinned():
+            return None
+        return target_tensor
+
+    def begin_copy(
+        self,
+        source: torch.Tensor,
+        *,
+        target: np.ndarray | None = None,
+        finalize: Callable[[np.ndarray], None] | None = None,
+    ) -> PendingD2H:
+        """Enqueue one D2H without blocking the host on its completion."""
         if source.device.type != "cuda":
             raise RuntimeError(
                 f"Expected CUDA source, got device={source.device}"
@@ -141,15 +232,63 @@ class PinnedD2HStager:
             raise RuntimeError(
                 "D2H source must be contiguous before the compute boundary"
             )
-        host = self._ensure(source)
+        if self._pending is not None:
+            raise RuntimeError("D2H stager already has an in-flight transfer")
+
+        direct_tensor = self._direct_target(source, target)
+        direct = direct_tensor is not None
+        if direct:
+            if finalize is not None:
+                raise RuntimeError("Direct D2H target cannot also use a finalizer")
+            host_tensor = direct_tensor
+            host_array = target
+        else:
+            host_tensor = self._ensure(source)
+            host_array = host_tensor.numpy()
+            if target is not None:
+                if tuple(target.shape) != tuple(source.shape):
+                    raise RuntimeError(
+                        f"D2H target shape mismatch: {target.shape} != {tuple(source.shape)}"
+                    )
+                if torch.from_numpy(target).dtype != source.dtype:
+                    raise TypeError(
+                        f"D2H target dtype mismatch: {target.dtype} != {source.dtype}"
+                    )
+                if finalize is not None:
+                    raise RuntimeError("D2H target and explicit finalizer are mutually exclusive")
+
+                def copy_target(array: np.ndarray) -> None:
+                    np.copyto(target, array, casting="no")
+
+                finalize = copy_target
 
         producer = torch.cuda.current_stream(self.device)
         self.stream.wait_stream(producer)
         with torch.cuda.stream(self.stream):
-            host.copy_(source, non_blocking=True)
+            host_tensor.copy_(source, non_blocking=True)
             self.done_event.record(self.stream)
-        self.done_event.synchronize()
-        return host.numpy()
+
+        pending = PendingD2H(
+            self,
+            host_tensor,
+            host_array,
+            finalize,
+            direct,
+        )
+        self._pending = pending
+        return pending
+
+    def _finish(self, pending: PendingD2H) -> None:
+        if self._pending is not pending:
+            raise RuntimeError("Unexpected D2H completion token")
+        try:
+            self.done_event.synchronize()
+        finally:
+            self._pending = None
+
+    def copy(self, source: torch.Tensor) -> np.ndarray:
+        """Compatibility helper: enqueue then wait for pinned staging output."""
+        return self.begin_copy(source).wait()
 
 
 def copy_host_frames_to_slots(
@@ -181,41 +320,38 @@ def copy_host_frames_to_slots(
         np.copyto(output_view[slot], frame, casting="no")
 
 
-def copy_cuda_frames_to_slots(
+def _validate_cuda_frame_batch(
     frames: torch.Tensor,
     output_view: np.ndarray,
     slots: Sequence[int],
-    stager: PinnedD2HStager | None = None,
-) -> None:
-    """Copy one CUDA frame batch into shared-memory slots with one D2H sync."""
+) -> tuple[int, tuple[int, ...]]:
     if frames.device.type != "cuda":
         raise RuntimeError(
-            f"Expected CUDA BVS output, got device={frames.device}"
+            f"Expected CUDA frame batch, got device={frames.device}"
         )
     if frames.dtype != torch.uint8:
         raise TypeError(
-            f"Expected uint8 BVS output, got dtype={frames.dtype}"
+            f"Expected uint8 CUDA frame batch, got dtype={frames.dtype}"
         )
     if frames.ndim != 4:
         raise ValueError(
-            f"Expected BVS output shape [T,H,W,C], got {tuple(frames.shape)}"
+            f"Expected CUDA frame batch [T,H,W,C], got {tuple(frames.shape)}"
         )
 
     count = int(frames.shape[0])
     slot_ids = tuple(int(slot) for slot in slots)
     if count != len(slot_ids):
         raise RuntimeError(
-            f"BVS transport frame/slot mismatch: frames={count}, slots={len(slot_ids)}"
+            f"Transport frame/slot mismatch: frames={count}, slots={len(slot_ids)}"
         )
     if len(set(slot_ids)) != len(slot_ids):
-        raise RuntimeError("BVS transport received duplicate output slots")
+        raise RuntimeError("Transport received duplicate output slots")
 
     expected_shape = tuple(int(value) for value in output_view.shape[1:])
     frame_shape = tuple(int(value) for value in frames.shape[1:])
     if frame_shape != expected_shape:
         raise RuntimeError(
-            "BVS transport frame shape mismatch: "
-            f"frames={frame_shape}, slots={expected_shape}"
+            f"Transport frame shape mismatch: frames={frame_shape}, slots={expected_shape}"
         )
     if output_view.dtype != np.dtype(np.uint8):
         raise TypeError(
@@ -226,29 +362,59 @@ def copy_cuda_frames_to_slots(
     for slot in slot_ids:
         if slot < 0 or slot >= slot_count:
             raise RuntimeError(
-                f"BVS transport output slot out of range: {slot}/{slot_count}"
+                f"Transport output slot out of range: {slot}/{slot_count}"
             )
+    return count, slot_ids
 
+
+def begin_cuda_frames_to_slots(
+    frames: torch.Tensor,
+    output_view: np.ndarray,
+    slots: Sequence[int],
+    stager: PinnedD2HStager,
+) -> PendingD2H | None:
+    """Enqueue a batch D2H, direct to registered shared slots when contiguous."""
+    count, slot_ids = _validate_cuda_frame_batch(frames, output_view, slots)
     if count == 0:
-        return
+        return None
 
-    transfer = stager or PinnedD2HStager(frames.device)
-    frames_cpu = transfer.copy(frames)
-    if frames_cpu.dtype != output_view.dtype:
-        raise TypeError(
-            "BVS transport dtype changed during D2H: "
-            f"{frames_cpu.dtype} != {output_view.dtype}"
+    first = slot_ids[0]
+    contiguous = slot_ids == tuple(range(first, first + count))
+    if contiguous:
+        return stager.begin_copy(
+            frames,
+            target=output_view[first : first + count],
         )
 
-    copy_host_frames_to_slots(frames_cpu, output_view, slot_ids)
+    return stager.begin_copy(
+        frames,
+        finalize=lambda array: copy_host_frames_to_slots(
+            array,
+            output_view,
+            slot_ids,
+        ),
+    )
 
 
-def copy_cuda_frame_to_array(
+def copy_cuda_frames_to_slots(
+    frames: torch.Tensor,
+    output_view: np.ndarray,
+    slots: Sequence[int],
+    stager: PinnedD2HStager | None = None,
+) -> None:
+    """Compatibility helper for one synchronized frame-batch D2H."""
+    transfer = stager or PinnedD2HStager(frames.device)
+    pending = begin_cuda_frames_to_slots(frames, output_view, slots, transfer)
+    if pending is not None:
+        pending.wait()
+
+
+def begin_cuda_frame_to_array(
     frame: torch.Tensor,
     output_view: np.ndarray,
     stager: PinnedD2HStager,
-) -> None:
-    """Drain one CUDA HWC frame into an existing shared-memory ndarray."""
+) -> PendingD2H:
+    """Enqueue one HWC frame D2H directly to registered output when possible."""
     if frame.device.type != "cuda":
         raise RuntimeError(
             f"Expected CUDA SR output, got device={frame.device}"
@@ -259,10 +425,17 @@ def copy_cuda_frame_to_array(
         raise RuntimeError(
             f"SR transport shape mismatch: {actual_shape} != {expected_shape}"
         )
-
-    frame_cpu = stager.copy(frame)
-    if frame_cpu.dtype != output_view.dtype:
+    if torch.from_numpy(output_view).dtype != frame.dtype:
         raise TypeError(
-            f"SR transport dtype mismatch: {frame_cpu.dtype} != {output_view.dtype}"
+            f"SR transport dtype mismatch: {output_view.dtype} != {frame.dtype}"
         )
-    np.copyto(output_view, frame_cpu, casting="no")
+    return stager.begin_copy(frame, target=output_view)
+
+
+def copy_cuda_frame_to_array(
+    frame: torch.Tensor,
+    output_view: np.ndarray,
+    stager: PinnedD2HStager,
+) -> None:
+    """Compatibility helper for one synchronized HWC frame D2H."""
+    begin_cuda_frame_to_array(frame, output_view, stager).wait()
