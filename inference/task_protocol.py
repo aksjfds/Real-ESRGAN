@@ -64,9 +64,9 @@ class RIFETask:
 @dataclass(frozen=True)
 class SRTask:
     task_id: int
-    frame_id: int
-    frame: FrameInput
-    output_slot: int = 0
+    frame_ids: tuple[int, ...]
+    frames: tuple[FrameInput, ...]
+    output_slots: tuple[int, ...]
     kind: TaskKind = TaskKind.SR
 
 
@@ -119,8 +119,8 @@ class RIFEResult:
 
 @dataclass(frozen=True)
 class SRResult:
-    frame_id: int
-    output_slot: int = 0
+    frame_ids: tuple[int, ...]
+    output_slots: tuple[int, ...]
 
 
 ResultPayload: TypeAlias = BVSResult | RIFEResult | SRResult

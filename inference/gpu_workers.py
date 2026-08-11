@@ -34,6 +34,10 @@ class UnifiedGPUWorkers(GPUWorkerTransport):
     def can_reserve_frames(self, worker_id: int, count: int) -> bool:
         return self.frames.can_reserve(worker_id, count)
 
+    def available_sr_output_slots(self, worker_id: int) -> int:
+        with self._sr_lock:
+            return len(self._sr_free_slots[worker_id])
+
     def retain(self, handle: FrameHandle, count: int = 1) -> None:
         self.frames.retain(handle, count)
 
@@ -189,6 +193,53 @@ class UnifiedGPUWorkers(GPUWorkerTransport):
 
         return outputs, tuple(deferred)
 
+    def submit_sr_batch(
+        self,
+        worker_id: int,
+        task_id: int,
+        frame_ids: Sequence[int],
+        frames: Sequence[FrameHandle],
+    ) -> tuple[tuple[FrameHandle, ...], tuple[int, ...]]:
+        ids = tuple(int(value) for value in frame_ids)
+        handles = tuple(frames)
+        if not ids or len(ids) != len(handles):
+            raise ValueError("SR batch frame ids/handles must be non-empty and aligned")
+        if len(ids) > self.input_slots:
+            raise RuntimeError("SR micro-batch exceeds unified GPU input buffer")
+
+        claimed: list[int] = []
+        deferred: list[FrameHandle] = []
+        inputs: list[FrameInput] = []
+        try:
+            for _ in ids:
+                claimed.append(self.claim_sr_output(worker_id))
+            claimed.sort()
+
+            for index, handle in enumerate(handles):
+                frame_input, releases = self._prepare_handle_input(
+                    worker_id,
+                    handle,
+                    index,
+                )
+                inputs.append(frame_input)
+                deferred.extend(releases)
+
+            self.sr_task_queues[worker_id].put(
+                SRTask(
+                    task_id=int(task_id),
+                    frame_ids=ids,
+                    frames=tuple(inputs),
+                    output_slots=tuple(claimed),
+                )
+            )
+        except Exception:
+            for slot in claimed:
+                self.release(worker_id, slot)
+            self.frames.release_many(deferred)
+            raise
+
+        return tuple(deferred), tuple(claimed)
+
     def submit_sr(
         self,
         worker_id: int,
@@ -196,26 +247,10 @@ class UnifiedGPUWorkers(GPUWorkerTransport):
         frame_id: int,
         frame: FrameHandle,
     ) -> tuple[tuple[FrameHandle, ...], int]:
-        output_slot = self.claim_sr_output(worker_id)
-        deferred: tuple[FrameHandle, ...] = ()
-
-        try:
-            frame_input, deferred = self._prepare_handle_input(
-                worker_id,
-                frame,
-                0,
-            )
-            self.sr_task_queues[worker_id].put(
-                SRTask(
-                    task_id=int(task_id),
-                    frame_id=int(frame_id),
-                    frame=frame_input,
-                    output_slot=int(output_slot),
-                )
-            )
-        except Exception:
-            self.release(worker_id, output_slot)
-            self.frames.release_many(deferred)
-            raise
-
-        return deferred, output_slot
+        deferred, slots = self.submit_sr_batch(
+            worker_id,
+            task_id,
+            (frame_id,),
+            (frame,),
+        )
+        return deferred, slots[0]

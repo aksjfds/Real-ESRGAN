@@ -24,6 +24,9 @@ from .task_protocol import FrameHandle, TaskKind
 from .timeline import TimelinePlanner
 
 
+_SR_MICRO_BATCH = 2
+
+
 class SchedulerState:
     def __init__(
         self,
@@ -56,10 +59,6 @@ class SchedulerState:
         self.restored_heap: list[tuple[int, FrameHandle]] = []
         self.rife_queue = deque()
 
-        # Each physical GPU owns two persistent process roles. A role stays
-        # occupied until its complete TaskResult arrives, but compute_done=True
-        # releases the physical CUDA compute lane so the opposite role may run
-        # while this task drains D2H / shared-memory / CPU transport.
         self.temporal_active: list[ActiveTask | None] = [
             None for _ in self.gpu_ids
         ]
@@ -350,24 +349,39 @@ class SchedulerState:
             return False
         if self.compute_busy(worker_id):
             return False
-        if not self.workers.can_submit_sr(worker_id):
-            return False
 
-        item = pop_preferred_frame(
-            self.restored_heap,
-            worker_id,
-            local_only,
+        capacity = min(
+            _SR_MICRO_BATCH,
+            self.workers.available_sr_output_slots(worker_id),
         )
-        if item is None:
+        if capacity <= 0:
             return False
 
-        frame_id, handle = item
+        items: list[tuple[int, FrameHandle]] = []
+        for _ in range(capacity):
+            item = pop_preferred_frame(
+                self.restored_heap,
+                worker_id,
+                local_only,
+            )
+            if item is None:
+                break
+            if items and item[0] != items[-1][0] + 1:
+                heapq.heappush(self.restored_heap, item)
+                break
+            items.append(item)
+
+        if not items:
+            return False
+
+        frame_ids = tuple(frame_id for frame_id, _handle in items)
+        handles = tuple(handle for _frame_id, handle in items)
         task_id = self.next_id()
-        deferred, output_slot = self.workers.submit_sr(
+        deferred, output_slots = self.workers.submit_sr_batch(
             worker_id,
             task_id,
-            frame_id,
-            handle,
+            frame_ids,
+            handles,
         )
         self.sr_active[worker_id] = ActiveTask(
             task_id=task_id,
@@ -375,8 +389,8 @@ class SchedulerState:
             submitted_at=time.monotonic(),
             started_at=None,
             meta=SRActive(
-                frame_id=frame_id,
-                output_slot=output_slot,
+                frame_ids=frame_ids,
+                output_slots=output_slots,
                 release_on_result=deferred,
             ),
         )
@@ -390,8 +404,6 @@ class SchedulerState:
         )
 
     def schedule_idle_worker(self, worker_id: int) -> bool:
-        # At most one role may own CUDA compute at a time. The opposite role
-        # may be active only when its compute_done flag says it is draining.
         if self.compute_busy(worker_id):
             return False
 

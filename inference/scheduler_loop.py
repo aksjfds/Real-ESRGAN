@@ -151,19 +151,18 @@ def _handle_sr_result(
 
     meta = active.meta
     state.workers.release_handles(meta.release_on_result)
-    if message.payload.frame_id != meta.frame_id:
-        raise RuntimeError(
-            "SR worker returned an unexpected frame id"
-        )
-    if message.payload.output_slot != meta.output_slot:
-        raise RuntimeError(
-            "SR worker returned an unexpected output slot"
-        )
+    if message.payload.frame_ids != meta.frame_ids:
+        raise RuntimeError("SR worker returned unexpected frame ids")
+    if message.payload.output_slots != meta.output_slots:
+        raise RuntimeError("SR worker returned unexpected output slots")
+    if len(meta.frame_ids) != len(meta.output_slots):
+        raise RuntimeError("SR scheduler batch accounting mismatch")
 
-    state.pending[meta.frame_id] = (
-        message.worker_id,
-        meta.output_slot,
-    )
+    for frame_id, output_slot in zip(meta.frame_ids, meta.output_slots):
+        state.pending[frame_id] = (
+            message.worker_id,
+            output_slot,
+        )
     state.sr_seconds += message.seconds
 
 
@@ -253,13 +252,6 @@ def _schedule_idle_worker_without_rife(
     state: SchedulerState,
     worker_id: int,
 ) -> bool:
-    """Keep BVS parallel until the restored-frame backlog reaches one emit batch.
-
-    A task whose CUDA compute is complete no longer blocks the opposite role:
-    BVS/SR transport drain can overlap the other role's CUDA compute. Heavy
-    model compute itself remains exclusive per physical GPU for predictable
-    VRAM use and to avoid inter-process kernel contention.
-    """
     if state.compute_busy(worker_id):
         return False
 

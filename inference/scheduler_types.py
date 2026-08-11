@@ -32,8 +32,8 @@ class RIFEActive:
 
 @dataclass(frozen=True)
 class SRActive:
-    frame_id: int
-    output_slot: int
+    frame_ids: tuple[int, ...]
+    output_slots: tuple[int, ...]
     release_on_result: tuple[FrameHandle, ...]
 
 

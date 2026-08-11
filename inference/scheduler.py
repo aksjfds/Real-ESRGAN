@@ -105,11 +105,7 @@ def process_video(args) -> None:
         else np.dtype(np.uint8)
     )
     input_shape = (in_h, in_w, 3)
-    native_shape = (
-        in_h * native_scale,
-        in_w * native_scale,
-        3,
-    )
+    final_output_shape = (out_h, out_w, 3)
 
     from .checkpoint_parts import resolve_checkpoint
 
@@ -154,7 +150,7 @@ def process_video(args) -> None:
     else:
         scale_text = (
             f"native={native_scale}x -> final={args.scale:g}x | "
-            "resample=full-frame Lanczos4"
+            "resample=NPP Lanczos CUDA (CPU Lanczos4 fallback)"
         )
 
     from .scheduler_reporting import print_run_header
@@ -256,7 +252,7 @@ def process_video(args) -> None:
             bvs_config=bvs_config,
             rife_weights=rife_weights,
             input_shape=input_shape,
-            sr_output_shape=native_shape,
+            sr_output_shape=final_output_shape,
             dtype=dtype,
             input_slots=input_slots,
             frame_output_slots=frame_output_slots,
@@ -272,7 +268,7 @@ def process_video(args) -> None:
         )
         print(
             "Pipeline: event-driven control IPC | locality-aware "
-            "FrameHandle scheduling",
+            "FrameHandle scheduling | SR micro-batch<=2",
             flush=True,
         )
         print(flush=True)
