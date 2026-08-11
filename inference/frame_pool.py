@@ -39,6 +39,30 @@ class FrameSlotPool:
     def can_reserve(self, worker_id: int, count: int) -> bool:
         return self.available(worker_id) >= int(count)
 
+    @staticmethod
+    def _select_slots(free: set[int], count: int) -> list[int]:
+        """Prefer one contiguous run so CUDA batches can target one shared slice."""
+        ordered = sorted(free)
+        if count <= 1:
+            return ordered[:count]
+
+        run_start = 0
+        for index in range(1, len(ordered) + 1):
+            boundary = (
+                index == len(ordered)
+                or ordered[index] != ordered[index - 1] + 1
+            )
+            if not boundary:
+                continue
+            if index - run_start >= count:
+                return ordered[run_start : run_start + count]
+            run_start = index
+
+        # Fragmentation may make a contiguous run impossible even though the
+        # total free count is sufficient. Preserve the original allocation
+        # semantics as a safe fallback.
+        return ordered[:count]
+
     def reserve(
         self,
         worker_id: int,
@@ -57,7 +81,7 @@ class FrameSlotPool:
             )
 
         handles: list[FrameHandle] = []
-        for slot in sorted(self._free[worker_id])[:count]:
+        for slot in self._select_slots(self._free[worker_id], count):
             self._free[worker_id].remove(slot)
             self._generations[worker_id][slot] += 1
             self._refs[worker_id][slot] = 1
