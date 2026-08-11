@@ -19,9 +19,9 @@ from .timeline import TimelinePlanner, ceil_fraction
 
 def process_video(args) -> None:
     requested_gpu_ids = base.parse_gpu_ids(args.gpu_ids)
-    if len(requested_gpu_ids) < 2:
+    if len(requested_gpu_ids) < 1:
         raise RuntimeError(
-            "Unified GPU scheduling requires at least two CUDA GPUs"
+            "Unified GPU scheduling requires at least one CUDA GPU"
         )
     if any(gpu is None for gpu in requested_gpu_ids):
         raise RuntimeError("Unified GPU scheduling requires CUDA GPUs")
