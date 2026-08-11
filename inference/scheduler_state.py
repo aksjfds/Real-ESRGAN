@@ -17,7 +17,6 @@ from .scheduler_types import (
     RIFEActive,
     RifeJob,
     SRActive,
-    pop_preferred_frame,
     pop_preferred_rife,
 )
 from .task_protocol import FrameHandle, TaskKind
@@ -48,6 +47,10 @@ class SchedulerState:
 
         self.pending: dict[int, tuple[int, int]] = {}
         self.next_output = 0
+        # SR dispatch is an independent ordered frontier. Future restored/RIFE
+        # frames may become ready out of order, but they must never consume all
+        # SR output slots ahead of a missing earlier frame.
+        self.next_sr_dispatch = 0
         self.next_source_id = 0
         self.next_interval = 0
         self.next_task_id = 0
@@ -339,6 +342,55 @@ class SchedulerState:
         self.rife_jobs += 1
         return True
 
+    def _pop_next_sr_batch(
+        self,
+        worker_id: int,
+        capacity: int,
+        *,
+        local_only: bool,
+    ) -> list[tuple[int, FrameHandle]]:
+        """Pop only the next contiguous SR-dispatch prefix.
+
+        GPU locality may choose the worker, but it must never allow a future
+        frame to jump ahead and occupy bounded SR output slots. This prevents
+        output-order head-of-line blocking from turning into slot starvation.
+        """
+        if capacity <= 0 or not self.restored_heap:
+            return []
+
+        first_id, first_handle = self.restored_heap[0]
+        if first_id < self.next_sr_dispatch:
+            raise RuntimeError(
+                "SR restored heap fell behind dispatch frontier: "
+                f"frame={first_id}, frontier={self.next_sr_dispatch}"
+            )
+        if first_id != self.next_sr_dispatch:
+            return []
+
+        owner = int(first_handle.worker_id)
+        if local_only and owner != worker_id:
+            return []
+        if not local_only and owner != worker_id:
+            owner_can_take = (
+                0 <= owner < len(self.gpu_ids)
+                and self.sr_active[owner] is None
+                and not self.compute_busy(owner)
+                and self.workers.available_sr_output_slots(owner) > 0
+            )
+            if owner_can_take:
+                return []
+
+        items = [heapq.heappop(self.restored_heap)]
+        expected = self.next_sr_dispatch + 1
+        while len(items) < capacity and self.restored_heap:
+            next_id, _next_handle = self.restored_heap[0]
+            if next_id != expected:
+                break
+            items.append(heapq.heappop(self.restored_heap))
+            expected += 1
+
+        return items
+
     def schedule_sr(
         self,
         worker_id: int,
@@ -357,32 +409,30 @@ class SchedulerState:
         if capacity <= 0:
             return False
 
-        items: list[tuple[int, FrameHandle]] = []
-        for _ in range(capacity):
-            item = pop_preferred_frame(
-                self.restored_heap,
-                worker_id,
-                local_only,
-            )
-            if item is None:
-                break
-            if items and item[0] != items[-1][0] + 1:
-                heapq.heappush(self.restored_heap, item)
-                break
-            items.append(item)
-
+        items = self._pop_next_sr_batch(
+            worker_id,
+            capacity,
+            local_only=local_only,
+        )
         if not items:
             return False
 
         frame_ids = tuple(frame_id for frame_id, _handle in items)
         handles = tuple(handle for _frame_id, handle in items)
         task_id = self.next_id()
-        deferred, output_slots = self.workers.submit_sr_batch(
-            worker_id,
-            task_id,
-            frame_ids,
-            handles,
-        )
+        try:
+            deferred, output_slots = self.workers.submit_sr_batch(
+                worker_id,
+                task_id,
+                frame_ids,
+                handles,
+            )
+        except Exception:
+            for item in items:
+                heapq.heappush(self.restored_heap, item)
+            raise
+
+        self.next_sr_dispatch += len(frame_ids)
         self.sr_active[worker_id] = ActiveTask(
             task_id=task_id,
             kind=TaskKind.SR,
