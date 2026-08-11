@@ -258,10 +258,10 @@ def process_media(
             "Audio enhancement requires AUDIO_CODEC='aac' because filtered audio "
             "must be re-encoded."
         )
-    if enhance:
-        validate_runtime(ffmpeg_bin)
 
     total_duration, has_audio = _probe_media(input_path, ffprobe_bin)
+    if enhance and has_audio:
+        validate_runtime(ffmpeg_bin)
     if start < 0 or start >= total_duration:
         raise ValueError(f"START_TIME must be in [0, {total_duration:.3f}).")
     available = total_duration - start
