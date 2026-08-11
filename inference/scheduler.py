@@ -8,6 +8,7 @@ import time
 
 import numpy as np
 
+from audio.runtime import mux_audio as mux_output_audio
 from . import runtime_api as base
 from .clip_source import ClipSource
 from .gpu_workers import UnifiedGPUWorkers
@@ -337,7 +338,7 @@ def process_video(args) -> None:
 
     actual_duration = processed / output_fps
     audio_started = time.monotonic()
-    base.mux_audio(
+    mux_output_audio(
         temp_video,
         input_path,
         output_path,
@@ -347,6 +348,7 @@ def process_video(args) -> None:
         info.has_audio,
         args.audio_codec,
         args.audio_bitrate,
+        enhance=bool(args.audio_enhance),
     )
     audio_time = time.monotonic() - audio_started
     if temp_video.exists():
