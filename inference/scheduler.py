@@ -45,16 +45,18 @@ def process_video(args) -> None:
 
     info = base.probe_video(input_path, args.ffprobe_bin)
     source_rate = Fraction(info.fps_num, info.fps_den)
-    output_rate = Fraction(
-        str(float(args.rife_fps))
-    ).limit_denominator(100000)
-    if output_rate < source_rate:
-        raise ValueError(
-            "--rife-fps must be >= source FPS; "
-            f"got {float(output_rate):g} < {float(source_rate):g}"
-        )
+    requested_rife_fps = float(args.rife_fps)
+    if requested_rife_fps == 0.0:
+        output_rate = source_rate
+    else:
+        output_rate = Fraction(str(requested_rife_fps)).limit_denominator(100000)
+        if output_rate < source_rate:
+            raise ValueError(
+                "--rife-fps must be 0 or >= source FPS; "
+                f"got {float(output_rate):g} < {float(source_rate):g}"
+            )
 
-    rife_enabled = output_rate > source_rate
+    rife_enabled = requested_rife_fps > 0.0 and output_rate > source_rate
     source_fps = float(source_rate)
     output_fps = float(output_rate)
     source_rate_text = (

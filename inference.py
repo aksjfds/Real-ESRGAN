@@ -88,7 +88,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--rife-fps",
         type=float,
         default=60.0,
-        help="Practical-RIFE 4.25 target/output FPS; must be >= source FPS",
+        help=(
+            "Practical-RIFE 4.25 target/output FPS; 0 disables RIFE and "
+            "keeps source FPS, otherwise must be >= source FPS"
+        ),
     )
     parser.add_argument(
         "--gpu-timing",
@@ -113,8 +116,8 @@ def _validate_args(args) -> None:
         )
     if int(args.bvs_batch_size) < 1:
         raise ValueError("--bvs-batch-size must be at least 1")
-    if float(args.rife_fps) <= 0:
-        raise ValueError("--rife-fps must be positive")
+    if float(args.rife_fps) < 0:
+        raise ValueError("--rife-fps must be 0 or a positive FPS")
 
 
 def main() -> None:

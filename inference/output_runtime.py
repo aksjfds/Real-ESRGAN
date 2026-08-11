@@ -210,7 +210,6 @@ class OutputPump:
         )
 
     def _heartbeat_run(self) -> None:
-        self._heartbeat_emit()
         while not self._heartbeat_stop.wait(self._heartbeat_interval):
             self._heartbeat_emit()
 

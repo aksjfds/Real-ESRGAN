@@ -1,11 +1,11 @@
 # Real-ESRGAN 动画视频推理
 
-当前 v6.4 流水线：
+当前 v6.5 流水线：
 
 ```text
 FFmpeg 解码
 → BasicVSR++ NTIRE Track 1 同分辨率时序恢复
-→ Practical-RIFE 4.25 任意 timestep 插帧
+→ Practical-RIFE 4.25 任意 timestep 插帧（可关闭）
 → Real-ESRGAN full-frame 超分
 → Lanczos4 最终倍率调整
 → HEVC / AV1 编码
@@ -20,6 +20,7 @@ FFmpeg 解码
 - v6.2：typed task protocol、FrameHandle 引用计数、locality-aware 调度。
 - v6.3：去除活动路径 monkey-patch，显式 runtime、事件驱动 IPC、RIFE direct-slot、原生 GPU timing。
 - v6.4：OutputPump/Pipe fail-fast、BVS CUDA direct-slot、scene signature cache、runtime API 边界和更严格 task/runtime 类型协议。
+- v6.5：`RIFE_FPS=0` 关闭插帧并保持源帧率；RIFE 优先使用仓库内模型归档；离线 `[progress]` 首次 60 秒后开始并每 60 秒打印一次。
 
 ## 当前结构
 
@@ -42,7 +43,7 @@ FFmpeg 解码
 - `inference/output_runtime.py`：fail-fast 输出 pump、Lanczos4 resize、交互/批处理 progress。
 - `inference/clip_source.py` / `timeline.py` / `scene_metrics.py`：CPU clip、目标时间轴和缓存 scene signature。
 
-旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留历史兼容；当前 v6.4 主路径不依赖这些旧安装器。
+旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留历史兼容；当前 v6.5 主路径不依赖这些旧安装器。
 
 ## BasicVSR++ 固定参数
 
@@ -62,13 +63,26 @@ scene_threshold=0.30
 
 ## RIFE 4.25 / 输出帧率
 
-Notebook 只保留：
+Notebook 参数：
 
 ```python
 RIFE_FPS = 60
 ```
 
-`RIFE_FPS` 同时是插帧目标帧率和最终输出帧率，并且必须大于或等于源视频帧率。等于源帧率时绕过 RIFE；高于源帧率时按目标 CFR 时间轴生成真实 arbitrary timestep。
+语义：
+
+- `RIFE_FPS = 0`：完全关闭 RIFE，最终输出保持源视频帧率。
+- `RIFE_FPS == 源帧率`：不需要生成中间帧，RIFE 自动旁路。
+- `RIFE_FPS > 源帧率`：按目标 CFR 时间轴生成 arbitrary timestep 中间帧。
+- 除 `0` 外，不允许 `RIFE_FPS < 源帧率`。
+
+RIFE 权重解析优先检查：
+
+```text
+inference/weights/RIFEv4.25_0919.zip
+```
+
+仓库归档存在时直接从该 ZIP 提取 `flownet.pkl` 到本地 cache，不发起网络下载；归档缺失时保留 Practical-RIFE 官方 Google Drive fallback。
 
 场景保护：
 
@@ -97,6 +111,10 @@ OutputPump 的有界队列使用 timeout + error check 循环。若 resize/write
 
 启动前在 Linux 上检查 `/dev/shm` 可用容量，避免 shared-memory 不足运行到中途才出现不明确故障。
 
+## 离线进度
+
+非交互式运行时只打印 `[progress]`。首次周期进度在运行 60 秒后输出，之后每 60 秒一次；结束时可额外输出最终 `done` 状态。不会再输出 `[gpu-status]`。
+
 ## GPU timing
 
 `--gpu-timing` 直接在 GPU worker 内围绕 BVS/RIFE/SR handler 使用 CUDA Event，并通过 typed `TaskResult` 返回统计。关闭时不创建 CUDA Event；开启时因显式同步会产生 profiling 开销。
@@ -106,7 +124,7 @@ OutputPump 的有界队列使用 timeout + error check 循环。若 resize/write
 ```python
 MODEL = "realesr-animevideov3"
 SCALE = 2
-RIFE_FPS = 60
+RIFE_FPS = 60  # 0 = 关闭 RIFE
 GPU_IDS = "0,1"
 BVS_TILE_SIZE = 640
 BVS_CLIP_LENGTH = 13

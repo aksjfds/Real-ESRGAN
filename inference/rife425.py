@@ -1,7 +1,8 @@
 """Practical-RIFE 4.25 inference-only adapter for arbitrary-timestep interpolation.
 
-Architecture adapted from hzwer/Practical-RIFE (MIT). The official 4.25 archive
-is downloaded on first use and only flownet.pkl is consumed.
+Architecture adapted from hzwer/Practical-RIFE (MIT). A repository-bundled
+RIFEv4.25_0919.zip is preferred when present; otherwise the official 4.25
+archive is downloaded on first use. Only flownet.pkl is consumed.
 """
 from __future__ import annotations
 
@@ -17,6 +18,10 @@ from torch import nn
 from torch.nn import functional as F
 
 RIFE425_FILE_ID = "1ZKjcbmt1hypiFprJPIKW0Tt0lr_2i7bg"
+RIFE425_ARCHIVE_NAME = "RIFEv4.25_0919.zip"
+RIFE425_REPOSITORY_ARCHIVE = (
+    Path(__file__).resolve().parent / "weights" / RIFE425_ARCHIVE_NAME
+)
 RIFE425_CACHE = Path.home() / ".cache" / "realesrgan" / "rife-v4.25"
 _WARP_GRID: dict[tuple[str, str, int, int, int], torch.Tensor] = {}
 
@@ -141,21 +146,56 @@ class _IFNet425(nn.Module):
         return warped0 * blend + warped1 * (1.0 - blend)
 
 
+def _is_usable_archive(path: Path) -> bool:
+    return (
+        path.is_file()
+        and path.stat().st_size > 10_000_000
+        and zipfile.is_zipfile(path)
+    )
+
+
 def resolve_rife425_weights() -> Path:
     target = RIFE425_CACHE / "flownet.pkl"
     if target.is_file() and target.stat().st_size > 10_000_000:
         return target
+
     RIFE425_CACHE.mkdir(parents=True, exist_ok=True)
-    archive = RIFE425_CACHE / "RIFEv4.25_0919.zip"
-    if not archive.is_file() or archive.stat().st_size < 10_000_000:
-        try:
-            import gdown
-        except ImportError as error:
-            raise RuntimeError("RIFE 4.25 requires gdown; install repository requirements.txt") from error
-        print("[rife] downloading official Practical-RIFE 4.25 model archive", flush=True)
-        downloaded = gdown.download(id=RIFE425_FILE_ID, output=str(archive), quiet=False)
-        if not downloaded or not archive.is_file():
-            raise RuntimeError("Failed to download official Practical-RIFE 4.25 archive")
+    repository_archive = RIFE425_REPOSITORY_ARCHIVE
+    if repository_archive.exists() and not _is_usable_archive(repository_archive):
+        raise RuntimeError(
+            f"Bundled RIFE 4.25 archive is invalid: {repository_archive}"
+        )
+
+    if _is_usable_archive(repository_archive):
+        archive = repository_archive
+        print(
+            f"[rife] using bundled Practical-RIFE 4.25 archive: {archive}",
+            flush=True,
+        )
+    else:
+        archive = RIFE425_CACHE / RIFE425_ARCHIVE_NAME
+        if not _is_usable_archive(archive):
+            try:
+                import gdown
+            except ImportError as error:
+                raise RuntimeError(
+                    "RIFE 4.25 requires gdown when the bundled archive is absent; "
+                    "install repository requirements.txt"
+                ) from error
+            print(
+                "[rife] downloading official Practical-RIFE 4.25 model archive",
+                flush=True,
+            )
+            downloaded = gdown.download(
+                id=RIFE425_FILE_ID,
+                output=str(archive),
+                quiet=False,
+            )
+            if not downloaded or not _is_usable_archive(archive):
+                raise RuntimeError(
+                    "Failed to download official Practical-RIFE 4.25 archive"
+                )
+
     with tempfile.TemporaryDirectory(prefix="rife425-") as temp:
         with zipfile.ZipFile(archive) as zf:
             zf.extractall(temp)
