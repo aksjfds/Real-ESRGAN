@@ -1,6 +1,6 @@
 # Real-ESRGAN 动画视频推理
 
-当前 v8.0 流水线：
+当前 v8.1 流水线：
 
 ```text
 视频增强（可关闭）：
@@ -12,7 +12,14 @@ FFmpeg 解码
 → HEVC / AV1 编码
 
 音频增强（可关闭）：
-FFmpeg EQ → Compressor → De-esser → EBU R128 Loudness → AAC
+48 kHz PCM
+→ Mel-Band RoFormer dialogue/vocal stem
+→ residual background = original - dialogue
+→ PyTorch 自适应 presence / de-ess / gentle compression
+→ voice-aware 1.5-5 kHz spectral ducking
+→ remix
+→ two-pass EBU R128 loudness / true-peak mastering
+→ AAC
 ```
 
 ## 项目原则（必须遵守）
@@ -27,6 +34,7 @@ FFmpeg EQ → Compressor → De-esser → EBU R128 Loudness → AAC
 
 ## 版本
 
+- v8.1 - e98604a [Dev] 🔧：Mel-Band RoFormer 分离 + PyTorch 自适应 dialogue DSP + spectral ducking。
 - v8.0 - d0908ea [Dev] 🔧：Notebook 独立视频/音频增强开关，音频 FFmpeg DSP 独立模块。
 - v7.0 - 5ec12df [Release] ✅：单 GPU（目标 RTX 4090），其余沿用 v6.10 推理链路。
 - v6.10 - 2ca1203 [Release] ✅：shared-memory 直传、CUDA Lanczos、SR 微批与有序调度。
@@ -65,10 +73,14 @@ FFmpeg EQ → Compressor → De-esser → EBU R128 Loudness → AAC
 - `inference/output_runtime.py`：fail-fast 输出 pump、SR shared-output slot 消费、Lanczos4 resize、交互/批处理 progress。
 - `inference/clip_source.py` / `timeline.py` / `scene_metrics.py`：CPU clip、目标时间轴和缓存 scene signature。
 - `inference/run_lock.py`：同一输出路径的进程级单实例锁，避免重复运行争抢 GPU/输出文件。
-- `audio/runtime.py`：v8 FFmpeg 音频增强、原音频 mux、视频旁路与音频滤镜 fail-fast 边界。
-- `audio/process.py`：`VIDEO_ENHANCE=False` 时的视频 stream-copy / 音频处理入口。
+- `audio/backend.py`：v8.1 独立音频 venv/cache、`audio-separator==0.44.5` 与 Mel-Band RoFormer 权重准备/校验。
+- `audio/separator_worker.py`：在隔离环境内加载 `vocals_mel_band_roformer.ckpt`，只导出 dialogue/vocal stem。
+- `audio/dsp.py`：48 kHz PyTorch STFT 自适应 presence、de-ess、linked gentle compression、voice-aware background spectral ducking 与 20 秒分块 overlap-add。
+- `audio/runtime.py`：源音频提取、RoFormer 调用、residual background 重建、DSP、two-pass EBU R128 mastering 和最终 mux。
+- `audio/prepare.py`：Notebook 在视频推理前执行的音频依赖/权重 fail-fast 预检。
+- `audio/process.py`：`VIDEO_ENHANCE=False` 时的视频 stream-copy / v8.1 音频处理入口。
 
-旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留历史兼容；当前 v8.0 视频增强主路径不依赖这些旧安装器。
+旧 `pipeline.py`、`v51_runtime.py`、`v54_runtime.py`、`progress_log.py`、`gpu_timing.py` 保留历史兼容；当前 v8.1 视频增强主路径不依赖这些旧安装器。
 
 ## BasicVSR++ 固定参数
 
@@ -86,7 +98,7 @@ scene_threshold=0.30
 
 8-bit BVS 结果保持 CUDA `uint8` 到 handler；多个 emit group 在 CUDA 侧合并为连续 batch。FrameSlotPool 优先分配连续输出 slot；对应 shared-memory 映射成功 CUDA host registration 时，packed batch 通过一次异步 D2H 直接写入连续 shared-memory slice，不再经过 pinned staging → `np.copyto`。若 host registration 不可用或 slots 已碎片化，则自动回退 v6.9 的 pinned staging / scatter 路径。10-bit 路径保持保守兼容实现。
 
-v8.0 的视频增强路径完整保留 v7.0 / v6.10 的 frame-slot headroom 与 backpressure 逻辑；单 GPU下 BVS/RIFE/SR 共享同一 heavy-compute lane，frame pool 空间不足时现有 slot 约束会阻止继续提交 BVS，并让已就绪的 RIFE/SR 消化 backlog，不引入另一套单 GPU scheduler。
+v8.1 的视频增强路径完整保留 v7.0 / v6.10 的 frame-slot headroom 与 backpressure 逻辑；单 GPU 下 BVS/RIFE/SR 共享同一 heavy-compute lane，frame pool 空间不足时现有 slot 约束会阻止继续提交 BVS，并让已就绪的 RIFE/SR 消化 backlog，不引入另一套单 GPU scheduler。
 
 ## RIFE 4.25 / 输出帧率
 
@@ -122,7 +134,7 @@ RIFE 8-bit 输入保持 `uint8`；若来源 shared slot 已注册为 CUDA pinned
 
 ## GPU 稳定边界
 
-v8.0 视频增强目标运行环境仍为单张 RTX 4090；代码保留通用多 GPU 数据结构，不新增平行的单 GPU pipeline。
+v8.1 视频增强目标运行环境仍为单张 RTX 4090；代码保留通用多 GPU 数据结构，不新增平行的单 GPU pipeline。
 
 ```text
 Main Scheduler
@@ -133,9 +145,9 @@ Main Scheduler
 
 每个 GPU 子进程在整个运行期间保持固定 `torch.cuda.device(...)` context。当前主路径不存在共享 CUDA `ThreadPoolExecutor`，也不在任务级反复 `torch.cuda.set_device()`。
 
-BVS、RIFE、SR 始终是独立 task。同一物理 GPU 的 heavy model compute 保持互斥。v8.0 视频路径沿用 v7.0 handler：在 compute boundary 前先把依赖当前 producer stream 的 D2H 排入独立 copy stream；copy stream 只等待当时已经提交的 model/packing work。worker 随后同步常驻 compute-boundary Event并发送 `TaskComputeDone`，scheduler 才允许同卡另一 role 开始 heavy compute。因此 D2H 可在 boundary 到达后立即启动并与后续另一阶段 compute 重叠，但不会无控制地并发两个重模型 kernel。
+BVS、RIFE、SR 始终是独立 task。同一物理 GPU 的 heavy model compute 保持互斥。v8.1 视频路径沿用 v7.0 handler：在 compute boundary 前先把依赖当前 producer stream 的 D2H 排入独立 copy stream；copy stream 只等待当时已经提交的 model/packing work。worker 随后同步常驻 compute-boundary Event 并发送 `TaskComputeDone`，scheduler 才允许同卡另一 role 开始 heavy compute。因此 D2H 可在 boundary 到达后立即启动并与后续另一阶段 compute 重叠，但不会无控制地并发两个重模型 kernel。
 
-中间帧通过 `FrameHandle(worker_id, slot, generation)` 引用共享 slot。单 GPU v8.0 中所有 FrameHandle 都保持本地，不进入跨 GPU CPU shared-memory copy；通用 non-local 路径仅为兼容多 GPU 配置保留。
+中间帧通过 `FrameHandle(worker_id, slot, generation)` 引用共享 slot。单 GPU v8.1 中所有 FrameHandle 都保持本地，不进入跨 GPU CPU shared-memory copy；通用 non-local 路径仅为兼容多 GPU 配置保留。
 
 SR 每张 GPU 优先使用两个显式 shared-output slot。OutputPump 可持有旧 slot 做 Lanczos4/编码，同时 SR worker 写另一个 slot；若 `/dev/shm` 不足以维持双 slot，则启动时自动回退到单 slot。
 
@@ -147,21 +159,31 @@ OutputPump 的有界队列使用 timeout + error check 循环。若 resize/write
 
 同一 `--output` 路径在 POSIX 上通过 `flock(LOCK_EX | LOCK_NB)` 只允许一个 inference 主进程持有；第二个重复运行会在加载 GPU 模型前直接报错，不会与第一个任务争抢 GPU 或同时写同一输出文件。
 
+v8.1 的 RoFormer 与自适应音频 DSP 不与上述视频 worker 并发：视频 worker 全部关闭后才进入最终音频阶段，因此不会在视频 hot path 中引入额外 CUDA kernel、显存竞争或 per-frame 同步。
+
 ## 传输边界
 
 当前跨进程 frame pool 仍基于 POSIX shared memory，但每个 CUDA worker 会对自己长期使用的 input / frame-output / SR-output 映射尝试 `cudaHostRegister()`。注册成功后，这些映射由 CUDA 视为 page-locked host memory：8-bit H2D 可以直接从 shared slot 异步 DMA，8-bit D2H 也可以直接写 shared output，因此活动主路径不再需要 shared-memory ↔ pinned-staging 的第二次 CPU memcpy。
 
-`cudaHostRegister()` 是启动期、长期持有的优化，而不是逐帧注册。若当前 CUDA/OS/驱动不支持注册，或注册失败，worker 只打印一次对应映射的 fallback 信息并继续使用 v6.9 可复用 pinned staging，不改变功能正确性。由于 page-locked memory 是有限系统资源，v8.0 视频路径只注册推理进程已经固定分配的 frame pools，不创建额外同尺寸 pinned 副本。
+`cudaHostRegister()` 是启动期、长期持有的优化，而不是逐帧注册。若当前 CUDA/OS/驱动不支持注册，或注册失败，worker 只打印一次对应映射的 fallback 信息并继续使用 v6.9 可复用 pinned staging，不改变功能正确性。由于 page-locked memory 是有限系统资源，v8.1 视频路径只注册推理进程已经固定分配的 frame pools，不创建额外同尺寸 pinned 副本。
 
 连续 FrameHandle slot 会直接形成一个 NumPy/Torch shared-memory slice，一次 packed CUDA batch 对应一次异步 D2H。只有 frame pool 碎片化导致无法取得连续 run 时，才回退 staging + scatter；slot allocator 会优先寻找足够长的连续空闲区来减少这种情况。
 
 ## 音频处理边界
 
-Notebook 将 `VIDEO_ENHANCE` 放在视频参数单元，将 `AUDIO_ENHANCE` 放在独立音频参数单元。`AUDIO_ENHANCE=False` 时强制使用原音频 stream copy，不执行音频 DSP；`AUDIO_ENHANCE=True` 时使用独立 `audio/` 模块完成 EQ、温和压缩、de-esser、EBU R128 loudness normalization，并以 AAC 输出。音频增强只使用 FFmpeg/CPU，不进入 BVS/RIFE/SR CUDA worker。
+Notebook 将 `VIDEO_ENHANCE` 放在视频参数单元，将 `AUDIO_ENHANCE` 放在独立音频参数单元。
 
-启用音频增强时，程序会在加载 GPU 模型之前检查 FFmpeg 是否具备所需滤镜；缺失时立即 fail-fast，避免视频推理完成后才失败。
+`AUDIO_ENHANCE=False` 时强制使用原音频 stream copy，不创建音频 AI 环境、不运行 RoFormer、不执行 DSP。
 
-`VIDEO_ENHANCE=False` 时不创建 GPU worker，`audio.process` 直接 stream-copy 视频并按 `AUDIO_ENHANCE` 决定复制或处理音频。
+`AUDIO_ENHANCE=True` 时，Notebook 在视频推理前运行 `python -m audio.prepare`：创建独立 `--system-site-packages` venv、固定安装 `audio-separator==0.44.5`，并下载/加载 `vocals_mel_band_roformer.ckpt` 做 fail-fast。独立环境默认缓存到 `/kaggle/working/realesrgan-audio-cache`，避免改变视频主环境的 NumPy/SciPy/ONNX 依赖。
+
+实际音频处理在视频完成后进行：先提取 48 kHz float PCM，再由 Mel-Band RoFormer 只预测 dialogue/vocal stem。背景不直接使用模型 secondary stem，而使用 `background = original - dialogue` residual reconstruction，确保进入 DSP 前可精确还原原混音基线。
+
+`audio/dsp.py` 使用 PyTorch STFT 做自适应处理：根据每个时间窗的人声能量、brightness、sibilance ratio 和 background dominance 动态决定 1.8-4.8 kHz presence、5.5-9.5 kHz de-ess、10-16 kHz air lift，并只在人声占优时让背景 1.5-5 kHz 最多约 2 dB。随后使用 stereo-linked 轻压缩和约 +0.4 dB dialogue lift。处理按 20 秒 chunk、1 秒 overlap-add 执行，限制长片段的 GPU memory 峰值并减少块边界伪影。
+
+最终 mix 保留 headroom，然后使用 two-pass EBU R128 `loudnorm` 做线性响度/True Peak mastering，目标为 -16 LUFS / LRA 7 / -1.5 dBTP，再编码 AAC。FFmpeg 在 v8.1 中主要负责 demux/mux、PCM I/O 与最终标准化，不再承担主要人声音色塑形。
+
+`VIDEO_ENHANCE=False` 时不创建视频 GPU worker，`audio.process` 直接 stream-copy 视频并按 `AUDIO_ENHANCE` 决定复制原音频或运行同一套 v8.1 音频链。
 
 ## 离线进度
 
