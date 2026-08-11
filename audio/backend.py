@@ -11,6 +11,7 @@ import sys
 from typing import Sequence
 
 AUDIO_SEPARATOR_VERSION = "0.44.5"
+AUDIO_SEPARATOR_SPEC = f"audio-separator[gpu]=={AUDIO_SEPARATOR_VERSION}"
 ROFORMER_MODEL = "vocals_mel_band_roformer.ckpt"
 
 
@@ -74,6 +75,17 @@ def _installed_version(python_bin: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def _onnxruntime_importable(python_bin: Path) -> bool:
+    if not python_bin.is_file():
+        return False
+    result = subprocess.run(
+        [str(python_bin), "-c", "import onnxruntime"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
 def _host_pip_prefix() -> list[str]:
     """Resolve a host pip that can manage the pip-less isolated venv via --python."""
     result = subprocess.run(
@@ -129,19 +141,30 @@ def prepare_backend() -> None:
     root.mkdir(parents=True, exist_ok=True)
     python_bin = _ensure_venv()
 
-    if _installed_version(python_bin) != AUDIO_SEPARATOR_VERSION:
-        print(f"[audio-v8.1] installing audio-separator=={AUDIO_SEPARATOR_VERSION}", flush=True)
+    version = _installed_version(python_bin)
+    runtime_ready = _onnxruntime_importable(python_bin)
+    if version != AUDIO_SEPARATOR_VERSION or not runtime_ready:
+        reason = (
+            f"version={version or 'missing'}"
+            if version != AUDIO_SEPARATOR_VERSION
+            else "onnxruntime=missing"
+        )
+        print(
+            f"[audio-v8.1] installing {AUDIO_SEPARATOR_SPEC} ({reason})",
+            flush=True,
+        )
         _run(
             [
                 *_host_pip_prefix(),
                 "--python",
                 str(venv_root()),
                 "install",
+                "--upgrade",
                 "--disable-pip-version-check",
                 "--no-input",
-                f"audio-separator=={AUDIO_SEPARATOR_VERSION}",
+                AUDIO_SEPARATOR_SPEC,
             ],
-            "audio-separator installation",
+            "audio-separator GPU installation",
         )
 
     model_dir().mkdir(parents=True, exist_ok=True)
@@ -166,6 +189,11 @@ def validate_backend() -> None:
         raise RuntimeError(
             "v8.1 audio backend is not prepared. Run `python -m audio.prepare` "
             f"before inference (expected audio-separator {AUDIO_SEPARATOR_VERSION}, got {version or 'missing'})."
+        )
+    if not _onnxruntime_importable(python_bin):
+        raise RuntimeError(
+            "v8.1 audio backend is missing ONNX Runtime. Run `python -m audio.prepare` "
+            "to install the audio-separator GPU extra."
         )
     model_path = model_dir() / ROFORMER_MODEL
     if not model_path.is_file() or model_path.stat().st_size == 0:
