@@ -2,7 +2,7 @@
 
 ## 当前版本流水线
 
-当前 v8.1 流水线：
+当前 v8.2 流水线：
 
 ```text
 视频增强（可关闭）：
@@ -13,16 +13,21 @@ FFmpeg 解码
 → NPP Lanczos CUDA 最终倍率调整（CPU Lanczos4 fallback）
 → HEVC / AV1 编码
 
-音频增强（可关闭）：
+音频增强（可关闭，默认开启 FFmpeg 版本）：
 原始音频
-→ 55 Hz high-pass
-→ 500 Hz -0.8 dB / 3 kHz +0.8 dB / 11 kHz high-shelf +0.8 dB
-→ 1.8:1 gentle compression
-→ de-esser
-→ EBU R128 loudnorm（-16 LUFS / -1.5 dBTP）
-→ 48 kHz
-→ AAC
+├→ FFmpeg DSP
+│  → 55 Hz high-pass
+│  → 500 Hz -0.8 dB / 3 kHz +0.8 dB / 11 kHz high-shelf +0.8 dB
+│  → 1.8:1 gentle compression
+│  → de-esser
+│  → EBU R128 loudnorm（-16 LUFS / -1.5 dBTP）
+│  → 48 kHz AAC
+│  → Audio 1: Enhanced (FFmpeg)，默认音轨
+└→ stream copy
+   → Audio 2: Original，原音轨
 ```
+
+`AUDIO_ENHANCE=False` 时不执行 DSP，继续只保留原音轨并优先 stream copy。
 
 ## 项目原则（必须遵守）
 
@@ -36,6 +41,7 @@ FFmpeg 解码
 
 ## 版本历史
 
+- v8.2 - 09274ad [Dev] 🔧：FFmpeg 增强音轨作为默认 Audio 1，同时保留原始音轨作为 Audio 2。
 - v8.1 - b212afa [Dev] 🔧：音频回退到 v8.0 FFmpeg DSP；保留视频链和后续非音频改动。
 - v8.0 - d0908ea [Dev] 🔧：Notebook 独立视频/音频增强开关，音频 FFmpeg DSP 独立模块。
 - v7.0 - 5ec12df [Release] ✅：单 GPU（目标 RTX 4090），其余沿用 v6.10 推理链路。
@@ -55,7 +61,7 @@ FFmpeg 解码
 
 ## 当前结构
 
-- `realesrgan.ipynb`：Kaggle 入口；视频、音频参数分离，`VIDEO_ENHANCE` / `AUDIO_ENHANCE` 独立控制，当前默认 `DUAL_GPU=True`。
+- `realesrgan.ipynb`：Kaggle 入口；视频、音频参数分离，`VIDEO_ENHANCE` / `AUDIO_ENHANCE` 独立控制，当前默认 `DUAL_GPU=True`、`AUDIO_ENHANCE=True`。
 - `inference.py`：视频增强 CLI 与总入口。
 - `inference/scheduler.py`：CPU 总编排与最终音频边界。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：调度状态、任务策略、结果处理与 watchdog。
@@ -67,7 +73,7 @@ FFmpeg 解码
 - `inference/sr_runtime.py`：Real-ESRGAN SR runtime。
 - `inference/output_runtime.py`：NPP Lanczos、输出 pump、编码与进度日志。
 - `inference/weights/`：仓库内置 BasicVSR++ 权重分片与 RIFE 模型压缩包。
-- `audio/runtime.py`：FFmpeg dialogue-focused DSP、音频旁路与最终 mux。
+- `audio/runtime.py`：FFmpeg dialogue-focused DSP、增强/原始双音轨 mux、音频旁路。
 - `audio/process.py`：`VIDEO_ENHANCE=False` 时的视频 stream-copy / 音频处理入口。
 
 ## 模型与资源
