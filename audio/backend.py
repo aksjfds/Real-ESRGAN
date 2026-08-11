@@ -107,6 +107,7 @@ def prepare_backend() -> None:
         ],
         "RoFormer model preparation",
     )
+    validate_backend()
 
 
 def validate_backend() -> None:
@@ -117,8 +118,11 @@ def validate_backend() -> None:
             "v8.1 audio backend is not prepared. Run `python -m audio.prepare` "
             f"before inference (expected audio-separator {AUDIO_SEPARATOR_VERSION}, got {version or 'missing'})."
         )
-    if not model_dir().is_dir():
-        raise RuntimeError("v8.1 RoFormer model cache is missing; run `python -m audio.prepare`.")
+    model_path = model_dir() / ROFORMER_MODEL
+    if not model_path.is_file() or model_path.stat().st_size == 0:
+        raise RuntimeError(
+            f"v8.1 RoFormer model cache is missing {ROFORMER_MODEL}; run `python -m audio.prepare`."
+        )
 
 
 def separate_dialogue(input_wav: Path, output_dir: Path) -> Path:
