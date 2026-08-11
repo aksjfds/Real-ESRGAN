@@ -132,6 +132,10 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
     _validate_args(args)
+    if args.audio_enhance:
+        from audio.runtime import validate_runtime
+
+        validate_runtime(args.ffmpeg_bin)
     with exclusive_output_run(args.output):
         encode_runtime.prepare_runtime(inference_runtime, args)
         inference_pipeline.process_video(args)
