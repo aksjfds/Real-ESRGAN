@@ -39,7 +39,7 @@ class OptimizedRIFE425Interpolator:
             # avoid overwriting a buffer while its async H2D is still in flight.
             self.h2d_stager = PinnedH2DStager(self.device, slots=2)
             # Retained only for the compatibility interpolate_into() API. The
-            # active v6.9 task path owns D2H in gpu_task_handlers instead.
+            # active v6.10 task path owns direct/staged D2H in gpu_task_handlers.
             self.d2h_stager = PinnedD2HStager(self.device)
 
         self.elapsed = 0.0
