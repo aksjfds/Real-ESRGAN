@@ -23,7 +23,7 @@ FFmpeg 解码
 
 ## 版本
 
-- v7.0 - 5702808 [Dev] 🔧：单 GPU（目标 RTX 4090），其余沿用 v6.10 推理链路。
+- v7.0 - 5ec12df [Release] ✅：单 GPU（目标 RTX 4090），其余沿用 v6.10 推理链路。
 - v6.10 - 2ca1203 [Release] ✅：shared-memory 直传、CUDA Lanczos、SR 微批与有序调度。
 - v6.9 - f116bff [Dev] 🔧：复用 CUDA Event，优化 H2D/D2H 与连续 slot 拷贝。
 - v6.8 - f3f35f9 [Dev] 🔧：temporal/SR 分进程，compute 与 transport drain 解耦。
