@@ -13,19 +13,19 @@ FFmpeg 解码
 
 ## 版本
 
-- v4.3-9020854 [Dev] 🔧：早期代码基线。
-- v5.8-f5eca71 [Dev] 🔧：固定 BVS 参数 + selective channels_last。
-- v6.0-63e28d8 [Dev] 🔧：加入 Practical-RIFE 4.25。
-- v6.1-e66ae69 [Dev] 🔧：一张 GPU 一个常驻 `spawn` 子进程，BVS / RIFE / SR 独立 task。
-- v6.2-0c2109d [Dev] 🔧：typed task protocol、FrameHandle 引用计数、locality-aware 调度。
-- v6.3-5474432 [Dev] 🔧：去除活动路径 monkey-patch，显式 runtime、事件驱动 IPC、RIFE direct-slot、原生 GPU timing。
-- v6.4-ea40744 [Dev] 🔧：OutputPump/Pipe fail-fast、BVS CUDA direct-slot、scene signature cache、runtime API 边界和更严格 task/runtime 类型协议。
-- v6.5-ecce8f1 [Dev] 🔧：`RIFE_FPS=0` 关闭插帧并保持源帧率；RIFE 优先使用仓库内模型归档；离线 `[progress]` 使用固定 heartbeat。
-- v6.6-fc61dcf [Dev] 🔧：BVS emit group 使用一次 batch D2H，再复制到 FrameHandle shared-memory slots，避免逐帧 blocking D2H。
-- v6.7-5a15af7 [Dev] 🔧：RIFE 关闭时恢复 BVS/SR 高水位调度，避免 SR 过早抢占第二条 BVS GPU lane；同输出路径增加单实例进程锁；Kaggle Notebook 将子进程 stdout/stderr 合并后由 notebook kernel 单路转发，避免离线日志重复。
-- v6.8-f3f35f9 [Dev] 🔧：每张 GPU 拆为常驻 temporal(BVS/RIFE) 与 SR 两个 `spawn` 进程；任务生命周期拆为 CUDA compute / transport drain 两阶段，保持同卡重模型 compute 互斥但允许另一阶段在 D2H/CPU drain 期间接管 compute lane；BVS/RIFE/SR 使用可复用 pinned H2D/D2H staging 与独立 copy stream，BVS/RIFE 合并批量 D2H；SR 使用显式双 shared-output slot 解耦 resize/encoder 反压，`/dev/shm` 紧张时自动回退单 slot。
-- v6.9-f116bff [Dev] 🔧：保持 v6.8 调度/画质数学不变，进一步收窄 runtime 边界：活动 RIFE runtime 只返回 packed CUDA batch，不再接收 scheduler compute callback，compute-boundary 与 D2H/shared-slot transport 统一回到 task handler；H2D ring slot、D2H 和 worker compute-boundary CUDA Event 改为常驻复用，去除 per-task Event 分配；连续 FrameHandle slots 使用单次 NumPy batch copy，减少逐帧 Python scatter 开销；已 pinned 的外部 CPU tensor 可绕过额外 pinned staging memcpy。
-- v6.10-2ca1203 [Release] ✅：`cudaHostRegister()` direct shared-memory transport；NPP Lanczos CUDA 在 D2H 前完成最终倍率缩放；SR micro-batch≤2；SR 按连续 frame_id 严格有序 dispatch，避免 output-slot starvation/deadlock。
+- v6.10 - 2ca1203 [Release] ✅：shared-memory 直传、CUDA Lanczos、SR 微批与有序调度。
+- v6.9 - f116bff [Dev] 🔧：复用 CUDA Event，优化 H2D/D2H 与连续 slot 拷贝。
+- v6.8 - f3f35f9 [Dev] 🔧：temporal/SR 分进程，compute 与 transport drain 解耦。
+- v6.7 - 5a15af7 [Dev] 🔧：恢复 BVS/SR 高水位调度，增加单实例锁与 Kaggle 日志转发。
+- v6.6 - fc61dcf [Dev] 🔧：BVS emit 改为 batch D2H，减少逐帧阻塞拷贝。
+- v6.5 - ecce8f1 [Dev] 🔧：支持关闭 RIFE，并加入固定离线 progress heartbeat。
+- v6.4 - ea40744 [Dev] 🔧：增强 fail-fast、scene cache 与 runtime API 边界。
+- v6.3 - 5474432 [Dev] 🔧：去除活动路径 monkey-patch，改为显式 runtime 与事件驱动 IPC。
+- v6.2 - 0c2109d [Dev] 🔧：加入 typed task、FrameHandle 引用计数与 locality-aware 调度。
+- v6.1 - e66ae69 [Dev] 🔧：一张 GPU 一个常驻进程，BVS/RIFE/SR 独立 task。
+- v6.0 - 63e28d8 [Dev] 🔧：加入 Practical-RIFE 4.25。
+- v5.8 - f5eca71 [Dev] 🔧：固定 BVS 参数并加入 selective channels_last。
+- v4.3 - 9020854 [Dev] 🔧：早期代码基线。
 
 ## 当前结构
 
