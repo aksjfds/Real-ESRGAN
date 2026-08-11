@@ -72,6 +72,28 @@ def _voice_filter() -> str:
     )
 
 
+def _dual_audio_args(audio_bitrate: str) -> list[str]:
+    """Encode enhanced track first/default while preserving source audio second."""
+    return [
+        "-c:a:0",
+        "aac",
+        "-b:a:0",
+        audio_bitrate,
+        "-ar:a:0",
+        "48000",
+        "-c:a:1",
+        "copy",
+        "-metadata:s:a:0",
+        "title=Enhanced (FFmpeg)",
+        "-metadata:s:a:1",
+        "title=Original",
+        "-disposition:a:0",
+        "default",
+        "-disposition:a:1",
+        "original",
+    ]
+
+
 def mux_audio(
     silent_video: Path,
     input_path: Path,
@@ -85,7 +107,7 @@ def mux_audio(
     *,
     enhance: bool = False,
 ) -> None:
-    """Mux source audio into processed video; preserve v7 behavior when disabled."""
+    """Mux audio into processed video; v8.2 keeps original beside enhancement."""
     if not has_audio:
         silent_video.replace(output_path)
         return
@@ -109,7 +131,7 @@ def mux_audio(
     if enhance:
         filtergraph = (
             f"[1:a:0]atrim=start=0:duration={duration:.6f},"
-            f"asetpts=PTS-STARTPTS,{_voice_filter()}[a]"
+            f"asetpts=PTS-STARTPTS,{_voice_filter()}[enhanced]"
         )
         command = base + [
             "-ss",
@@ -123,23 +145,22 @@ def mux_audio(
             "-map",
             "0:v:0",
             "-map",
-            "[a]",
+            "[enhanced]",
+            "-map",
+            "1:a:0",
             "-map_metadata",
             "1",
             "-c:v",
             "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            audio_bitrate,
-            "-ar",
-            "48000",
+            *_dual_audio_args(audio_bitrate),
             "-shortest",
+            "-avoid_negative_ts",
+            "make_zero",
             "-movflags",
             "+faststart",
             str(output_path),
         ]
-        _run_checked(command, "audio enhancement mux")
+        _run_checked(command, "dual-track audio enhancement mux")
         return
 
     if audio_codec == "aac":
@@ -246,7 +267,7 @@ def process_media(
     *,
     enhance: bool,
 ) -> None:
-    """Bypass video enhancement and optionally enhance audio with video stream copy."""
+    """Bypass video enhancement and optionally emit enhanced + original audio."""
     input_path = input_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
     if not input_path.is_file():
@@ -290,18 +311,15 @@ def process_media(
         command += ["-c:v", "copy"]
     elif enhance:
         command += [
+            "-filter_complex",
+            f"[0:a:0]{_voice_filter()}[enhanced]",
+            "-map",
+            "[enhanced]",
             "-map",
             "0:a:0",
             "-c:v",
             "copy",
-            "-af",
-            _voice_filter(),
-            "-c:a",
-            "aac",
-            "-b:a",
-            audio_bitrate,
-            "-ar",
-            "48000",
+            *_dual_audio_args(audio_bitrate),
         ]
     elif audio_codec == "aac":
         command += [
