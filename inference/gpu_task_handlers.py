@@ -12,8 +12,8 @@ from . import runtime_api as base
 from .frame_transport import (
     PinnedD2HStager,
     PinnedH2DStager,
-    copy_cuda_frame_to_array,
-    copy_cuda_frames_to_slots,
+    begin_cuda_frame_to_array,
+    begin_cuda_frames_to_slots,
     copy_host_frames_to_slots,
 )
 from .sr_runtime import infer_cuda_u8_tensor
@@ -173,16 +173,20 @@ def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
             task,
             device_groups,
         )
-        # Packing is a CUDA op and is complete/enqueued before this boundary.
-        # Only pinned D2H + CPU shared-memory scatter remains afterward.
-        _notify_compute_done(context)
+        pending = None
         if packed is not None:
-            copy_cuda_frames_to_slots(
+            # Enqueue D2H first. The copy stream waits only for already-submitted
+            # producer work, so it can start at the compute boundary while the
+            # worker publishes that boundary to the scheduler.
+            pending = begin_cuda_frames_to_slots(
                 packed,
                 context.frame_output_view,
                 slots,
-                stager=_require_d2h_stager(context),
+                _require_d2h_stager(context),
             )
+        _notify_compute_done(context)
+        if pending is not None:
+            pending.wait()
     else:
         if len(clips) > 1:
             enhanced_groups = bvs.enhance_clips(clips)
@@ -215,12 +219,9 @@ def run_rife(context: WorkerContext, task: RIFETask) -> RIFEResult:
         task.timesteps,
     )
 
-    # RIFE runtime now owns model math only. The task handler owns the scheduler
-    # compute boundary and all host transport, matching the BVS/SR layering.
-    _notify_compute_done(context)
-
     expected = len(task.output_slots)
     if batch is None:
+        _notify_compute_done(context)
         if expected != 0:
             raise RuntimeError(
                 "RIFE returned no CUDA batch for reserved output slots"
@@ -233,14 +234,28 @@ def run_rife(context: WorkerContext, task: RIFETask) -> RIFEResult:
             f"RIFE returned {count} frames for {expected} reserved output slots"
         )
 
-    frames_cpu = _require_d2h_stager(context).copy(batch)
-    if frame0.dtype != np.uint8:
-        frames_cpu = frames_cpu.astype(frame0.dtype, copy=False)
-    copy_host_frames_to_slots(
-        frames_cpu,
-        context.frame_output_view,
-        task.output_slots,
-    )
+    if frame0.dtype == np.uint8:
+        pending = begin_cuda_frames_to_slots(
+            batch,
+            context.frame_output_view,
+            task.output_slots,
+            _require_d2h_stager(context),
+        )
+        _notify_compute_done(context)
+        if pending is not None:
+            pending.wait()
+    else:
+        # 10-bit compatibility uses an int32 CUDA batch before host-side uint16
+        # conversion, so it cannot use the direct same-dtype shared-slot path.
+        pending = _require_d2h_stager(context).begin_copy(batch)
+        _notify_compute_done(context)
+        frames_cpu = pending.wait().astype(frame0.dtype, copy=False)
+        copy_host_frames_to_slots(
+            frames_cpu,
+            context.frame_output_view,
+            task.output_slots,
+        )
+
     return RIFEResult(count=count)
 
 
@@ -266,12 +281,13 @@ def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
             context.device,
             h2d_stager=_require_h2d_stager(context),
         )
-        _notify_compute_done(context)
-        copy_cuda_frame_to_array(
+        pending = begin_cuda_frame_to_array(
             result_cuda,
             target,
             _require_d2h_stager(context),
         )
+        _notify_compute_done(context)
+        pending.wait()
         del result_cuda
     else:
         result = base.infer_frame(
