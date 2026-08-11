@@ -27,7 +27,7 @@ FFmpeg EQ → Compressor → De-esser → EBU R128 Loudness → AAC
 
 ## 版本
 
-- v8.0 - 978fe39 [Dev] 🔧：Notebook 独立视频/音频增强开关，音频 FFmpeg DSP 独立模块。
+- v8.0 - d0908ea [Dev] 🔧：Notebook 独立视频/音频增强开关，音频 FFmpeg DSP 独立模块。
 - v7.0 - 5ec12df [Release] ✅：单 GPU（目标 RTX 4090），其余沿用 v6.10 推理链路。
 - v6.10 - 2ca1203 [Release] ✅：shared-memory 直传、CUDA Lanczos、SR 微批与有序调度。
 - v6.9 - f116bff [Dev] 🔧：复用 CUDA Event，优化 H2D/D2H 与连续 slot 拷贝。
@@ -86,7 +86,7 @@ scene_threshold=0.30
 
 8-bit BVS 结果保持 CUDA `uint8` 到 handler；多个 emit group 在 CUDA 侧合并为连续 batch。FrameSlotPool 优先分配连续输出 slot；对应 shared-memory 映射成功 CUDA host registration 时，packed batch 通过一次异步 D2H 直接写入连续 shared-memory slice，不再经过 pinned staging → `np.copyto`。若 host registration 不可用或 slots 已碎片化，则自动回退 v6.9 的 pinned staging / scatter 路径。10-bit 路径保持保守兼容实现。
 
-v8.0 的视频增强路径完整保留 v7.0 / v6.10 的 frame-slot headroom 与 backpressure 逻辑；单 GPU 下 BVS/RIFE/SR 共享同一 heavy-compute lane，frame pool 空间不足时现有 slot 约束会阻止继续提交 BVS，并让已就绪的 RIFE/SR 消化 backlog，不引入另一套单 GPU scheduler。
+v8.0 的视频增强路径完整保留 v7.0 / v6.10 的 frame-slot headroom 与 backpressure 逻辑；单 GPU下 BVS/RIFE/SR 共享同一 heavy-compute lane，frame pool 空间不足时现有 slot 约束会阻止继续提交 BVS，并让已就绪的 RIFE/SR 消化 backlog，不引入另一套单 GPU scheduler。
 
 ## RIFE 4.25 / 输出帧率
 
