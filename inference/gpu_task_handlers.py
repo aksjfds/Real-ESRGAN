@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from . import runtime_api as base
+from .frame_transport import copy_cuda_frames_to_slots
 from .sr_runtime import infer_cuda_u8_tensor
 from .task_protocol import (
     BVSResult,
@@ -68,9 +69,11 @@ def _copy_bvs_device_groups(
         if len(slots) != emitted_count:
             raise RuntimeError("BVS task output-slot accounting mismatch")
 
-        for slot, frame_cuda in zip(slots, emitted):
-            target = torch.from_numpy(context.frame_output_view[slot])
-            target.copy_(frame_cuda, non_blocking=False)
+        copy_cuda_frames_to_slots(
+            emitted,
+            context.frame_output_view,
+            slots,
+        )
         output_cursor = end
 
     if output_cursor != len(task.output_slots):
