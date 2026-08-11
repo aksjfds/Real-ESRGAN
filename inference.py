@@ -47,6 +47,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--audio-bitrate", default="192k")
     parser.add_argument(
+        "--audio-enhance",
+        action="store_true",
+        help="Enable v8 FFmpeg dialogue-focused audio enhancement",
+    )
+    parser.add_argument(
         "--start-time",
         type=float,
         default=0.0,
@@ -119,6 +124,8 @@ def _validate_args(args) -> None:
         raise ValueError("--bvs-batch-size must be at least 1")
     if float(args.rife_fps) < 0:
         raise ValueError("--rife-fps must be 0 or a positive FPS")
+    if bool(args.audio_enhance) and args.audio_codec != "aac":
+        raise ValueError("--audio-enhance requires --audio-codec aac")
 
 
 def main() -> None:
