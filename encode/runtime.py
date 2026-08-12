@@ -46,6 +46,16 @@ def extend_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
     # v8.5 AV1 NVENC high-quality controls.
     parser.add_argument("--av1-profile", choices=("main",), default="main")
+    parser.add_argument(
+        "--av1-bit-depth",
+        type=int,
+        choices=(8, 10),
+        default=8,
+        help=(
+            "Minimum AV1 NVENC output bit depth: 8 keeps 8-bit sources at 8-bit; "
+            "10 promotes 8-bit sources to 10-bit. 10-bit sources are never down-converted."
+        ),
+    )
     parser.add_argument("--av1-tune", choices=("hq",), default="hq")
     parser.add_argument("--av1-rc", choices=("vbr", "cbr", "constqp"), default="vbr")
     parser.add_argument("--av1-bitrate", default="0")

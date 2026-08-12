@@ -11,7 +11,7 @@ FFmpeg 解码
 → Practical-RIFE 4.25 任意 timestep 插帧（可关闭）
 → Real-ESRGAN full-frame 超分
 → NPP Lanczos CUDA 最终倍率调整（CPU Lanczos4 fallback）
-→ AV1 NVENC（Notebook 默认：P7 / HQ / CQ18 / 位深跟随片源 / fullres multipass）
+→ AV1 NVENC（Notebook 默认：P7 / HQ / CQ18 / 可选最低输出位深 / fullres multipass）
 
 音频增强（可关闭，默认开启 FFmpeg 版本）：
 原始音频
@@ -29,7 +29,7 @@ FFmpeg 解码
 
 `AUDIO_ENHANCE=False` 时不执行 DSP，继续只保留原音轨并优先 stream copy。
 
-v8.5 Notebook 只暴露 `av1_nvenc` 高质量参数；底层旧编码后端仍保留用于兼容。AV1 输出位深自动跟随片源：8-bit 输入输出 `yuv420p`，10-bit 输入输出 `p010le`；AV1 两种位深都使用 Main profile。
+v8.5 Notebook 只暴露 `av1_nvenc` 高质量参数；底层旧编码后端仍保留用于兼容。`AV1_BIT_DEPTH` 表示 AV1 最低输出位深：设为 `8` 时 8-bit 片源保持 `yuv420p`，设为 `10` 时 8-bit 片源编码为 `p010le`；10-bit 片源无论该参数为 `8` 还是 `10` 都始终输出 10-bit `p010le`。AV1 两种位深都使用 Main profile。
 
 ## 项目原则（必须遵守）
 
@@ -43,7 +43,7 @@ v8.5 Notebook 只暴露 `av1_nvenc` 高质量参数；底层旧编码后端仍�
 
 ## 版本历史
 
-- v8.5 [Dev] 🔧：Notebook 使用 AV1 NVENC-only 高质量配置；P7/HQ、VBR CQ18、fullres multipass、AQ、B-ref 与 GOP，输出位深恢复为自动跟随片源。
+- v8.5 [Dev] 🔧：Notebook 使用 AV1 NVENC-only 高质量配置；P7/HQ、VBR CQ18、fullres multipass、AQ、B-ref 与 GOP，并新增 `AV1_BIT_DEPTH=8/10` 最低输出位深控制；10-bit 片源禁止降为 8-bit。
 - v8.2 - 09274ad [Dev] 🔧：FFmpeg 增强音轨作为默认 Audio 1，同时保留原始音轨作为 Audio 2。
 - v8.1 - b212afa [Dev] 🔧：音频回退到 v8.0 FFmpeg DSP；保留视频链和后续非音频改动。
 - v8.0 - d0908ea [Dev] 🔧：Notebook 独立视频/音频增强开关，音频 FFmpeg DSP 独立模块。
@@ -102,7 +102,8 @@ v8.5 Notebook 只暴露 `av1_nvenc` 高质量参数；底层旧编码后端仍�
 v8.5 Notebook 默认：
 
 - GPU AV1：`av1_nvenc`
-- 输出位深：自动跟随片源；8-bit → `yuv420p`，10-bit → `p010le`
+- `AV1_BIT_DEPTH=8`：8-bit 片源输出 `yuv420p`；10-bit 片源仍输出 `p010le`
+- `AV1_BIT_DEPTH=10`：8-bit / 10-bit 片源都输出 `p010le`
 - 质量：P7 / HQ / VBR CQ18 / fullres multipass
 - AQ：Spatial + Temporal，strength=8
 - B-frame：3，`b_ref_mode=middle`

@@ -1,4 +1,4 @@
-"""AV1 FFmpeg encoders with automatic 8-bit/10-bit output."""
+"""AV1 FFmpeg encoders with selectable minimum output bit depth."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ _AOM_QUEUE_DEPTH = 2
 
 # v8.5 AV1 NVENC configuration. configure() overrides these from CLI args.
 _AV1_PROFILE = "main"
+_AV1_BIT_DEPTH = 8
 _AV1_TUNE = "hq"
 _AV1_RC = "vbr"
 _AV1_BITRATE = "0"
@@ -77,6 +78,8 @@ def validate_args(args) -> None:
             raise ValueError("--cq must be between 0 and 63 for av1_nvenc")
         if args.av1_profile != "main":
             raise ValueError("AV1 NVENC uses AV1 Main profile.")
+        if args.av1_bit_depth not in (8, 10):
+            raise ValueError("--av1-bit-depth must be 8 or 10")
         if not 0 <= args.av1_b_frames <= 31:
             raise ValueError("--av1-b-frames must be between 0 and 31")
         max_lookahead = max(0, 31 - int(args.av1_b_frames))
@@ -147,7 +150,12 @@ def _libaom_tile_args(width: int, height: int) -> tuple[list[str], str]:
 
 def _frame_pixel_formats(frame: np.ndarray, codec: str) -> tuple[str, str]:
     if frame.dtype.kind == "u" and frame.dtype.itemsize == 1:
-        return "rgb24", "yuv420p"
+        output_pix_fmt = (
+            "p010le"
+            if codec == "av1_nvenc" and _AV1_BIT_DEPTH == 10
+            else "yuv420p"
+        )
+        return "rgb24", output_pix_fmt
     if frame.dtype.kind == "u" and frame.dtype.itemsize == 2:
         output_pix_fmt = "p010le" if codec == "av1_nvenc" else "yuv420p10le"
         return "rgb48le", output_pix_fmt
@@ -155,7 +163,7 @@ def _frame_pixel_formats(frame: np.ndarray, codec: str) -> tuple[str, str]:
 
 
 class RawVideoWriter:
-    """AV1 writer with automatic bit depth and asynchronous libaom stdin."""
+    """AV1 writer with source-safe bit depth and asynchronous libaom stdin."""
 
     def __init__(
         self,
@@ -327,6 +335,11 @@ class RawVideoWriter:
 
 def probe_encoder_runtime(args) -> None:
     probe_size = "640x360" if args.video_codec == "av1_nvenc" else "128x128"
+    probe_pix_fmt = (
+        "p010le"
+        if args.video_codec == "av1_nvenc" and _AV1_BIT_DEPTH == 10
+        else "yuv420p"
+    )
     command = [
         args.ffmpeg_bin,
         "-hide_banner",
@@ -344,9 +357,10 @@ def probe_encoder_runtime(args) -> None:
             args.svtav1_preset,
             args.aom_cpu_used,
         ),
-        "-pix_fmt", "yuv420p",
-        "-f", "null", "-",
     ]
+    if args.video_codec == "av1_nvenc" and probe_pix_fmt == "p010le":
+        command += ["-highbitdepth", "1"]
+    command += ["-pix_fmt", probe_pix_fmt, "-f", "null", "-"]
     result = subprocess.run(
         command,
         stdout=subprocess.PIPE,
@@ -370,7 +384,7 @@ def probe_encoder_runtime(args) -> None:
 
 def configure(args) -> None:
     global _SVTAV1_PRESET, _AOM_CPU_USED
-    global _AV1_PROFILE, _AV1_TUNE, _AV1_RC, _AV1_BITRATE
+    global _AV1_PROFILE, _AV1_BIT_DEPTH, _AV1_TUNE, _AV1_RC, _AV1_BITRATE
     global _AV1_MULTIPASS, _AV1_RC_LOOKAHEAD, _AV1_SPATIAL_AQ, _AV1_TEMPORAL_AQ
     global _AV1_AQ_STRENGTH, _AV1_B_REF_MODE, _AV1_B_FRAMES, _AV1_GOP_SIZE
 
@@ -378,6 +392,7 @@ def configure(args) -> None:
     _AOM_CPU_USED = int(args.aom_cpu_used)
 
     _AV1_PROFILE = str(args.av1_profile)
+    _AV1_BIT_DEPTH = int(args.av1_bit_depth)
     _AV1_TUNE = str(args.av1_tune)
     _AV1_RC = str(args.av1_rc)
     _AV1_BITRATE = str(args.av1_bitrate)
