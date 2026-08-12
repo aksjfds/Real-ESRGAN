@@ -66,21 +66,6 @@ def extend_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument("--av1-b-frames", type=int, default=3)
     parser.add_argument("--av1-gop-size", type=int, default=240)
-    parser.add_argument(
-        "--av1-color-primaries",
-        choices=("bt709", "bt2020"),
-        default="bt2020",
-    )
-    parser.add_argument(
-        "--av1-color-trc",
-        choices=("bt709", "smpte2084"),
-        default="smpte2084",
-    )
-    parser.add_argument(
-        "--av1-colorspace",
-        choices=("bt709", "bt2020nc"),
-        default="bt2020nc",
-    )
     return parser
 
 

@@ -29,7 +29,7 @@ FFmpeg 解码
 
 `AUDIO_ENHANCE=False` 时不执行 DSP，继续只保留原音轨并优先 stream copy。
 
-v8.5 Notebook 只暴露 `av1_nvenc` 参数；底层旧编码后端仍保留用于兼容。AV1 NVENC 的 10-bit 使用 AV1 Main profile + `p010le`，不存在 HEVC 式 `Main10` profile。Notebook 中 BT.2020 / PQ 参数是 HDR 色彩信令，不执行 SDR→HDR tone mapping，也不等同于完整的 mastering-display / MaxCLL 静态元数据。
+v8.5 Notebook 只暴露 `av1_nvenc` 参数；底层旧编码后端仍保留用于兼容。AV1 NVENC 的 10-bit 使用 AV1 Main profile + `p010le`，不存在 HEVC 式 `Main10` profile。
 
 ## 项目原则（必须遵守）
 
@@ -43,7 +43,7 @@ v8.5 Notebook 只暴露 `av1_nvenc` 参数；底层旧编码后端仍保留用�
 
 ## 版本历史
 
-- v8.5 [Dev] 🔧：Notebook 切换为 AV1 NVENC-only 高质量配置；AV1 Main + P010 10-bit、P7/HQ、VBR CQ18、fullres multipass、AQ、B-ref、GOP 与 BT.2020/PQ 色彩信令。
+- v8.5 [Dev] 🔧：Notebook 切换为 AV1 NVENC-only 高质量配置；AV1 Main + P010 10-bit、P7/HQ、VBR CQ18、fullres multipass、AQ、B-ref 与 GOP。
 - v8.2 - 09274ad [Dev] 🔧：FFmpeg 增强音轨作为默认 Audio 1，同时保留原始音轨作为 Audio 2。
 - v8.1 - b212afa [Dev] 🔧：音频回退到 v8.0 FFmpeg DSP；保留视频链和后续非音频改动。
 - v8.0 - d0908ea [Dev] 🔧：Notebook 独立视频/音频增强开关，音频 FFmpeg DSP 独立模块。
@@ -108,6 +108,5 @@ v8.5 Notebook 默认：
 - B-frame：3，`b_ref_mode=middle`
 - Lookahead：28（SDK 13.1 在 3 个 B 帧时允许的最大值）
 - GOP：240（60 fps 时 4 秒）
-- 色彩信令：BT.2020 + SMPTE ST 2084 + BT.2020 non-constant luminance
 
 底层仍保留旧 HEVC/H.264/CPU AV1 编码后端，用于 CLI 兼容，不在 v8.5 Notebook 暴露。

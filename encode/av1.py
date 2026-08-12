@@ -30,9 +30,6 @@ _AV1_AQ_STRENGTH = 8
 _AV1_B_REF_MODE = "middle"
 _AV1_B_FRAMES = 3
 _AV1_GOP_SIZE = 240
-_AV1_COLOR_PRIMARIES = "bt2020"
-_AV1_COLOR_TRC = "smpte2084"
-_AV1_COLORSPACE = "bt2020nc"
 
 
 def require_encoder(ffmpeg_bin: str, encoder: str) -> None:
@@ -139,9 +136,6 @@ def _codec_args(
             "-b_ref_mode", _AV1_B_REF_MODE,
             "-bf", str(_AV1_B_FRAMES),
             "-g", str(_AV1_GOP_SIZE),
-            "-color_primaries", _AV1_COLOR_PRIMARIES,
-            "-color_trc", _AV1_COLOR_TRC,
-            "-colorspace", _AV1_COLORSPACE,
         ]
         if _AV1_PIX_FMT == "p010le":
             args += ["-highbitdepth", "1"]
@@ -385,7 +379,6 @@ def configure(args) -> None:
     global _AV1_PROFILE, _AV1_PIX_FMT, _AV1_TUNE, _AV1_RC, _AV1_BITRATE
     global _AV1_MULTIPASS, _AV1_RC_LOOKAHEAD, _AV1_SPATIAL_AQ, _AV1_TEMPORAL_AQ
     global _AV1_AQ_STRENGTH, _AV1_B_REF_MODE, _AV1_B_FRAMES, _AV1_GOP_SIZE
-    global _AV1_COLOR_PRIMARIES, _AV1_COLOR_TRC, _AV1_COLORSPACE
 
     _SVTAV1_PRESET = int(args.svtav1_preset)
     _AOM_CPU_USED = int(args.aom_cpu_used)
@@ -403,6 +396,3 @@ def configure(args) -> None:
     _AV1_B_REF_MODE = str(args.av1_b_ref_mode)
     _AV1_B_FRAMES = int(args.av1_b_frames)
     _AV1_GOP_SIZE = int(args.av1_gop_size)
-    _AV1_COLOR_PRIMARIES = str(args.av1_color_primaries)
-    _AV1_COLOR_TRC = str(args.av1_color_trc)
-    _AV1_COLORSPACE = str(args.av1_colorspace)
