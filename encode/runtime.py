@@ -15,10 +15,10 @@ def extend_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--video-codec",
         choices=ALL_CODECS,
-        default="hevc_nvenc",
+        default="av1_nvenc",
         help=(
-            "Video encoder: CPU HEVC=libx265, GPU HEVC=hevc_nvenc, "
-            "CPU AV1=libsvtav1/libaom-av1, GPU AV1=av1_nvenc"
+            "Video encoder; v8.5 Notebook uses AV1 NVENC by default. "
+            "Legacy HEVC/H.264/software backends remain available through the CLI."
         ),
     )
     parser.add_argument("--crf", type=int, default=18, help="Software encoder quality; lower is higher quality")
@@ -42,6 +42,44 @@ def extend_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=6,
         help="libaom-av1 quality/speed setting, 0-8; higher is faster",
+    )
+
+    # v8.5 AV1 NVENC high-quality controls.
+    parser.add_argument("--av1-profile", choices=("main",), default="main")
+    parser.add_argument("--av1-pix-fmt", choices=("yuv420p", "p010le"), default="p010le")
+    parser.add_argument("--av1-tune", choices=("hq",), default="hq")
+    parser.add_argument("--av1-rc", choices=("vbr", "cbr", "constqp"), default="vbr")
+    parser.add_argument("--av1-bitrate", default="0")
+    parser.add_argument(
+        "--av1-multipass",
+        choices=("disabled", "qres", "fullres"),
+        default="fullres",
+    )
+    parser.add_argument("--av1-rc-lookahead", type=int, default=28)
+    parser.add_argument("--av1-spatial-aq", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--av1-temporal-aq", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--av1-aq-strength", type=int, default=8)
+    parser.add_argument(
+        "--av1-b-ref-mode",
+        choices=("disabled", "each", "middle"),
+        default="middle",
+    )
+    parser.add_argument("--av1-b-frames", type=int, default=3)
+    parser.add_argument("--av1-gop-size", type=int, default=240)
+    parser.add_argument(
+        "--av1-color-primaries",
+        choices=("bt709", "bt2020"),
+        default="bt2020",
+    )
+    parser.add_argument(
+        "--av1-color-trc",
+        choices=("bt709", "smpte2084"),
+        default="smpte2084",
+    )
+    parser.add_argument(
+        "--av1-colorspace",
+        choices=("bt709", "bt2020nc"),
+        default="bt2020nc",
     )
     return parser
 

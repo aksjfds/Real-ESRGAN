@@ -1,4 +1,4 @@
-"""AV1 FFmpeg encoders with automatic 8-bit/10-bit output."""
+"""AV1 FFmpeg encoders with v8.5 AV1 NVENC high-quality controls."""
 
 from __future__ import annotations
 
@@ -15,6 +15,24 @@ CODECS = {"libsvtav1", "libaom-av1", "av1_nvenc"}
 _SVTAV1_PRESET = 6
 _AOM_CPU_USED = 6
 _AOM_QUEUE_DEPTH = 2
+
+# v8.5 AV1 NVENC configuration. configure() overrides these from CLI args.
+_AV1_PROFILE = "main"
+_AV1_PIX_FMT = "p010le"
+_AV1_TUNE = "hq"
+_AV1_RC = "vbr"
+_AV1_BITRATE = "0"
+_AV1_MULTIPASS = "fullres"
+_AV1_RC_LOOKAHEAD = 28
+_AV1_SPATIAL_AQ = 1
+_AV1_TEMPORAL_AQ = 1
+_AV1_AQ_STRENGTH = 8
+_AV1_B_REF_MODE = "middle"
+_AV1_B_FRAMES = 3
+_AV1_GOP_SIZE = 240
+_AV1_COLOR_PRIMARIES = "bt2020"
+_AV1_COLOR_TRC = "smpte2084"
+_AV1_COLORSPACE = "bt2020nc"
 
 
 def require_encoder(ffmpeg_bin: str, encoder: str) -> None:
@@ -58,8 +76,27 @@ def validate_args(args) -> None:
         raise ValueError(f"Unsupported AV1 encoder: {args.video_codec}")
     if args.video_codec in {"libsvtav1", "libaom-av1"} and not 0 <= args.crf <= 63:
         raise ValueError("--crf must be between 0 and 63 for CPU AV1")
-    if args.video_codec == "av1_nvenc" and not 0 <= args.cq <= 63:
-        raise ValueError("--cq must be between 0 and 63 for av1_nvenc")
+    if args.video_codec == "av1_nvenc":
+        if not 0 <= args.cq <= 63:
+            raise ValueError("--cq must be between 0 and 63 for av1_nvenc")
+        if args.av1_profile != "main":
+            raise ValueError("AV1 NVENC uses AV1 Main profile; there is no HEVC-style Main10 profile.")
+        if not 0 <= args.av1_b_frames <= 31:
+            raise ValueError("--av1-b-frames must be between 0 and 31")
+        max_lookahead = max(0, 31 - int(args.av1_b_frames))
+        if not 0 <= args.av1_rc_lookahead <= max_lookahead:
+            raise ValueError(
+                f"--av1-rc-lookahead must be between 0 and {max_lookahead} "
+                f"when --av1-b-frames={args.av1_b_frames}"
+            )
+        if not 1 <= args.av1_aq_strength <= 15:
+            raise ValueError("--av1-aq-strength must be between 1 and 15")
+        if args.av1_gop_size < 1:
+            raise ValueError("--av1-gop-size must be at least 1")
+        if args.av1_b_ref_mode != "disabled" and args.av1_b_frames == 0:
+            raise ValueError("--av1-b-ref-mode requires --av1-b-frames > 0")
+        if args.av1_pix_fmt == "p010le" and args.av1_profile != "main":
+            raise ValueError("10-bit AV1 NVENC is encoded as AV1 Main profile with p010le")
     if not 0 <= args.svtav1_preset <= 13:
         raise ValueError("--svtav1-preset must be between 0 and 13")
     if not 0 <= args.aom_cpu_used <= 8:
@@ -87,18 +124,28 @@ def _codec_args(
             "-row-mt", "1",
         ]
     if codec == "av1_nvenc":
-        return [
+        args = [
             "-gpu", str(encode_gpu),
             "-preset", nvenc_preset,
-            "-tune", "hq",
-            "-rc", "vbr",
+            "-tune", _AV1_TUNE,
+            "-rc", _AV1_RC,
             "-cq", str(cq),
-            "-b:v", "0",
-            "-multipass", "fullres",
-            "-spatial-aq", "1",
-            "-temporal-aq", "1",
-            "-rc-lookahead", "32",
+            "-b:v", _AV1_BITRATE,
+            "-multipass", _AV1_MULTIPASS,
+            "-rc-lookahead", str(_AV1_RC_LOOKAHEAD),
+            "-spatial-aq", str(_AV1_SPATIAL_AQ),
+            "-temporal-aq", str(_AV1_TEMPORAL_AQ),
+            "-aq-strength", str(_AV1_AQ_STRENGTH),
+            "-b_ref_mode", _AV1_B_REF_MODE,
+            "-bf", str(_AV1_B_FRAMES),
+            "-g", str(_AV1_GOP_SIZE),
+            "-color_primaries", _AV1_COLOR_PRIMARIES,
+            "-color_trc", _AV1_COLOR_TRC,
+            "-colorspace", _AV1_COLORSPACE,
         ]
+        if _AV1_PIX_FMT == "p010le":
+            args += ["-highbitdepth", "1"]
+        return args
     raise ValueError(f"Unsupported AV1 encoder: {codec}")
 
 
@@ -112,15 +159,16 @@ def _libaom_tile_args(width: int, height: int) -> tuple[list[str], str]:
 
 def _frame_pixel_formats(frame: np.ndarray, codec: str) -> tuple[str, str]:
     if frame.dtype.kind == "u" and frame.dtype.itemsize == 1:
-        return "rgb24", "yuv420p"
+        output_pix_fmt = _AV1_PIX_FMT if codec == "av1_nvenc" else "yuv420p"
+        return "rgb24", output_pix_fmt
     if frame.dtype.kind == "u" and frame.dtype.itemsize == 2:
-        output_pix_fmt = "p010le" if codec == "av1_nvenc" else "yuv420p10le"
+        output_pix_fmt = _AV1_PIX_FMT if codec == "av1_nvenc" else "yuv420p10le"
         return "rgb48le", output_pix_fmt
     raise RuntimeError(f"Unsupported inference frame dtype for encoding: {frame.dtype}")
 
 
 class RawVideoWriter:
-    """AV1 writer with automatic bit depth and asynchronous libaom stdin."""
+    """AV1 writer with configurable NVENC output and asynchronous libaom stdin."""
 
     def __init__(
         self,
@@ -290,6 +338,7 @@ class RawVideoWriter:
 
 def probe_encoder_runtime(args) -> None:
     probe_size = "640x360" if args.video_codec == "av1_nvenc" else "128x128"
+    probe_pix_fmt = _AV1_PIX_FMT if args.video_codec == "av1_nvenc" else "yuv420p"
     command = [
         args.ffmpeg_bin,
         "-hide_banner",
@@ -307,7 +356,7 @@ def probe_encoder_runtime(args) -> None:
             args.svtav1_preset,
             args.aom_cpu_used,
         ),
-        "-pix_fmt", "yuv420p",
+        "-pix_fmt", probe_pix_fmt,
         "-f", "null", "-",
     ]
     result = subprocess.run(
@@ -322,7 +371,7 @@ def probe_encoder_runtime(args) -> None:
     detail = result.stdout.strip()
     if args.video_codec == "av1_nvenc":
         raise RuntimeError(
-            "av1_nvenc is present in FFmpeg but the runtime probe failed. "
+            "av1_nvenc is present in FFmpeg but the v8.5 runtime probe failed. "
             "Check the FFmpeg options below and the selected NVIDIA GPU/driver.\n"
             f"FFmpeg output:\n{detail}"
         )
@@ -333,5 +382,27 @@ def probe_encoder_runtime(args) -> None:
 
 def configure(args) -> None:
     global _SVTAV1_PRESET, _AOM_CPU_USED
+    global _AV1_PROFILE, _AV1_PIX_FMT, _AV1_TUNE, _AV1_RC, _AV1_BITRATE
+    global _AV1_MULTIPASS, _AV1_RC_LOOKAHEAD, _AV1_SPATIAL_AQ, _AV1_TEMPORAL_AQ
+    global _AV1_AQ_STRENGTH, _AV1_B_REF_MODE, _AV1_B_FRAMES, _AV1_GOP_SIZE
+    global _AV1_COLOR_PRIMARIES, _AV1_COLOR_TRC, _AV1_COLORSPACE
+
     _SVTAV1_PRESET = int(args.svtav1_preset)
     _AOM_CPU_USED = int(args.aom_cpu_used)
+
+    _AV1_PROFILE = str(args.av1_profile)
+    _AV1_PIX_FMT = str(args.av1_pix_fmt)
+    _AV1_TUNE = str(args.av1_tune)
+    _AV1_RC = str(args.av1_rc)
+    _AV1_BITRATE = str(args.av1_bitrate)
+    _AV1_MULTIPASS = str(args.av1_multipass)
+    _AV1_RC_LOOKAHEAD = int(args.av1_rc_lookahead)
+    _AV1_SPATIAL_AQ = int(args.av1_spatial_aq)
+    _AV1_TEMPORAL_AQ = int(args.av1_temporal_aq)
+    _AV1_AQ_STRENGTH = int(args.av1_aq_strength)
+    _AV1_B_REF_MODE = str(args.av1_b_ref_mode)
+    _AV1_B_FRAMES = int(args.av1_b_frames)
+    _AV1_GOP_SIZE = int(args.av1_gop_size)
+    _AV1_COLOR_PRIMARIES = str(args.av1_color_primaries)
+    _AV1_COLOR_TRC = str(args.av1_color_trc)
+    _AV1_COLORSPACE = str(args.av1_colorspace)
