@@ -46,7 +46,6 @@ def extend_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
     # v8.5 AV1 NVENC high-quality controls.
     parser.add_argument("--av1-profile", choices=("main",), default="main")
-    parser.add_argument("--av1-pix-fmt", choices=("yuv420p", "p010le"), default="p010le")
     parser.add_argument("--av1-tune", choices=("hq",), default="hq")
     parser.add_argument("--av1-rc", choices=("vbr", "cbr", "constqp"), default="vbr")
     parser.add_argument("--av1-bitrate", default="0")
