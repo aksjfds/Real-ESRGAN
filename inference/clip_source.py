@@ -1,7 +1,9 @@
-"""CPU-only scene-aware BasicVSR++ clip assembly."""
+"""CPU-only scene-aware BasicVSR++ clip assembly with one-item prefetch."""
 
 from __future__ import annotations
 
+import queue
+import threading
 import time
 
 import numpy as np
@@ -13,8 +15,12 @@ from .scene_metrics import (
 )
 
 
+_ClipTask = tuple[list[np.ndarray], int, int] | None
+_PREFETCH_DEPTH = 1
+
+
 class ClipSource:
-    """Assemble overlapping temporal clips without owning any CUDA state."""
+    """Assemble overlapping temporal clips and prefetch one task ahead."""
 
     def __init__(
         self,
@@ -39,6 +45,16 @@ class ClipSource:
 
         self._last_signature: SceneSignature | None = None
         self._pending_signature: SceneSignature | None = None
+        self._prefetch_queue: queue.Queue[tuple[str, object]] = queue.Queue(
+            maxsize=_PREFETCH_DEPTH
+        )
+        self._prefetch_stop = threading.Event()
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_loop,
+            name="bvs-clip-prefetch",
+            daemon=True,
+        )
+        self._prefetch_thread.start()
 
     def _read_source(self) -> np.ndarray | None:
         started = time.monotonic()
@@ -55,7 +71,7 @@ class ClipSource:
         self._last_signature = self._pending_signature
         self._pending_signature = None
 
-    def next_task(self) -> tuple[list[np.ndarray], int, int] | None:
+    def _next_task_sync(self) -> _ClipTask:
         while True:
             if self.segment_end or self.eof:
                 if self.buffer:
@@ -121,8 +137,57 @@ class ClipSource:
                 self._last_signature = None
             return frames, emit_start, emit_end
 
+    def _publish_prefetch(self, kind: str, payload: object) -> bool:
+        while not self._prefetch_stop.is_set():
+            try:
+                self._prefetch_queue.put((kind, payload), timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _prefetch_loop(self) -> None:
+        try:
+            while not self._prefetch_stop.is_set():
+                task = self._next_task_sync()
+                if not self._publish_prefetch("task", task):
+                    return
+                if task is None:
+                    return
+        except BaseException as error:
+            if not self._prefetch_stop.is_set():
+                self._publish_prefetch("error", error)
+
+    def next_task(self) -> _ClipTask:
+        if self.closed:
+            raise RuntimeError("ClipSource is closed.")
+        kind, payload = self._prefetch_queue.get()
+        if kind == "error":
+            if isinstance(payload, BaseException):
+                raise RuntimeError("BVS clip prefetch failed.") from payload
+            raise RuntimeError(f"BVS clip prefetch failed: {payload!r}")
+        if kind != "task":
+            raise RuntimeError(f"Unknown BVS prefetch message: {kind!r}")
+        return payload  # type: ignore[return-value]
+
     def close(self) -> None:
         if self.closed:
             return
         self.closed = True
-        self.reader.close()
+        self._prefetch_stop.set()
+
+        while True:
+            try:
+                self._prefetch_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        try:
+            self.reader.close()
+        finally:
+            self._prefetch_thread.join(timeout=5.0)
+            while True:
+                try:
+                    self._prefetch_queue.get_nowait()
+                except queue.Empty:
+                    break

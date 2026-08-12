@@ -2,7 +2,7 @@
 
 ## 当前版本流水线
 
-当前 v8.8 [Dev] 流水线：
+当前 v8.9 [Dev] 流水线：
 
 ```text
 视频增强（可关闭）：
@@ -31,6 +31,8 @@ FFmpeg 解码
 
 `DEBAND_STRENGTH=0` 时不执行 deband；Notebook 默认 `0.006`，只在 FFmpeg 解码后、BasicVSR++ 前处理。CLI 默认仍为 `0`，保持旧调用兼容。
 
+v8.9 的 `ClipSource` 使用单槽有界异步预取：后台线程提前执行下一次 FFmpeg 读帧、scene signature 与 BVS clip 组装，`Queue(maxsize=1)` 只缓存 1 个待调度 clip；不改变帧顺序、scene-cut 判定、BVS/RIFE/SR 数学路径或编码参数。
+
 `AUDIO_ENHANCE=False` 时不执行 DSP，继续只保留原音轨并优先 stream copy。
 
 v8.8 Notebook 暴露 `av1_nvenc` / `hevc_nvenc` 两种 GPU 编码器，默认仍为 `av1_nvenc`。两者共用 `PRESET`、`CQ`、`ENCODE_GPU`。AV1 的 profile 不再作为可变参数暴露；旧 CLI 的 `--av1-profile main` 仅作为兼容占位，成品会验证为 Main；VBR 使用 `CQ`，CBR 要求非零 bitrate 并设置匹配的 maxrate/bufsize，CONSTQP 使用 `QP`。`AV1_BIT_DEPTH` 表示 AV1 最低输出位深：设为 `8` 时 8-bit 片源保持 8-bit，设为 `10` 时 8-bit 片源编码为 10-bit；10-bit 片源始终保持 10-bit。启动日志中的 `encode=` 表示编码器输入/目标像素格式，任务完成后以最终文件的 ffprobe 结果作为实际输出事实。
@@ -49,6 +51,7 @@ AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频�
 
 ## 版本历史
 
+- v8.9 [Dev] 🔧：`ClipSource` 增加单槽有界异步预取；后台线程在当前 GPU 任务执行期间提前完成下一 BVS clip 的 FFmpeg 读帧、scene signature 与组帧，`Queue(maxsize=1)` 提供背压并限制额外内存，不改变视频处理数学路径与输出顺序。
 - v8.8 [Dev] 🔧：修复编码配置/日志一致性：AV1 VBR/CBR/CONSTQP 使用正确 FFmpeg 参数，CONSTQP 要求 AQ 关闭；移除 AV1 profile 的伪可配置语义并保留旧 CLI 兼容，成品验证为 Main；AV1/HEVC/H.264 增加源位深一致的 runtime probe；输出位深日志移除全局状态并显式传递；任务完成后用 ffprobe 验证成品 codec/profile/位深/分辨率/FPS/音轨；NVENC 默认改为仅 Spatial AQ，避免 Spatial/Temporal AQ 同时开启；清理活动路径中的陈旧版本文案。
 - v8.7 [Dev] 🔧：Notebook 恢复 `hevc_nvenc`，与 `av1_nvenc` 二选一；继续默认 AV1，HEVC 复用现有 NVENC 高质量 backend。
 - v8.6 [Dev] 🔧：在 FFmpeg 解码后、BasicVSR++ 前加入可选轻度 deband；新增 `DEBAND_STRENGTH` / `--deband-strength`，Notebook 默认 `0.006`，CLI 默认 `0` 保持旧行为。
@@ -76,6 +79,7 @@ AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频�
 - `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），v8.8 Notebook 可选 `av1_nvenc` / `hevc_nvenc`，当前默认 `DUAL_GPU=True`、`AUDIO_ENHANCE=True`。
 - `inference.py`：视频增强 CLI 与总入口。
 - `inference/scheduler.py`：CPU 总编排、编码 fail-fast probe、最终音频边界与成品验证。
+- `inference/clip_source.py`：CPU scene-aware BVS clip 组装；v8.9 使用后台线程单槽预取下一 clip。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：调度状态、任务策略、结果处理与 watchdog。
 - `inference/task_protocol.py` / `worker_protocols.py`：BVS / RIFE / SR typed task/result 与 worker API。
 - `inference/gpu_transport.py` / `gpu_workers.py` / `gpu_worker_process.py`：常驻 GPU worker、shared memory、FrameHandle 与进程生命周期。
