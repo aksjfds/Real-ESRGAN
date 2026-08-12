@@ -1,4 +1,4 @@
-"""Low-coupling FFmpeg audio enhancement and mux boundary for v8."""
+"""Low-coupling FFmpeg audio enhancement and mux boundary."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def validate_runtime(ffmpeg_bin: str) -> None:
     ]
     if missing:
         raise RuntimeError(
-            "FFmpeg is missing required v8 audio filters: " + ", ".join(missing)
+            "FFmpeg is missing required audio filters: " + ", ".join(missing)
         )
 
 
@@ -107,7 +107,7 @@ def mux_audio(
     *,
     enhance: bool = False,
 ) -> None:
-    """Mux audio into processed video; v8.2 keeps original beside enhancement."""
+    """Mux audio into processed video, preserving original audio beside enhancement."""
     if not has_audio:
         silent_video.replace(output_path)
         return

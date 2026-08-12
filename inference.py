@@ -48,7 +48,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gpu-ids",
         default="0",
-        help="Comma-separated CUDA GPU IDs; v7 defaults to one GPU",
+        help="Comma-separated CUDA GPU IDs; defaults to one GPU",
     )
     parser.add_argument(
         "--audio-codec",
@@ -59,7 +59,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-enhance",
         action="store_true",
-        help="Enable v8 FFmpeg dialogue-focused audio enhancement",
+        help="Enable FFmpeg dialogue-focused audio enhancement",
     )
     parser.add_argument(
         "--start-time",

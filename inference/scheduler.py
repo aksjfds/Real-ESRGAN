@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from fractions import Fraction
+import json
 from pathlib import Path
+import re
+import subprocess
 import time
 
 import numpy as np
@@ -16,6 +19,139 @@ from .output_runtime import OutputPump, create_progress
 from .scheduler_loop import run_scheduler
 from .scheduler_state import SchedulerState
 from .timeline import TimelinePlanner, ceil_fraction
+
+
+def _expected_output_bit_depth(args, source_bit_depth: int) -> int:
+    if args.video_codec == "av1_nvenc":
+        return max(int(source_bit_depth), int(args.av1_bit_depth))
+    return int(source_bit_depth)
+
+
+def _expected_codec_name(video_codec: str) -> str:
+    if video_codec in {"av1_nvenc", "libsvtav1", "libaom-av1"}:
+        return "av1"
+    if video_codec in {"hevc_nvenc", "libx265"}:
+        return "hevc"
+    if video_codec in {"h264_nvenc", "libx264"}:
+        return "h264"
+    raise ValueError(f"Unsupported output codec for verification: {video_codec}")
+
+
+def _stream_bit_depth(stream: dict) -> tuple[int, str]:
+    pix_fmt = str(stream.get("pix_fmt") or "unknown").lower()
+    raw_value = str(stream.get("bits_per_raw_sample") or "").strip()
+    raw_bits = int(raw_value) if raw_value.isdigit() and int(raw_value) > 0 else 0
+    if "p010" in pix_fmt:
+        bits = 10
+    else:
+        match = re.search(r"(?:p|gray|rgb|bgr)(9|10|12|14|16)(?:le|be)$", pix_fmt)
+        bits = int(match.group(1)) if match else raw_bits or 8
+    if bits <= 8:
+        return 8, pix_fmt
+    if bits == 10:
+        return 10, pix_fmt
+    raise RuntimeError(
+        f"Final output pixel format {pix_fmt!r} reports {bits}-bit samples; "
+        "only 8-bit and 10-bit are supported."
+    )
+
+
+def _verify_output_file(
+    output_path: Path,
+    ffprobe_bin: str,
+    *,
+    video_codec: str,
+    expected_width: int,
+    expected_height: int,
+    expected_fps: float,
+    expected_bit_depth: int,
+    expected_audio_streams: int,
+    expect_enhanced_audio: bool,
+) -> str:
+    command = [
+        ffprobe_bin,
+        "-v", "error",
+        "-print_format", "json",
+        "-show_streams",
+        str(output_path),
+    ]
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"final ffprobe verification failed:\n{detail}")
+
+    data = json.loads(result.stdout)
+    streams = data.get("streams", [])
+    videos = [stream for stream in streams if stream.get("codec_type") == "video"]
+    audios = [stream for stream in streams if stream.get("codec_type") == "audio"]
+    if len(videos) != 1:
+        raise RuntimeError(f"Final output must contain exactly one video stream; got {len(videos)}")
+
+    video = videos[0]
+    actual_codec = str(video.get("codec_name") or "unknown")
+    expected_codec = _expected_codec_name(video_codec)
+    if actual_codec != expected_codec:
+        raise RuntimeError(
+            f"Final output codec mismatch: expected {expected_codec}, got {actual_codec}"
+        )
+
+    width = int(video.get("width") or 0)
+    height = int(video.get("height") or 0)
+    if (width, height) != (expected_width, expected_height):
+        raise RuntimeError(
+            "Final output dimensions mismatch: "
+            f"expected {expected_width}x{expected_height}, got {width}x{height}"
+        )
+
+    rate_text = str(video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/0")
+    try:
+        actual_fps = float(Fraction(rate_text))
+    except (ValueError, ZeroDivisionError) as error:
+        raise RuntimeError(f"Final output has invalid frame rate: {rate_text!r}") from error
+    if abs(actual_fps - expected_fps) > max(1e-3, expected_fps * 1e-6):
+        raise RuntimeError(
+            f"Final output FPS mismatch: expected {expected_fps:.6f}, got {actual_fps:.6f}"
+        )
+
+    actual_bit_depth, pix_fmt = _stream_bit_depth(video)
+    if actual_bit_depth != expected_bit_depth:
+        raise RuntimeError(
+            "Final output bit depth mismatch: "
+            f"expected {expected_bit_depth}-bit, got {actual_bit_depth}-bit ({pix_fmt})"
+        )
+
+    profile = str(video.get("profile") or "unknown")
+    if expected_codec == "av1" and profile.lower() != "main":
+        raise RuntimeError(f"Final AV1 profile mismatch: expected Main, got {profile}")
+    if expected_codec == "hevc":
+        expected_profile = "main 10" if expected_bit_depth == 10 else "main"
+        if profile.lower() != expected_profile:
+            raise RuntimeError(
+                f"Final HEVC profile mismatch: expected {expected_profile.title()}, got {profile}"
+            )
+
+    if len(audios) != expected_audio_streams:
+        raise RuntimeError(
+            "Final output audio stream count mismatch: "
+            f"expected {expected_audio_streams}, got {len(audios)}"
+        )
+    if expect_enhanced_audio:
+        defaults = [int(stream.get("disposition", {}).get("default", 0)) for stream in audios]
+        if defaults != [1, 0]:
+            raise RuntimeError(
+                "Final enhanced/original audio default dispositions are incorrect: "
+                f"default={defaults}"
+            )
+
+    return (
+        f"{actual_codec} | profile={profile} | {actual_bit_depth}-bit ({pix_fmt}) | "
+        f"{width}x{height} | {actual_fps:.3f} fps | audio={len(audios)}"
+    )
 
 
 def process_video(args) -> None:
@@ -45,6 +181,10 @@ def process_video(args) -> None:
     )
 
     info = base.probe_video(input_path, args.ffprobe_bin)
+    probe_runtime = getattr(writer_type, "probe_runtime", None)
+    if callable(probe_runtime):
+        probe_runtime(args, info.bit_depth)
+
     source_rate = Fraction(info.fps_num, info.fps_den)
     requested_rife_fps = float(args.rife_fps)
     if requested_rife_fps == 0.0:
@@ -154,6 +294,12 @@ def process_video(args) -> None:
             "resample=NPP Lanczos CUDA (CPU Lanczos4 fallback)"
         )
 
+    output_bit_depth = _expected_output_bit_depth(args, info.bit_depth)
+    output_pix_fmt = base.output_pixel_format(
+        args.video_codec,
+        output_bit_depth,
+    )
+
     from .scheduler_reporting import print_run_header
 
     print_run_header(
@@ -165,10 +311,8 @@ def process_video(args) -> None:
         out_h=out_h,
         output_fps=output_fps,
         video_codec=args.video_codec,
-        output_pix_fmt=base.output_pixel_format(
-            args.video_codec,
-            info.bit_depth,
-        ),
+        output_bit_depth=output_bit_depth,
+        output_pix_fmt=output_pix_fmt,
         mode=mode,
         start=base.format_seconds(start),
         end=base.format_seconds(end),
@@ -351,6 +495,23 @@ def process_video(args) -> None:
         enhance=bool(args.audio_enhance),
     )
     audio_time = time.monotonic() - audio_started
+
+    expected_audio_streams = (
+        0
+        if not info.has_audio
+        else (2 if bool(args.audio_enhance) else 1)
+    )
+    verification_text = _verify_output_file(
+        output_path,
+        args.ffprobe_bin,
+        video_codec=args.video_codec,
+        expected_width=out_w,
+        expected_height=out_h,
+        expected_fps=output_fps,
+        expected_bit_depth=output_bit_depth,
+        expected_audio_streams=expected_audio_streams,
+        expect_enhanced_audio=bool(args.audio_enhance and info.has_audio),
+    )
     if temp_video.exists():
         temp_video.unlink()
 
@@ -393,5 +554,6 @@ def process_video(args) -> None:
         scene_cuts=scene_cuts,
         size_mib=size_mib,
         bitrate=bitrate,
+        verification_text=verification_text,
         output_path=output_path,
     )

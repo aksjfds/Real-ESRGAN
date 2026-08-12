@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone v8 media bypass/audio enhancement entry point."""
+"""Standalone media bypass/audio enhancement entry point."""
 
 from __future__ import annotations
 

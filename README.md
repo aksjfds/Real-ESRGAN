@@ -2,7 +2,7 @@
 
 ## 当前版本流水线
 
-当前 v8.7 [Dev] 流水线：
+当前 v8.8 [Dev] 流水线：
 
 ```text
 视频增强（可关闭）：
@@ -13,6 +13,7 @@ FFmpeg 解码
 → Real-ESRGAN full-frame 超分
 → NPP Lanczos CUDA 最终倍率调整（CPU Lanczos4 fallback）
 → NVENC（Notebook 可选 av1_nvenc / hevc_nvenc；默认 av1_nvenc）
+→ ffprobe 成品验证（codec / profile / 位深 / 分辨率 / FPS / 音轨）
 
 音频增强（可关闭，默认开启 FFmpeg 版本）：
 原始音频
@@ -32,7 +33,9 @@ FFmpeg 解码
 
 `AUDIO_ENHANCE=False` 时不执行 DSP，继续只保留原音轨并优先 stream copy。
 
-v8.7 Notebook 暴露 `av1_nvenc` / `hevc_nvenc` 两种 GPU 编码器，默认仍为 `av1_nvenc`。两者共用 `PRESET`、`CQ`、`ENCODE_GPU`；AV1 专属参数仅在选择 `av1_nvenc` 时传入。`AV1_BIT_DEPTH` 表示 AV1 最低输出位深：设为 `8` 时 8-bit 片源保持 `yuv420p`，设为 `10` 时 8-bit 片源编码为 `p010le`；10-bit 片源无论该参数为 `8` 还是 `10` 都始终输出 10-bit `p010le`。`hevc_nvenc` 沿用现有 backend 的 HQ / VBR / fullres multipass / AQ / lookahead 配置，位深跟随推理帧：8-bit 输出 `yuv420p`，10-bit 输出 `p010le`。
+v8.8 Notebook 暴露 `av1_nvenc` / `hevc_nvenc` 两种 GPU 编码器，默认仍为 `av1_nvenc`。两者共用 `PRESET`、`CQ`、`ENCODE_GPU`。AV1 的 profile 不再作为可变参数暴露；旧 CLI 的 `--av1-profile main` 仅作为兼容占位，成品会验证为 Main；VBR 使用 `CQ`，CBR 要求非零 bitrate 并设置匹配的 maxrate/bufsize，CONSTQP 使用 `QP`。`AV1_BIT_DEPTH` 表示 AV1 最低输出位深：设为 `8` 时 8-bit 片源保持 8-bit，设为 `10` 时 8-bit 片源编码为 10-bit；10-bit 片源始终保持 10-bit。启动日志中的 `encode=` 表示编码器输入/目标像素格式，任务完成后以最终文件的 ffprobe 结果作为实际输出事实。
+
+AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频相同位深的测试帧执行一次真实编码 probe；GPU、驱动、10-bit、lookahead、AQ 等参数组合不兼容时会提前失败。NVENC 默认只启用 Spatial AQ，Temporal AQ 默认关闭；AV1 参数校验禁止同时开启两种 AQ，CONSTQP 则要求两种 AQ 都关闭，以保证 QP 语义不被 AQ 改写。
 
 ## 项目原则（必须遵守）
 
@@ -46,6 +49,7 @@ v8.7 Notebook 暴露 `av1_nvenc` / `hevc_nvenc` 两种 GPU 编码器，默认仍
 
 ## 版本历史
 
+- v8.8 [Dev] 🔧：修复编码配置/日志一致性：AV1 VBR/CBR/CONSTQP 使用正确 FFmpeg 参数，CONSTQP 要求 AQ 关闭；移除 AV1 profile 的伪可配置语义并保留旧 CLI 兼容，成品验证为 Main；AV1/HEVC/H.264 增加源位深一致的 runtime probe；输出位深日志移除全局状态并显式传递；任务完成后用 ffprobe 验证成品 codec/profile/位深/分辨率/FPS/音轨；NVENC 默认改为仅 Spatial AQ，避免 Spatial/Temporal AQ 同时开启；清理活动路径中的陈旧版本文案。
 - v8.7 [Dev] 🔧：Notebook 恢复 `hevc_nvenc`，与 `av1_nvenc` 二选一；继续默认 AV1，HEVC 复用现有 NVENC 高质量 backend。
 - v8.6 [Dev] 🔧：在 FFmpeg 解码后、BasicVSR++ 前加入可选轻度 deband；新增 `DEBAND_STRENGTH` / `--deband-strength`，Notebook 默认 `0.006`，CLI 默认 `0` 保持旧行为。
 - v8.5 [Release] ✅：Notebook 使用 AV1 NVENC-only 高质量配置；P7/HQ、VBR CQ18、fullres multipass、AQ、B-ref 与 GOP，并新增 `AV1_BIT_DEPTH=8/10` 最低输出位深控制；10-bit 片源禁止降为 8-bit。
@@ -69,9 +73,9 @@ v8.7 Notebook 暴露 `av1_nvenc` / `hevc_nvenc` 两种 GPU 编码器，默认仍
 
 ## 当前结构
 
-- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），v8.7 Notebook 可选 `av1_nvenc` / `hevc_nvenc`，当前默认 `DUAL_GPU=True`、`AUDIO_ENHANCE=True`。
+- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），v8.8 Notebook 可选 `av1_nvenc` / `hevc_nvenc`，当前默认 `DUAL_GPU=True`、`AUDIO_ENHANCE=True`。
 - `inference.py`：视频增强 CLI 与总入口。
-- `inference/scheduler.py`：CPU 总编排与最终音频边界。
+- `inference/scheduler.py`：CPU 总编排、编码 fail-fast probe、最终音频边界与成品验证。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：调度状态、任务策略、结果处理与 watchdog。
 - `inference/task_protocol.py` / `worker_protocols.py`：BVS / RIFE / SR typed task/result 与 worker API。
 - `inference/gpu_transport.py` / `gpu_workers.py` / `gpu_worker_process.py`：常驻 GPU worker、shared memory、FrameHandle 与进程生命周期。
@@ -104,14 +108,16 @@ v8.7 Notebook 暴露 `av1_nvenc` / `hevc_nvenc` 两种 GPU 编码器，默认仍
 
 ## 编码
 
-v8.7 Notebook 默认：
+v8.8 Notebook 默认：
 
 - `VIDEO_CODEC="av1_nvenc"`；可改为 `hevc_nvenc`
 - 两种 NVENC 共用：P7 / CQ18 / `ENCODE_GPU=0`
-- AV1：HQ / VBR / fullres multipass / Spatial + Temporal AQ / B-ref / GOP
-- `AV1_BIT_DEPTH=8`：8-bit 片源输出 `yuv420p`；10-bit 片源仍输出 `p010le`
-- `AV1_BIT_DEPTH=10`：8-bit / 10-bit 片源都输出 `p010le`
-- HEVC：沿用现有 HQ / VBR / fullres multipass / Spatial + Temporal AQ / lookahead 32 / B-frame 3
-- HEVC 位深：8-bit 推理帧输出 `yuv420p`；10-bit 推理帧输出 `p010le`
+- AV1：Main / HQ / VBR CQ18 / fullres multipass / Spatial AQ strength=8 / B-ref / GOP
+- AV1 默认 `TEMPORAL_AQ=0`，并禁止与 Spatial AQ 同时开启
+- `AV1_BIT_DEPTH=8`：8-bit 片源输出 8-bit；10-bit 片源仍输出 10-bit
+- `AV1_BIT_DEPTH=10`：8-bit / 10-bit 片源都输出 10-bit
+- HEVC：HQ / VBR CQ18 / fullres multipass / Spatial AQ strength=8 / lookahead 32 / B-frame 3
+- HEVC 位深：8-bit 推理帧输出 8-bit；10-bit 推理帧输出 10-bit
+- AV1/HEVC/H.264 编码在模型加载前执行真实 runtime probe；成品 mux 后执行 ffprobe 验证
 
-底层仍保留 H.264/软件 HEVC/CPU AV1 编码后端，用于 CLI 兼容，不在 v8.7 Notebook 暴露。
+底层仍保留 H.264/软件 HEVC/CPU AV1 编码后端，用于 CLI 兼容，不在 v8.8 Notebook 暴露。

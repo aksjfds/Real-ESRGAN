@@ -17,8 +17,8 @@ def extend_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         choices=ALL_CODECS,
         default="av1_nvenc",
         help=(
-            "Video encoder; v8.5 Notebook uses AV1 NVENC by default. "
-            "Legacy HEVC/H.264/software backends remain available through the CLI."
+            "Video encoder; Notebook defaults to AV1 NVENC. "
+            "HEVC/H.264/software backends remain available through the CLI."
         ),
     )
     parser.add_argument("--crf", type=int, default=18, help="Software encoder quality; lower is higher quality")
@@ -28,7 +28,7 @@ def extend_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default="medium",
         help="x264/x265 software encoder preset",
     )
-    parser.add_argument("--cq", type=int, default=18, help="NVENC quality target; lower is higher quality")
+    parser.add_argument("--cq", type=int, default=18, help="NVENC CQ target or CONSTQP QP; lower is higher quality")
     parser.add_argument("--nvenc-preset", choices=tuple(f"p{i}" for i in range(1, 8)), default="p7")
     parser.add_argument("--encode-gpu", type=int, default=0)
     parser.add_argument(
@@ -44,8 +44,13 @@ def extend_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="libaom-av1 quality/speed setting, 0-8; higher is faster",
     )
 
-    # v8.5 AV1 NVENC high-quality controls.
-    parser.add_argument("--av1-profile", choices=("main",), default="main")
+    # AV1 NVENC high-quality controls.
+    parser.add_argument(
+        "--av1-profile",
+        choices=("main",),
+        default="main",
+        help="Compatibility-only option; NVENC AV1 output is fixed to Main and final output is verified with ffprobe",
+    )
     parser.add_argument(
         "--av1-bit-depth",
         type=int,
@@ -57,7 +62,12 @@ def extend_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--av1-tune", choices=("hq",), default="hq")
-    parser.add_argument("--av1-rc", choices=("vbr", "cbr", "constqp"), default="vbr")
+    parser.add_argument(
+        "--av1-rc",
+        choices=("vbr", "cbr", "constqp"),
+        default="vbr",
+        help="AV1 NVENC rate control: VBR uses --cq, CBR requires --av1-bitrate, CONSTQP uses --cq as QP",
+    )
     parser.add_argument("--av1-bitrate", default="0")
     parser.add_argument(
         "--av1-multipass",
@@ -66,7 +76,7 @@ def extend_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument("--av1-rc-lookahead", type=int, default=28)
     parser.add_argument("--av1-spatial-aq", type=int, choices=(0, 1), default=1)
-    parser.add_argument("--av1-temporal-aq", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--av1-temporal-aq", type=int, choices=(0, 1), default=0)
     parser.add_argument("--av1-aq-strength", type=int, default=8)
     parser.add_argument(
         "--av1-b-ref-mode",
@@ -88,7 +98,6 @@ def prepare_runtime(base: ModuleType, args: argparse.Namespace) -> None:
         av1.validate_args(args)
         av1.configure(args)
         av1.require_encoder(args.ffmpeg_bin, args.video_codec)
-        av1.probe_encoder_runtime(args)
         base.set_encoding_backend(av1.require_encoder, av1.RawVideoWriter)
         return
 
