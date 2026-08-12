@@ -2,7 +2,7 @@
 
 ## 当前版本流水线
 
-当前 v8.6 [Dev] 流水线：
+当前 v8.7 [Dev] 流水线：
 
 ```text
 视频增强（可关闭）：
@@ -12,7 +12,7 @@ FFmpeg 解码
 → Practical-RIFE 4.25 任意 timestep 插帧（可关闭）
 → Real-ESRGAN full-frame 超分
 → NPP Lanczos CUDA 最终倍率调整（CPU Lanczos4 fallback）
-→ AV1 NVENC（Notebook 默认：P7 / HQ / CQ18 / 可选最低输出位深 / fullres multipass）
+→ NVENC（Notebook 可选 av1_nvenc / hevc_nvenc；默认 av1_nvenc）
 
 音频增强（可关闭，默认开启 FFmpeg 版本）：
 原始音频
@@ -32,7 +32,7 @@ FFmpeg 解码
 
 `AUDIO_ENHANCE=False` 时不执行 DSP，继续只保留原音轨并优先 stream copy。
 
-v8.6 Notebook 继续只暴露 `av1_nvenc` 高质量参数；底层旧编码后端仍保留用于兼容。`AV1_BIT_DEPTH` 表示 AV1 最低输出位深：设为 `8` 时 8-bit 片源保持 `yuv420p`，设为 `10` 时 8-bit 片源编码为 `p010le`；10-bit 片源无论该参数为 `8` 还是 `10` 都始终输出 10-bit `p010le`。AV1 两种位深都使用 Main profile。
+v8.7 Notebook 暴露 `av1_nvenc` / `hevc_nvenc` 两种 GPU 编码器，默认仍为 `av1_nvenc`。两者共用 `PRESET`、`CQ`、`ENCODE_GPU`；AV1 专属参数仅在选择 `av1_nvenc` 时传入。`AV1_BIT_DEPTH` 表示 AV1 最低输出位深：设为 `8` 时 8-bit 片源保持 `yuv420p`，设为 `10` 时 8-bit 片源编码为 `p010le`；10-bit 片源无论该参数为 `8` 还是 `10` 都始终输出 10-bit `p010le`。`hevc_nvenc` 沿用现有 backend 的 HQ / VBR / fullres multipass / AQ / lookahead 配置，位深跟随推理帧：8-bit 输出 `yuv420p`，10-bit 输出 `p010le`。
 
 ## 项目原则（必须遵守）
 
@@ -46,6 +46,7 @@ v8.6 Notebook 继续只暴露 `av1_nvenc` 高质量参数；底层旧编码后�
 
 ## 版本历史
 
+- v8.7 [Dev] 🔧：Notebook 恢复 `hevc_nvenc`，与 `av1_nvenc` 二选一；继续默认 AV1，HEVC 复用现有 NVENC 高质量 backend。
 - v8.6 [Dev] 🔧：在 FFmpeg 解码后、BasicVSR++ 前加入可选轻度 deband；新增 `DEBAND_STRENGTH` / `--deband-strength`，Notebook 默认 `0.006`，CLI 默认 `0` 保持旧行为。
 - v8.5 [Release] ✅：Notebook 使用 AV1 NVENC-only 高质量配置；P7/HQ、VBR CQ18、fullres multipass、AQ、B-ref 与 GOP，并新增 `AV1_BIT_DEPTH=8/10` 最低输出位深控制；10-bit 片源禁止降为 8-bit。
 - v8.2 - 09274ad [Dev] 🔧：FFmpeg 增强音轨作为默认 Audio 1，同时保留原始音轨作为 Audio 2。
@@ -68,7 +69,7 @@ v8.6 Notebook 继续只暴露 `av1_nvenc` 高质量参数；底层旧编码后�
 
 ## 当前结构
 
-- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），v8.6 Notebook 新增 `DEBAND_STRENGTH`，当前默认 `DUAL_GPU=True`、`AUDIO_ENHANCE=True`。
+- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），v8.7 Notebook 可选 `av1_nvenc` / `hevc_nvenc`，当前默认 `DUAL_GPU=True`、`AUDIO_ENHANCE=True`。
 - `inference.py`：视频增强 CLI 与总入口。
 - `inference/scheduler.py`：CPU 总编排与最终音频边界。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：调度状态、任务策略、结果处理与 watchdog。
@@ -103,15 +104,14 @@ v8.6 Notebook 继续只暴露 `av1_nvenc` 高质量参数；底层旧编码后�
 
 ## 编码
 
-v8.6 Notebook 默认：
+v8.7 Notebook 默认：
 
-- GPU AV1：`av1_nvenc`
+- `VIDEO_CODEC="av1_nvenc"`；可改为 `hevc_nvenc`
+- 两种 NVENC 共用：P7 / CQ18 / `ENCODE_GPU=0`
+- AV1：HQ / VBR / fullres multipass / Spatial + Temporal AQ / B-ref / GOP
 - `AV1_BIT_DEPTH=8`：8-bit 片源输出 `yuv420p`；10-bit 片源仍输出 `p010le`
 - `AV1_BIT_DEPTH=10`：8-bit / 10-bit 片源都输出 `p010le`
-- 质量：P7 / HQ / VBR CQ18 / fullres multipass
-- AQ：Spatial + Temporal，strength=8
-- B-frame：3，`b_ref_mode=middle`
-- Lookahead：28（SDK 13.1 在 3 个 B 帧时允许的最大值）
-- GOP：240（60 fps 时 4 秒）
+- HEVC：沿用现有 HQ / VBR / fullres multipass / Spatial + Temporal AQ / lookahead 32 / B-frame 3
+- HEVC 位深：8-bit 推理帧输出 `yuv420p`；10-bit 推理帧输出 `p010le`
 
-底层仍保留旧 HEVC/H.264/CPU AV1 编码后端，用于 CLI 兼容，不在 v8.6 Notebook 暴露。
+底层仍保留 H.264/软件 HEVC/CPU AV1 编码后端，用于 CLI 兼容，不在 v8.7 Notebook 暴露。
