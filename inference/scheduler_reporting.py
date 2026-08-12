@@ -2,7 +2,20 @@
 
 from __future__ import annotations
 
+from . import runtime_api as base
 from .task_protocol import TaskKind
+
+
+_MIN_OUTPUT_BIT_DEPTH = 0
+
+
+def configure_output_bit_depth(minimum_bit_depth: int) -> None:
+    """Configure the minimum encoded output bit depth used by run headers."""
+    global _MIN_OUTPUT_BIT_DEPTH
+    value = int(minimum_bit_depth)
+    if value not in (0, 8, 10):
+        raise ValueError("minimum output bit depth must be 0, 8, or 10")
+    _MIN_OUTPUT_BIT_DEPTH = value
 
 
 def print_run_header(
@@ -38,9 +51,17 @@ def print_run_header(
         f"{info.fps:.3f} fps | {info.bit_depth}-bit ({info.pix_fmt})",
         flush=True,
     )
+
+    output_bit_depth = max(int(info.bit_depth), _MIN_OUTPUT_BIT_DEPTH)
+    actual_output_pix_fmt = output_pix_fmt
+    if output_bit_depth != int(info.bit_depth):
+        actual_output_pix_fmt = base.output_pixel_format(
+            video_codec,
+            output_bit_depth,
+        )
     print(
         f"Output  : {out_w}x{out_h} | {output_fps:.3f} fps | "
-        f"{info.bit_depth}-bit ({output_pix_fmt}) | {video_codec}",
+        f"{output_bit_depth}-bit ({actual_output_pix_fmt}) | {video_codec}",
         flush=True,
     )
     print(
