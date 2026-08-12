@@ -2,11 +2,12 @@
 
 ## 当前版本流水线
 
-当前 v8.5 流水线：
+当前 v8.6 [Dev] 流水线：
 
 ```text
 视频增强（可关闭）：
 FFmpeg 解码
+→ FFmpeg 轻度 deband（Notebook 默认 0.006，可设 0 关闭）
 → BasicVSR++ NTIRE Track 1 同分辨率时序恢复
 → Practical-RIFE 4.25 任意 timestep 插帧（可关闭）
 → Real-ESRGAN full-frame 超分
@@ -27,9 +28,11 @@ FFmpeg 解码
    → Audio 2: Original，原音轨
 ```
 
+`DEBAND_STRENGTH=0` 时不执行 deband；Notebook 默认 `0.006`，只在 FFmpeg 解码后、BasicVSR++ 前处理。CLI 默认仍为 `0`，保持旧调用兼容。
+
 `AUDIO_ENHANCE=False` 时不执行 DSP，继续只保留原音轨并优先 stream copy。
 
-v8.5 Notebook 只暴露 `av1_nvenc` 高质量参数；底层旧编码后端仍保留用于兼容。`AV1_BIT_DEPTH` 表示 AV1 最低输出位深：设为 `8` 时 8-bit 片源保持 `yuv420p`，设为 `10` 时 8-bit 片源编码为 `p010le`；10-bit 片源无论该参数为 `8` 还是 `10` 都始终输出 10-bit `p010le`。AV1 两种位深都使用 Main profile。
+v8.6 Notebook 继续只暴露 `av1_nvenc` 高质量参数；底层旧编码后端仍保留用于兼容。`AV1_BIT_DEPTH` 表示 AV1 最低输出位深：设为 `8` 时 8-bit 片源保持 `yuv420p`，设为 `10` 时 8-bit 片源编码为 `p010le`；10-bit 片源无论该参数为 `8` 还是 `10` 都始终输出 10-bit `p010le`。AV1 两种位深都使用 Main profile。
 
 ## 项目原则（必须遵守）
 
@@ -43,6 +46,7 @@ v8.5 Notebook 只暴露 `av1_nvenc` 高质量参数；底层旧编码后端仍�
 
 ## 版本历史
 
+- v8.6 [Dev] 🔧：在 FFmpeg 解码后、BasicVSR++ 前加入可选轻度 deband；新增 `DEBAND_STRENGTH` / `--deband-strength`，Notebook 默认 `0.006`，CLI 默认 `0` 保持旧行为。
 - v8.5 [Release] ✅：Notebook 使用 AV1 NVENC-only 高质量配置；P7/HQ、VBR CQ18、fullres multipass、AQ、B-ref 与 GOP，并新增 `AV1_BIT_DEPTH=8/10` 最低输出位深控制；10-bit 片源禁止降为 8-bit。
 - v8.2 - 09274ad [Dev] 🔧：FFmpeg 增强音轨作为默认 Audio 1，同时保留原始音轨作为 Audio 2。
 - v8.1 - b212afa [Dev] 🔧：音频回退到 v8.0 FFmpeg DSP；保留视频链和后续非音频改动。
@@ -64,7 +68,7 @@ v8.5 Notebook 只暴露 `av1_nvenc` 高质量参数；底层旧编码后端仍�
 
 ## 当前结构
 
-- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），v8.5 Notebook 只暴露 AV1 NVENC 高质量参数，当前默认 `DUAL_GPU=True`、`AUDIO_ENHANCE=True`。
+- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），v8.6 Notebook 新增 `DEBAND_STRENGTH`，当前默认 `DUAL_GPU=True`、`AUDIO_ENHANCE=True`。
 - `inference.py`：视频增强 CLI 与总入口。
 - `inference/scheduler.py`：CPU 总编排与最终音频边界。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：调度状态、任务策略、结果处理与 watchdog。
@@ -99,7 +103,7 @@ v8.5 Notebook 只暴露 `av1_nvenc` 高质量参数；底层旧编码后端仍�
 
 ## 编码
 
-v8.5 Notebook 默认：
+v8.6 Notebook 默认：
 
 - GPU AV1：`av1_nvenc`
 - `AV1_BIT_DEPTH=8`：8-bit 片源输出 `yuv420p`；10-bit 片源仍输出 `p010le`
@@ -110,4 +114,4 @@ v8.5 Notebook 默认：
 - Lookahead：28（SDK 13.1 在 3 个 B 帧时允许的最大值）
 - GOP：240（60 fps 时 4 秒）
 
-底层仍保留旧 HEVC/H.264/CPU AV1 编码后端，用于 CLI 兼容，不在 v8.5 Notebook 暴露。
+底层仍保留旧 HEVC/H.264/CPU AV1 编码后端，用于 CLI 兼容，不在 v8.6 Notebook 暴露。
