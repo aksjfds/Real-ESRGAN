@@ -289,12 +289,13 @@ class RawVideoWriter:
 
 
 def probe_encoder_runtime(args) -> None:
+    probe_size = "640x360" if args.video_codec == "av1_nvenc" else "128x128"
     command = [
         args.ffmpeg_bin,
         "-hide_banner",
         "-loglevel", "error",
         "-f", "lavfi",
-        "-i", "color=black:size=128x128:rate=1,format=rgb24",
+        "-i", f"color=black:size={probe_size}:rate=1,format=rgb24",
         "-frames:v", "1",
         "-c:v", args.video_codec,
         *_codec_args(
@@ -321,8 +322,8 @@ def probe_encoder_runtime(args) -> None:
     detail = result.stdout.strip()
     if args.video_codec == "av1_nvenc":
         raise RuntimeError(
-            "av1_nvenc is present in FFmpeg but could not initialize. The selected "
-            "NVIDIA GPU/driver may not support AV1 NVENC.\n"
+            "av1_nvenc is present in FFmpeg but the runtime probe failed. "
+            "Check the FFmpeg options below and the selected NVIDIA GPU/driver.\n"
             f"FFmpeg output:\n{detail}"
         )
     raise RuntimeError(
