@@ -95,8 +95,8 @@ def _codec_args(
             "-cq", str(cq),
             "-b:v", "0",
             "-multipass", "fullres",
-            "-spatial_aq", "1",
-            "-temporal_aq", "1",
+            "-spatial-aq", "1",
+            "-temporal-aq", "1",
             "-rc-lookahead", "32",
         ]
     raise ValueError(f"Unsupported AV1 encoder: {codec}")
