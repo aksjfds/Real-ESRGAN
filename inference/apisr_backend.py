@@ -36,6 +36,7 @@ APISR_WEIGHT_URL = (
     "https://github.com/Kiteretsu77/APISR/releases/download/"
     "v0.1.0/4x_APISR_GRL_GAN_generator.pth"
 )
+APISR_WEIGHT_FILENAME = "4x_APISR_GRL_GAN_generator.pth"
 APISR_WEIGHT_SIZE = 6_479_400
 APISR_WEIGHT_SHA256 = "56fff250139563dea59c4ca81af19cc098d94dc3abaad23640f14cec488e5da1"
 APISR_DOWNLOAD_TIMEOUT = 60.0
@@ -273,47 +274,24 @@ def _validate_official_weight(path: Path) -> bool:
     return _sha256(path) == APISR_WEIGHT_SHA256
 
 
-def _ensure_official_weight() -> Path:
-    target = _cache_root() / "weights" / APISR_WEIGHT_URL.rsplit("/", 1)[-1]
-    with _cache_lock("weight"):
-        if _validate_official_weight(target):
-            return target
-        if target.exists():
-            target.unlink()
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        handle = tempfile.NamedTemporaryFile(
-            prefix=target.name + ".",
-            suffix=".part",
-            dir=target.parent,
-            delete=False,
+def _bundled_official_weight() -> Path:
+    """Return the repository-bundled official APISR v0.1.0 GRL weight."""
+    target = Path(__file__).resolve().parent / "weights" / APISR_WEIGHT_FILENAME
+    if not target.is_file():
+        raise FileNotFoundError(f"Bundled APISR weight is missing: {target}")
+    actual_size = target.stat().st_size
+    if actual_size != APISR_WEIGHT_SIZE:
+        raise RuntimeError(
+            "Bundled APISR weight size mismatch: "
+            f"expected {APISR_WEIGHT_SIZE}, got {actual_size}: {target}"
         )
-        temporary = Path(handle.name)
-        handle.close()
-        try:
-            print(f"[APISR] downloading {APISR_WEIGHT_URL}", flush=True)
-            _download_to(
-                APISR_WEIGHT_URL,
-                temporary,
-                max_bytes=APISR_WEIGHT_SIZE,
-            )
-            if temporary.stat().st_size != APISR_WEIGHT_SIZE:
-                raise RuntimeError(
-                    "Downloaded APISR weight size mismatch: "
-                    f"expected {APISR_WEIGHT_SIZE}, got {temporary.stat().st_size}"
-                )
-            digest = _sha256(temporary)
-            if digest != APISR_WEIGHT_SHA256:
-                raise RuntimeError(
-                    "Downloaded APISR weight SHA256 mismatch: "
-                    f"expected {APISR_WEIGHT_SHA256}, got {digest}"
-                )
-            temporary.replace(target)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-        return target
-
+    digest = _sha256(target)
+    if digest != APISR_WEIGHT_SHA256:
+        raise RuntimeError(
+            "Bundled APISR weight SHA256 mismatch: "
+            f"expected {APISR_WEIGHT_SHA256}, got {digest}: {target}"
+        )
+    return target
 
 def resolve_model_paths(args) -> tuple[str, ...]:
     if args.model != APISR_MODEL_NAME:
@@ -330,7 +308,7 @@ def resolve_model_paths(args) -> tuple[str, ...]:
             raise FileNotFoundError(f"Model weight not found: {primary}")
         return (str(primary),)
 
-    return (str(_ensure_official_weight()),)
+    return (str(_bundled_official_weight()),)
 
 
 def _loaded_module_path(module) -> Path | None:
@@ -551,6 +529,7 @@ __all__ = [
     "APISR_MODEL_NAME",
     "APISR_NATIVE_SCALE",
     "APISR_SOURCE_COMMIT",
+    "APISR_WEIGHT_FILENAME",
     "APISR_WEIGHT_SHA256",
     "APISR_WEIGHT_URL",
     "APISRGRL",

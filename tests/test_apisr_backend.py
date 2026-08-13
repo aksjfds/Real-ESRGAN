@@ -86,11 +86,18 @@ class APISRBackendTests(unittest.TestCase):
             backend.APISR_SOURCE_COMMIT,
             "fabe8332413bc7f4024e6db39141c68692e88ea5",
         )
+        self.assertEqual(backend.APISR_WEIGHT_FILENAME, "4x_APISR_GRL_GAN_generator.pth")
         self.assertEqual(len(backend.APISR_WEIGHT_SHA256), 64)
         self.assertIn("architecture/grl.py", backend.APISR_SOURCE_BLOBS)
         self.assertGreaterEqual(len(backend.APISR_SOURCE_BLOBS), 10)
         self.assertGreater(backend.APISR_SOURCE_ARCHIVE_MAX_BYTES, 0)
         self.assertFalse(backend.SR_MATMUL_TF32)
+
+    def test_bundled_official_weight_is_present_and_valid(self) -> None:
+        path = backend._bundled_official_weight()
+        self.assertEqual(path.name, backend.APISR_WEIGHT_FILENAME)
+        self.assertEqual(path.stat().st_size, backend.APISR_WEIGHT_SIZE)
+        self.assertEqual(backend._sha256(path), backend.APISR_WEIGHT_SHA256)
 
     def test_pinned_source_validation_rejects_changed_file(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

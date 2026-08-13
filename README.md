@@ -2,7 +2,7 @@
 
 ## 当前版本流水线
 
-当前 **APISR v8.12 [Dev] 🔧** 以 `master` v8.9 为完整基线，仅替换 SR 模型后端，并保留 master 的 BVS / RIFE / 调度 / shared-memory / CUDA 传输 / NPP / 编码 / 音频架构。
+当前 **APISR v8.13 [Dev] 🔧** 以 `master` v8.9 为完整基线，仅替换 SR 模型后端，并保留 master 的 BVS / RIFE / 调度 / shared-memory / CUDA 传输 / NPP / 编码 / 音频架构。
 
 ```text
 视频增强（可关闭）：
@@ -35,7 +35,7 @@ v8.9 的 `ClipSource` 使用单槽有界异步预取：后台线程提前执行�
 
 APISR 分支使用官方 **v0.1.0 4× GRL GAN** 权重，并固定到该 Release 对应源码 commit `fabe8332413bc7f4024e6db39141c68692e88ea5`。GRL 按官方限制继续使用 FP32；SR worker 的 FP32 matmul 使用 IEEE 精度，不强制启用 TF32，cuDNN convolution 仍允许 TF32 以保留卷积性能。
 
-APISR 首次运行会把源码和权重缓存到 `~/.cache/realesrgan/apisr/`。源码只提取 GRL 推理实际需要的文件，并按 Git blob manifest 校验；官方权重按大小和 SHA256 校验；下载使用有限超时/重试与硬性字节上限；POSIX 下使用独立 cache file lock，避免多进程首次启动时竞争写入。可用 `APISR_CACHE_DIR` 改缓存根目录；`APISR_SOURCE_DIR` 可显式指定本地 APISR 源码覆盖。
+APISR 官方 **v0.1.0 4× GRL GAN** 权重直接存放在仓库 `inference/weights/4x_APISR_GRL_GAN_generator.pth`；默认推理读取仓库内置文件并在 worker 启动前校验固定大小与 SHA256，不再运行时下载模型权重；`--model-path` 仍可显式覆盖。APISR 源码继续按固定 commit 首次缓存到 `~/.cache/realesrgan/apisr/source/`，只提取 GRL 推理需要的文件并按 Git blob manifest 校验。
 
 APISR v0.1.0 上游 GRL 使用通用顶层包名 `architecture.*`，且其源码会修改 `sys.path`。本分支在导入前保存并在导入后完整恢复 `sys.path` 与 `architecture.*` 的 `sys.modules` 状态，避免第三方源码 import side effect 泄漏到主运行时。
 
@@ -70,6 +70,7 @@ APISR 的基准是当前 `master`。静态审计只把以下两类内容视为 A
 
 ## 版本历史
 
+- **APISR v8.13 [Dev] 🔧**：将官方 v0.1.0 `4x_APISR_GRL_GAN_generator.pth`（6,479,400 bytes，SHA256 `56fff250139563dea59c4ca81af19cc098d94dc3abaad23640f14cec488e5da1`）直接纳入 `inference/weights/`；默认模型路径读取仓库内置权重并在启动前强校验，不再运行时下载 APISR 模型权重；保留 `--model-path` 覆盖与 APISR 源码固定版本缓存。
 - **APISR v8.12 [Dev] 🔧**：完成文件/目录结构清理：Kaggle Notebook 由 `realesrgan.ipynb` 统一命名为 `apisr.ipynb`；BasicVSR++ 分片 checkpoint 模块改为职责明确的 `basicvsrpp_checkpoint.py`；根入口直接使用 `scheduler.py`；删除已退出 active path 的旧 `pipeline` / `balanced_pipeline` / `progress_log`、v5.1/v5.4 runtime 兼容层、`v52_scheduler.py`、`stable_gpu_transport.py` 以及 master 专用 banding debug Notebook。不重排当前 active runtime 子目录，不改变推理数学路径或性能关键路径。
 - **APISR v8.11 [Dev] 🔧**：完成静态审计闭环：第三方 GRL import 同时恢复 `sys.path` 与 `architecture.*` 的 `sys.modules` 状态；APISR source/weight 下载加入硬性字节上限并补回归测试；README 固化 APISR↔master 审计边界，避免把 master 原样继承内容反复误报为 APISR 缺陷；补充上游 GPL-3.0 / academic-use disclaimer 提示。
 - **APISR v8.10 [Dev] 🔧**：在 v8.9 APISR backend 基础上完成运行边界收口：完整 SR startup probe 取代 model-only warmup；10-bit CUDA `uint16` 改为 capability-gated fast path 并提供稳定 fallback；`frame_transport` 泛化为 uint8/uint16 共用路径，删除 APISR handler 重复 transport；APISR FP32 matmul 恢复 IEEE 语义；完整恢复第三方源码 import 前后的 `sys.path`；下载增加超时/重试并只安全提取 pinned GRL runtime 文件；Notebook 默认执行 CPU 回归测试。
@@ -101,7 +102,7 @@ APISR 的基准是当前 `master`。静态审计只把以下两类内容视为 A
 
 - `apisr.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），默认 `MODEL="APISR_GRL"`，环境单元执行 APISR CPU 回归测试。
 - `inference.py`：视频增强 CLI 与总入口。
-- `inference/apisr_backend.py`：APISR v0.1.0 GRL 注册、最小源码/权重缓存、完整性校验、FP32 模型加载与 resolution cache。
+- `inference/apisr_backend.py`：APISR v0.1.0 GRL 注册、最小源码缓存、仓库内置权重完整性校验、FP32 模型加载与 resolution cache。
 - `inference/scheduler.py`：CPU 总编排、编码 fail-fast probe、最终音频边界与成品验证。
 - `inference/clip_source.py`：CPU scene-aware BVS clip 组装与单槽预取。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：调度状态、任务策略、结果处理与 watchdog。
@@ -122,19 +123,19 @@ APISR 的基准是当前 `master`。静态审计只把以下两类内容视为 A
 
 ### 仓库内置
 
+- APISR v0.1.0 `4x_APISR_GRL_GAN_generator.pth`；默认 SR 权重，启动前校验固定大小与 SHA256。
 - BasicVSR++ NTIRE Track 1 权重分片；运行时合并并验证。
 - Practical-RIFE 4.25 模型压缩包/运行时资源按 master 逻辑处理。
 
-### APISR 运行时资源
+### APISR 源码运行时资源
 
 | 文件 | 用途 | 来源 |
 |---|---|---|
-| `4x_APISR_GRL_GAN_generator.pth` | APISR 4× GRL GAN SR 权重 | APISR 官方 Release v0.1.0 |
 | APISR source commit `fabe8332413bc7f4024e6db39141c68692e88ea5` | 与 v0.1.0 权重对应的 GRL 架构源码 | `Kiteretsu77/APISR` |
 
-默认缓存根目录：`~/.cache/realesrgan/apisr/`。
+APISR 源码默认缓存根目录：`~/.cache/realesrgan/apisr/`；模型权重不进入运行时 cache。
 
-**上游使用与许可提示：**APISR 上游将项目以 GPL-3.0 发布，并在 README 中声明项目仅供学术用途（academic use only）且其 disclaimer 适用。本分支运行时下载的 APISR 源码/权重仍受上游许可、disclaimer 与权重相关条款约束；详见 `THIRD_PARTY_NOTICES.md`。
+**上游使用与许可提示：**APISR 上游将项目以 GPL-3.0 发布，并在 README 中声明项目仅供学术用途（academic use only）且其 disclaimer 适用。本分支运行时下载的 APISR 源码以及仓库内置的 APISR 官方权重仍受上游许可、disclaimer 与权重相关条款约束；详见 `THIRD_PARTY_NOTICES.md`。
 
 ## 编码
 
