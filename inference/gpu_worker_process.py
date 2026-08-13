@@ -205,15 +205,10 @@ def gpu_temporal_worker_main(
             )
 
             if rife_weights:
-                rife = OptimizedRIFE425Interpolator(
-                    gpu_id,
-                    Path(rife_weights),
-                )
+                rife = OptimizedRIFE425Interpolator(gpu_id, Path(rife_weights))
 
             input_shm = shared_memory.SharedMemory(name=input_name)
-            frame_output_shm = shared_memory.SharedMemory(
-                name=frame_output_name
-            )
+            frame_output_shm = shared_memory.SharedMemory(name=frame_output_name)
 
             input_view = np.ndarray(
                 (input_slots, *input_shape),
@@ -318,11 +313,13 @@ def gpu_sr_worker_main(
 
             config = base.WorkerConfig(**config_dict)
             sr_model, _native_scale = base.load_worker_model(config, device)
+            # Do not announce WorkerReady until the exact full-frame batch=1
+            # model path has proved it fits on this GPU. This also primes GRL's
+            # dynamic-resolution table/mask cache for the steady-state video size.
+            base.warmup_worker_model(sr_model, device, input_shape)
 
             input_shm = shared_memory.SharedMemory(name=input_name)
-            frame_output_shm = shared_memory.SharedMemory(
-                name=frame_output_name
-            )
+            frame_output_shm = shared_memory.SharedMemory(name=frame_output_name)
             sr_output_shm = shared_memory.SharedMemory(name=sr_output_name)
 
             input_view = np.ndarray(

@@ -44,7 +44,7 @@ def exclusive_output_run(output_path: str | Path) -> Iterator[None]:
             handle.seek(0)
             owner = handle.read().strip() or "unknown"
             raise RuntimeError(
-                "Another Real-ESRGAN inference process is already writing "
+                "Another video inference process is already writing "
                 f"{resolved} (lock owner pid={owner})."
             ) from error
 

@@ -8,16 +8,15 @@ from typing import Callable, cast
 import numpy as np
 import torch
 
-from . import runtime_api as base
 from .frame_transport import (
+    PendingD2H,
     PinnedD2HStager,
     PinnedH2DStager,
-    begin_cuda_frame_to_array,
     begin_cuda_frames_to_slots,
     copy_host_frames_to_slots,
 )
 from .npp_resize import NppLanczosResizer
-from .sr_runtime import infer_cuda_u8_batch, infer_cuda_u8_tensor
+from .sr_runtime import infer_cuda_batch, infer_cuda_tensor
 from .task_protocol import (
     BVSResult,
     BVSTask,
@@ -145,11 +144,7 @@ def _copy_bvs_cpu_groups(
             raise RuntimeError("BVS task output-slot accounting mismatch")
 
         for slot, frame in zip(slots, emitted):
-            np.copyto(
-                context.frame_output_view[slot],
-                frame,
-                casting="no",
-            )
+            np.copyto(context.frame_output_view[slot], frame, casting="no")
         output_cursor = end
 
     if output_cursor != len(task.output_slots):
@@ -163,20 +158,14 @@ def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
     cursor = 0
     for group in task.groups:
         clips.append(
-            [
-                context.input_view[cursor + index]
-                for index in range(group.count)
-            ]
+            [context.input_view[cursor + index] for index in range(group.count)]
         )
         cursor += group.count
 
     before_tiles = int(bvs.tiles)
     device_groups = bvs.enhance_clips_device(clips)
     if device_groups is not None:
-        packed, emitted_counts, slots = _pack_bvs_device_groups(
-            task,
-            device_groups,
-        )
+        packed, emitted_counts, slots = _pack_bvs_device_groups(task, device_groups)
         pending = None
         if packed is not None:
             pending = begin_cuda_frames_to_slots(
@@ -194,11 +183,7 @@ def run_bvs(context: WorkerContext, task: BVSTask) -> BVSResult:
         else:
             enhanced_groups = [bvs.enhance_clip(clips[0])]
         _notify_compute_done(context)
-        emitted_counts = _copy_bvs_cpu_groups(
-            context,
-            task,
-            enhanced_groups,
-        )
+        emitted_counts = _copy_bvs_cpu_groups(context, task, enhanced_groups)
 
     return BVSResult(
         emitted_counts=emitted_counts,
@@ -214,11 +199,7 @@ def run_rife(context: WorkerContext, task: RIFETask) -> RIFEResult:
 
     frame0 = resolve_frame(context, task.frame0)
     frame1 = resolve_frame(context, task.frame1)
-    batch = context.rife.interpolate_device(
-        frame0,
-        frame1,
-        task.timesteps,
-    )
+    batch = context.rife.interpolate_device(frame0, frame1, task.timesteps)
 
     expected = len(task.output_slots)
     if batch is None:
@@ -264,10 +245,7 @@ def _get_npp_resizer(context: WorkerContext) -> NppLanczosResizer | None:
     context.npp_checked = True
     try:
         context.npp_resizer = NppLanczosResizer(context.device)
-        print(
-            f"[npp] {context.device} Lanczos runtime ready",
-            flush=True,
-        )
+        print(f"[npp] {context.device} Lanczos runtime ready", flush=True)
     except Exception as error:
         context.npp_resizer = None
         print(
@@ -299,6 +277,63 @@ def _cpu_resize_sr_batch(
         np.copyto(output_view[int(slot)], resized, casting="no")
 
 
+def _begin_sr_cuda_frames_to_slots(
+    frames: torch.Tensor,
+    output_view: np.ndarray,
+    slots: tuple[int, ...],
+    stager: PinnedD2HStager,
+) -> PendingD2H | None:
+    """Use master uint8 transport; extend the same direct path to uint16 SR."""
+    if frames.dtype == torch.uint8:
+        return begin_cuda_frames_to_slots(frames, output_view, slots, stager)
+    if frames.dtype != torch.uint16:
+        raise TypeError(f"SR transport supports uint8/uint16, got {frames.dtype}")
+    if frames.device.type != "cuda" or frames.ndim != 4 or not frames.is_contiguous():
+        raise RuntimeError("uint16 SR transport requires contiguous CUDA [N,H,W,C]")
+    if np.dtype(output_view.dtype) != np.dtype(np.uint16):
+        raise TypeError(
+            f"uint16 SR output requires uint16 shared pool, got {output_view.dtype}"
+        )
+
+    slot_ids = tuple(int(slot) for slot in slots)
+    count = int(frames.shape[0])
+    if count != len(slot_ids):
+        raise RuntimeError(
+            f"SR transport frame/slot mismatch: frames={count}, slots={len(slot_ids)}"
+        )
+    expected_shape = tuple(int(value) for value in output_view.shape[1:])
+    actual_shape = tuple(int(value) for value in frames.shape[1:])
+    if actual_shape != expected_shape:
+        raise RuntimeError(
+            f"SR transport frame shape mismatch: {actual_shape} != {expected_shape}"
+        )
+    if len(set(slot_ids)) != len(slot_ids):
+        raise RuntimeError("SR transport received duplicate output slots")
+    for slot in slot_ids:
+        if slot < 0 or slot >= int(output_view.shape[0]):
+            raise RuntimeError(
+                f"SR transport output slot out of range: {slot}/{output_view.shape[0]}"
+            )
+    if count == 0:
+        return None
+
+    first = slot_ids[0]
+    contiguous = slot_ids == tuple(range(first, first + count))
+    if contiguous:
+        return stager.begin_copy(
+            frames,
+            target=output_view[first : first + count],
+        )
+    return stager.begin_copy(
+        frames,
+        finalize=lambda array: copy_host_frames_to_slots(
+            array,
+            output_view,
+            slot_ids,
+        ),
+    )
+
+
 def _store_sr_cuda_batch(
     context: WorkerContext,
     result_cuda: torch.Tensor,
@@ -328,7 +363,8 @@ def _store_sr_cuda_batch(
                     context.npp_active_logged = True
                     print(
                         f"[npp] {context.device} Lanczos active: "
-                        f"{source_w}x{source_h} -> {target_w}x{target_h}",
+                        f"{source_w}x{source_h} -> {target_w}x{target_h} | "
+                        f"dtype={result_cuda.dtype}",
                         flush=True,
                     )
             except Exception as error:
@@ -356,7 +392,7 @@ def _store_sr_cuda_batch(
             )
             return
 
-    pending = begin_cuda_frames_to_slots(
+    pending = _begin_sr_cuda_frames_to_slots(
         resized_cuda,
         context.sr_output_view,
         output_slots,
@@ -373,8 +409,10 @@ def _run_sr_sequential_fallback(
     frames: tuple[np.ndarray, ...],
     output_slots: tuple[int, ...],
 ) -> None:
+    if context.sr_model is None:
+        raise RuntimeError("SR worker model is unavailable")
     for frame, slot in zip(frames, output_slots):
-        result_cuda = infer_cuda_u8_tensor(
+        result_cuda = infer_cuda_tensor(
             context.sr_model,
             frame,
             context.device,
@@ -392,7 +430,7 @@ def _run_sr_sequential_fallback(
 
 def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
     if context.sr_model is None:
-        raise RuntimeError("SR task submitted to a worker without Real-ESRGAN")
+        raise RuntimeError("SR task submitted to a worker without an SR model")
     if context.sr_output_view is None:
         raise RuntimeError("SR worker output shared memory is unavailable")
 
@@ -407,55 +445,30 @@ def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
         raise RuntimeError("SR task contains duplicate output slots")
     for slot in output_slots:
         if slot < 0 or slot >= slot_count:
-            raise RuntimeError(
-                f"SR output slot out of range: {slot}/{slot_count}"
-            )
+            raise RuntimeError(f"SR output slot out of range: {slot}/{slot_count}")
 
     frames = tuple(resolve_frame(context, value) for value in task.frames)
+    if np.dtype(context.dtype) not in {np.dtype(np.uint8), np.dtype(np.uint16)}:
+        raise TypeError(f"SR worker supports uint8/uint16 frames, got {context.dtype}")
 
-    if context.dtype == np.dtype(np.uint8):
-        if len(frames) > 1 and context.sr_micro_batch_enabled:
-            try:
-                result_cuda = infer_cuda_u8_batch(
-                    context.sr_model,
-                    frames,
-                    context.device,
-                    h2d_stager=_require_h2d_stager(context),
-                )
-            except torch.cuda.OutOfMemoryError:
-                context.sr_micro_batch_enabled = False
-                torch.cuda.empty_cache()
-                print(
-                    f"[sr] {context.device} micro-batch=2 OOM; "
-                    "locking this worker to batch=1 fallback",
-                    flush=True,
-                )
-                _run_sr_sequential_fallback(
-                    context,
-                    frames,
-                    output_slots,
-                )
-            else:
-                _store_sr_cuda_batch(
-                    context,
-                    result_cuda,
-                    output_slots,
-                    publish_boundary=True,
-                )
-                del result_cuda
-        elif len(frames) > 1:
-            _run_sr_sequential_fallback(
-                context,
-                frames,
-                output_slots,
-            )
-        else:
-            result_cuda = infer_cuda_u8_batch(
+    if len(frames) > 1 and context.sr_micro_batch_enabled:
+        try:
+            result_cuda = infer_cuda_batch(
                 context.sr_model,
                 frames,
                 context.device,
                 h2d_stager=_require_h2d_stager(context),
             )
+        except torch.cuda.OutOfMemoryError:
+            context.sr_micro_batch_enabled = False
+            torch.cuda.empty_cache()
+            print(
+                f"[sr] {context.device} micro-batch={len(frames)} OOM; "
+                "locking this worker to batch=1 fallback",
+                flush=True,
+            )
+            _run_sr_sequential_fallback(context, frames, output_slots)
+        else:
             _store_sr_cuda_batch(
                 context,
                 result_cuda,
@@ -463,30 +476,22 @@ def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
                 publish_boundary=True,
             )
             del result_cuda
+    elif len(frames) > 1:
+        _run_sr_sequential_fallback(context, frames, output_slots)
     else:
-        import cv2
-
-        target_h = int(context.sr_output_view.shape[1])
-        target_w = int(context.sr_output_view.shape[2])
-        for frame, slot in zip(frames, output_slots):
-            result = base.infer_frame(
-                context.sr_model,
-                frame,
-                context.device,
-            )
-            if result.shape[0] != target_h or result.shape[1] != target_w:
-                result = cv2.resize(
-                    result,
-                    (target_w, target_h),
-                    interpolation=cv2.INTER_LANCZOS4,
-                )
-            np.copyto(
-                context.sr_output_view[slot],
-                result,
-                casting="no",
-            )
-            del result
-        _notify_compute_done(context)
+        result_cuda = infer_cuda_batch(
+            context.sr_model,
+            frames,
+            context.device,
+            h2d_stager=_require_h2d_stager(context),
+        )
+        _store_sr_cuda_batch(
+            context,
+            result_cuda,
+            output_slots,
+            publish_boundary=True,
+        )
+        del result_cuda
 
     return SRResult(
         frame_ids=tuple(int(value) for value in task.frame_ids),
@@ -505,6 +510,4 @@ def build_temporal_handlers() -> dict[TaskKind, Handler]:
 
 
 def build_sr_handlers() -> dict[TaskKind, Handler]:
-    return {
-        TaskKind.SR: cast(Handler, run_sr),
-    }
+    return {TaskKind.SR: cast(Handler, run_sr)}

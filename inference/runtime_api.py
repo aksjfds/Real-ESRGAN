@@ -108,6 +108,7 @@ resolve_range = _legacy.resolve_range
 parse_gpu_ids = _legacy.parse_gpu_ids
 resolve_model_paths = sr_backend.resolve_model_paths
 load_worker_model = sr_backend.load_worker_model
+warmup_worker_model = sr_backend.warmup_worker_model
 infer_frame = sr_backend.infer_frame
 mux_audio = _legacy.mux_audio
 

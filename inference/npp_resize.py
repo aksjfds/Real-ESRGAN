@@ -1,9 +1,8 @@
-"""NPP Lanczos resize for contiguous uint8 HWC CUDA tensors.
+"""NPP Lanczos resize for contiguous uint8/uint16 HWC CUDA tensors.
 
 The wrapper binds NVIDIA NPP's application-managed stream-context resize API to
-the PyTorch current CUDA stream.  It is intentionally narrow: the active video
-pipeline only needs packed 8-bit C3 images, so unsupported environments can
-fall back without leaking NPP details into the scheduler or model runtime.
+the PyTorch current CUDA stream. Unsupported libraries/dtypes fall back through
+the caller without leaking NPP details into the scheduler or model runtime.
 """
 
 from __future__ import annotations
@@ -108,8 +107,26 @@ def _check_npp(status: int, operation: str) -> None:
         raise RuntimeError(f"{operation} failed with NppStatus={int(status)}")
 
 
+def _bind_resize(library: ctypes.CDLL, symbol: str):
+    resize = getattr(library, symbol)
+    resize.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        NppiSize,
+        NppiRect,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        NppiSize,
+        NppiRect,
+        ctypes.c_int,
+        NppStreamContext,
+    ]
+    resize.restype = ctypes.c_int
+    return resize
+
+
 class NppLanczosResizer:
-    """Resize uint8 HWC CUDA batches with NPP Lanczos on the current stream."""
+    """Resize packed C3 uint8/uint16 CUDA batches on the current stream."""
 
     def __init__(self, device: torch.device) -> None:
         if device.type != "cuda":
@@ -122,26 +139,14 @@ class NppLanczosResizer:
         self.nppc.nppGetStream.restype = ctypes.c_void_p
         self.nppc.nppSetStream.argtypes = [ctypes.c_void_p]
         self.nppc.nppSetStream.restype = ctypes.c_int
-        self.nppc.nppGetStreamContext.argtypes = [
-            ctypes.POINTER(NppStreamContext)
-        ]
+        self.nppc.nppGetStreamContext.argtypes = [ctypes.POINTER(NppStreamContext)]
         self.nppc.nppGetStreamContext.restype = ctypes.c_int
 
-        resize = self.nppig.nppiResize_8u_C3R_Ctx
-        resize.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            NppiSize,
-            NppiRect,
-            ctypes.c_void_p,
-            ctypes.c_int,
-            NppiSize,
-            NppiRect,
-            ctypes.c_int,
-            NppStreamContext,
-        ]
-        resize.restype = ctypes.c_int
-        self._resize = resize
+        self._resize_8u = _bind_resize(self.nppig, "nppiResize_8u_C3R_Ctx")
+        try:
+            self._resize_16u = _bind_resize(self.nppig, "nppiResize_16u_C3R_Ctx")
+        except AttributeError:
+            self._resize_16u = None
 
     def _stream_context(self) -> NppStreamContext:
         stream = torch.cuda.current_stream(self.device)
@@ -162,6 +167,15 @@ class NppLanczosResizer:
         )
         return context
 
+    def _resize_for_dtype(self, dtype: torch.dtype):
+        if dtype == torch.uint8:
+            return self._resize_8u, "nppiResize_8u_C3R_Ctx"
+        if dtype == torch.uint16:
+            if self._resize_16u is None:
+                raise RuntimeError("NPP library does not expose nppiResize_16u_C3R_Ctx")
+            return self._resize_16u, "nppiResize_16u_C3R_Ctx"
+        raise TypeError(f"NPP resize supports uint8/uint16, got {dtype}")
+
     def resize_batch(
         self,
         frames: torch.Tensor,
@@ -170,8 +184,7 @@ class NppLanczosResizer:
     ) -> torch.Tensor:
         if frames.device.type != "cuda":
             raise RuntimeError("NPP resize source must be CUDA")
-        if frames.dtype != torch.uint8:
-            raise TypeError(f"NPP resize expects uint8, got {frames.dtype}")
+        resize, operation = self._resize_for_dtype(frames.dtype)
         if frames.ndim != 4 or int(frames.shape[-1]) != 3:
             raise ValueError(
                 f"NPP resize expects [N,H,W,3], got {tuple(frames.shape)}"
@@ -191,7 +204,7 @@ class NppLanczosResizer:
 
         output = torch.empty(
             (count, out_height, out_width, 3),
-            dtype=torch.uint8,
+            dtype=frames.dtype,
             device=frames.device,
         )
         context = self._stream_context()
@@ -199,13 +212,14 @@ class NppLanczosResizer:
         src_roi = NppiRect(0, 0, in_width, in_height)
         dst_size = NppiSize(out_width, out_height)
         dst_roi = NppiRect(0, 0, out_width, out_height)
-        src_step = in_width * 3
-        dst_step = out_width * 3
+        bytes_per_sample = int(frames.element_size())
+        src_step = in_width * 3 * bytes_per_sample
+        dst_step = out_width * 3 * bytes_per_sample
 
         for index in range(count):
             source = frames[index]
             target = output[index]
-            status = self._resize(
+            status = resize(
                 ctypes.c_void_p(int(source.data_ptr())),
                 src_step,
                 src_size,
@@ -217,6 +231,6 @@ class NppLanczosResizer:
                 _NPPI_INTER_LANCZOS,
                 context,
             )
-            _check_npp(status, "nppiResize_8u_C3R_Ctx")
+            _check_npp(status, operation)
 
         return output
