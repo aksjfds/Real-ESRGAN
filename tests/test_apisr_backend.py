@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 from pathlib import Path
 import sys
 import tempfile
@@ -40,6 +41,20 @@ class FakeGRL(torch.nn.Module):
         return {"call": torch.tensor(self.calls)}
 
 
+class FakeResponse(io.BytesIO):
+    def __init__(self, data: bytes, declared_length: int | None = None) -> None:
+        super().__init__(data)
+        self.headers: dict[str, str] = {}
+        if declared_length is not None:
+            self.headers["Content-Length"] = str(declared_length)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
 class APISRBackendTests(unittest.TestCase):
     def tearDown(self) -> None:
         backend._load_grl_class.cache_clear()
@@ -74,6 +89,7 @@ class APISRBackendTests(unittest.TestCase):
         self.assertEqual(len(backend.APISR_WEIGHT_SHA256), 64)
         self.assertIn("architecture/grl.py", backend.APISR_SOURCE_BLOBS)
         self.assertGreaterEqual(len(backend.APISR_SOURCE_BLOBS), 10)
+        self.assertGreater(backend.APISR_SOURCE_ARCHIVE_MAX_BYTES, 0)
         self.assertFalse(backend.SR_MATMUL_TF32)
 
     def test_pinned_source_validation_rejects_changed_file(self) -> None:
@@ -94,19 +110,32 @@ class APISRBackendTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     backend._validate_source_dir(root, require_pinned=True)
 
-    def test_grl_import_restores_entire_sys_path(self) -> None:
+    def test_grl_import_restores_global_import_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             grl_path = root / "architecture" / "grl.py"
             grl_path.parent.mkdir(parents=True, exist_ok=True)
             grl_path.write_text("# fake", encoding="utf-8")
-            original = list(sys.path)
-            previous_arch = sys.modules.pop("architecture", None)
+            original_path = list(sys.path)
+            original_modules = {
+                name: module
+                for name, module in tuple(sys.modules.items())
+                if name == "architecture" or name.startswith("architecture.")
+            }
+            for name in tuple(original_modules):
+                sys.modules.pop(name, None)
+
+            fake_grl_module = SimpleNamespace(__file__=str(grl_path), GRL=FakeGRL)
 
             def fake_import(name: str):
                 self.assertEqual(name, "architecture.grl")
                 sys.path.append("/tmp/apisr-upstream-side-effect")
-                return SimpleNamespace(__file__=str(grl_path), GRL=FakeGRL)
+                sys.modules["architecture"] = SimpleNamespace(
+                    __path__=[str(root / "architecture")]
+                )
+                sys.modules["architecture.grl"] = fake_grl_module
+                sys.modules["architecture.grl_common.ops"] = SimpleNamespace()
+                return fake_grl_module
 
             backend._load_grl_class.cache_clear()
             try:
@@ -117,13 +146,55 @@ class APISRBackendTests(unittest.TestCase):
                         side_effect=fake_import,
                     ):
                         self.assertIs(backend._load_grl_class(), FakeGRL)
-                self.assertEqual(sys.path, original)
+                self.assertEqual(sys.path, original_path)
+                actual_modules = {
+                    name: module
+                    for name, module in tuple(sys.modules.items())
+                    if name == "architecture" or name.startswith("architecture.")
+                }
+                self.assertEqual(actual_modules, original_modules)
             finally:
-                sys.path[:] = original
-                if previous_arch is not None:
-                    sys.modules["architecture"] = previous_arch
-                else:
-                    sys.modules.pop("architecture", None)
+                sys.path[:] = original_path
+                for name in tuple(sys.modules):
+                    if name == "architecture" or name.startswith("architecture."):
+                        sys.modules.pop(name, None)
+                sys.modules.update(original_modules)
+
+    def test_download_rejects_declared_oversize_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            target = Path(raw) / "asset.bin"
+            response = FakeResponse(b"", declared_length=9)
+            with mock.patch.object(
+                backend.urllib.request,
+                "urlopen",
+                return_value=response,
+            ) as urlopen:
+                with self.assertRaises(backend._DownloadLimitError):
+                    backend._download_to(
+                        "https://example.invalid/asset",
+                        target,
+                        max_bytes=8,
+                    )
+            self.assertEqual(urlopen.call_count, 1)
+            self.assertFalse(target.exists())
+
+    def test_download_rejects_streamed_oversize_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            target = Path(raw) / "asset.bin"
+            response = FakeResponse(b"123456789")
+            with mock.patch.object(
+                backend.urllib.request,
+                "urlopen",
+                return_value=response,
+            ) as urlopen:
+                with self.assertRaises(backend._DownloadLimitError):
+                    backend._download_to(
+                        "https://example.invalid/asset",
+                        target,
+                        max_bytes=8,
+                    )
+            self.assertEqual(urlopen.call_count, 1)
+            self.assertFalse(target.exists())
 
     def test_archive_extraction_ignores_unrelated_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

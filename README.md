@@ -2,7 +2,7 @@
 
 ## 当前版本流水线
 
-当前 **APISR v8.10 [Dev] 🔧** 以 `master` v8.9 为完整基线，仅替换 SR 模型后端，并保留 master 的 BVS / RIFE / 调度 / shared-memory / CUDA 传输 / NPP / 编码 / 音频架构。
+当前 **APISR v8.11 [Dev] 🔧** 以 `master` v8.9 为完整基线，仅替换 SR 模型后端，并保留 master 的 BVS / RIFE / 调度 / shared-memory / CUDA 传输 / NPP / 编码 / 音频架构。
 
 ```text
 视频增强（可关闭）：
@@ -35,9 +35,9 @@ v8.9 的 `ClipSource` 使用单槽有界异步预取：后台线程提前执行�
 
 APISR 分支使用官方 **v0.1.0 4× GRL GAN** 权重，并固定到该 Release 对应源码 commit `fabe8332413bc7f4024e6db39141c68692e88ea5`。GRL 按官方限制继续使用 FP32；SR worker 的 FP32 matmul 使用 IEEE 精度，不强制启用 TF32，cuDNN convolution 仍允许 TF32 以保留卷积性能。
 
-APISR 首次运行会把源码和权重缓存到 `~/.cache/realesrgan/apisr/`。源码只提取 GRL 推理实际需要的文件，并按 Git blob manifest 校验；官方权重按大小和 SHA256 校验；下载使用有限超时/重试；POSIX 下使用独立 cache file lock，避免多进程首次启动时竞争写入。可用 `APISR_CACHE_DIR` 改缓存根目录；`APISR_SOURCE_DIR` 可显式指定本地 APISR 源码覆盖。
+APISR 首次运行会把源码和权重缓存到 `~/.cache/realesrgan/apisr/`。源码只提取 GRL 推理实际需要的文件，并按 Git blob manifest 校验；官方权重按大小和 SHA256 校验；下载使用有限超时/重试与硬性字节上限；POSIX 下使用独立 cache file lock，避免多进程首次启动时竞争写入。可用 `APISR_CACHE_DIR` 改缓存根目录；`APISR_SOURCE_DIR` 可显式指定本地 APISR 源码覆盖。
 
-APISR v0.1.0 上游 `grl.py` 会自行修改 `sys.path`。本分支在导入前保存完整 `sys.path` 快照并在导入后完整恢复，避免第三方源码 import side effect 泄漏到主运行时。
+APISR v0.1.0 上游 GRL 使用通用顶层包名 `architecture.*`，且其源码会修改 `sys.path`。本分支在导入前保存并在导入后完整恢复 `sys.path` 与 `architecture.*` 的 `sys.modules` 状态，避免第三方源码 import side effect 泄漏到主运行时。
 
 SR worker 在发送 `WorkerReady` 前会执行一次**完整 batch=1 SR startup probe**：实际经过 shared input → H2D → GRL → 输出量化 → 必要的 NPP/CPU Lanczos → D2H/shared output。这样会在视频处理开始前验证 full-frame 显存、真实输出尺寸、NPP 路径、D2H/shared-memory 路径，并预热 GRL 动态 resolution table/mask cache。不会自动缩小输入或静默切 tile，以避免改变数学路径。
 
@@ -55,8 +55,22 @@ SR worker 在发送 `WorkerReady` 前会执行一次**完整 batch=1 SR startup 
 
 **AI / 新对话读取规则：**任何 AI 助手或自动化代理在新的对话中首次读取本 README 时，必须先读取并记住本节，并在该对话后续所有涉及本仓库的分析、修改、提交和版本管理中持续遵守；除非用户明确修改本原则，不得自行弱化、忽略或覆盖。
 
+### APISR 静态审计闭环规则（必须遵守）
+
+APISR 的基准是当前 `master`。静态审计只把以下两类内容视为 APISR 分支待修问题：
+
+1. `APISR` 相对 `master` 的实际代码差异所引入的问题；
+2. APISR backend 与 master 既有接口交互后新产生的正确性、稳定性、兼容性、耦合或性能问题。
+
+与 `master` 字节一致的既有实现、兼容代码、文件或资源，不得仅因为名称仍含 Real-ESRGAN、当前 APISR active path 未使用，或存在可进一步重构空间，就重复列为 APISR 缺陷；只有存在可复现的 APISR 交互故障或用户明确要求同步清理 master 基线时才处理。
+
+每次宣告“静态审计完成”前，必须一次性检查并记录以下边界：**模型拓扑/权重一致性、输入输出与精度、显存与 OOM、H2D/D2H/shared-memory/NPP、并发与生命周期、import/global state、下载/cache/完整性、依赖与许可证、失败/fallback、CLI/Notebook/文档、回归测试，以及 APISR↔master 接口。**
+
+同一 commit 在上述清单已经完成且代码未变化时，不得通过换审查角度继续把“可选重构/性能猜测”包装成新缺陷。后续新增问题必须至少满足其一：**代码发生新变化、出现新的真实运行证据、上游/运行环境约束发生变化，或能指出此前闭环清单中遗漏的具体失败路径。** 无 profiling/画质 A/B 数据的性能想法只能列为实验项，不得列为必须修改的问题。
+
 ## 版本历史
 
+- **APISR v8.11 [Dev] 🔧**：完成静态审计闭环：第三方 GRL import 同时恢复 `sys.path` 与 `architecture.*` 的 `sys.modules` 状态；APISR source/weight 下载加入硬性字节上限并补回归测试；README 固化 APISR↔master 审计边界，避免把 master 原样继承内容反复误报为 APISR 缺陷；补充上游 GPL-3.0 / academic-use disclaimer 提示。
 - **APISR v8.10 [Dev] 🔧**：在 v8.9 APISR backend 基础上完成运行边界收口：完整 SR startup probe 取代 model-only warmup；10-bit CUDA `uint16` 改为 capability-gated fast path 并提供稳定 fallback；`frame_transport` 泛化为 uint8/uint16 共用路径，删除 APISR handler 重复 transport；APISR FP32 matmul 恢复 IEEE 语义；完整恢复第三方源码 import 前后的 `sys.path`；下载增加超时/重试并只安全提取 pinned GRL runtime 文件；Notebook 默认执行 CPU 回归测试。
 - **APISR v8.9 [Dev] 🔧**：以 `master` v8.9 为完整基线，将 Real-ESRGAN SR 后端替换为 APISR 4× GRL GAN；补齐真正 BCHW micro-batch、GRL 动态 resolution table/mask 单槽缓存、显式 SR backend 边界、v0.1.0 源码/权重一致性与完整性校验、并发 cache lock 和 uint16 CUDA/NPP 初始路径；GRL 使用 FP32。
 - **v8.9 [Dev] 🔧**：`ClipSource` 增加单槽有界异步预取；后台线程在当前 GPU 任务执行期间提前完成下一 BVS clip 的 FFmpeg 读帧、scene signature 与组帧，`Queue(maxsize=1)` 提供背压并限制额外内存，不改变视频处理数学路径与输出顺序。
@@ -117,6 +131,8 @@ SR worker 在发送 `WorkerReady` 前会执行一次**完整 batch=1 SR startup 
 | APISR source commit `fabe8332413bc7f4024e6db39141c68692e88ea5` | 与 v0.1.0 权重对应的 GRL 架构源码 | `Kiteretsu77/APISR` |
 
 默认缓存根目录：`~/.cache/realesrgan/apisr/`。
+
+**上游使用与许可提示：**APISR 上游将项目以 GPL-3.0 发布，并在 README 中声明项目仅供学术用途（academic use only）且其 disclaimer 适用。本分支运行时下载的 APISR 源码/权重仍受上游许可、disclaimer 与权重相关条款约束；详见 `THIRD_PARTY_NOTICES.md`。
 
 ## 编码
 

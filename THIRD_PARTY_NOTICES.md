@@ -10,7 +10,7 @@ Upstream project: https://github.com/hzwer/Practical-RIFE
 
 The RIFE 4.25 `flownet.pkl` is downloaded from the upstream project's official Google Drive release on first use and cached under `~/.cache/realesrgan/rife-v4.25/`. It is not stored in this repository.
 
-The APISR branch downloads the official APISR v0.1.0 source archive at the pinned commit recorded in `inference/apisr_backend.py`, extracts only the GRL runtime files listed in its integrity manifest, and imports that architecture at runtime. The APISR source and released model weights are not stored in this repository. APISR is published by its upstream authors under the GPL-3.0 license and its published disclaimer/weight terms remain applicable to those downloaded materials.
+The APISR branch downloads the official APISR v0.1.0 source archive at the pinned commit recorded in `inference/apisr_backend.py`, extracts only the GRL runtime files listed in its integrity manifest, and imports that architecture at runtime. The APISR source and released model weights are not stored in this repository. APISR is published by its upstream authors under the GPL-3.0 license; its upstream README states that the project is released for academic use only and that its disclaimer applies. Those upstream license, disclaimer, model-weight, and usage terms remain applicable to the downloaded APISR materials.
 
 Upstream project: https://github.com/Kiteretsu77/APISR
 

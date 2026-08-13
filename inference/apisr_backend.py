@@ -40,6 +40,7 @@ APISR_WEIGHT_SIZE = 6_479_400
 APISR_WEIGHT_SHA256 = "56fff250139563dea59c4ca81af19cc098d94dc3abaad23640f14cec488e5da1"
 APISR_DOWNLOAD_TIMEOUT = 60.0
 APISR_DOWNLOAD_RETRIES = 3
+APISR_SOURCE_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024
 APISR_SOURCE_MAX_FILE_BYTES = 2 * 1024 * 1024
 SR_MATMUL_TF32 = False
 MODEL_URLS = {APISR_MODEL_NAME: (APISR_WEIGHT_URL,)}
@@ -58,6 +59,10 @@ APISR_SOURCE_BLOBS = {
     "architecture/grl_common/swin_v2_block.py": "e62f13704ee2fe5e1674cf6316df8137597688c3",
     "architecture/grl_common/upsample.py": "86155d0efeec42abd1ba12ef263c50357709b625",
 }
+
+
+class _DownloadLimitError(RuntimeError):
+    """Raised when an APISR asset exceeds its fixed download boundary."""
 
 
 def _cache_root() -> Path:
@@ -111,8 +116,12 @@ def _cache_lock(name: str) -> Iterator[None]:
         handle.close()
 
 
-def _download_to(url: str, target: Path) -> None:
-    """Download with a finite timeout/retry policy into an existing temp path."""
+def _download_to(url: str, target: Path, *, max_bytes: int) -> None:
+    """Download with timeout/retry and a hard byte cap into a temp path."""
+    max_bytes = int(max_bytes)
+    if max_bytes <= 0:
+        raise ValueError("APISR download max_bytes must be positive")
+
     last_error: Exception | None = None
     for attempt in range(1, APISR_DOWNLOAD_RETRIES + 1):
         try:
@@ -124,8 +133,36 @@ def _download_to(url: str, target: Path) -> None:
                 request,
                 timeout=APISR_DOWNLOAD_TIMEOUT,
             ) as response, target.open("wb") as output:
-                shutil.copyfileobj(response, output, length=1024 * 1024)
+                header_value = response.headers.get("Content-Length")
+                try:
+                    declared = int(header_value) if header_value is not None else None
+                except (TypeError, ValueError):
+                    declared = None
+                if declared is not None and declared > max_bytes:
+                    raise _DownloadLimitError(
+                        f"APISR asset exceeds download limit: "
+                        f"declared={declared}, max={max_bytes}, url={url}"
+                    )
+
+                total = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise _DownloadLimitError(
+                            f"APISR asset exceeds download limit while streaming: "
+                            f"received>{max_bytes}, url={url}"
+                        )
+                    output.write(chunk)
             return
+        except _DownloadLimitError:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         except Exception as error:
             last_error = error
             try:
@@ -214,7 +251,11 @@ def _ensure_apisr_source() -> Path:
                 f"[APISR] downloading v0.1.0 source commit {APISR_SOURCE_COMMIT}",
                 flush=True,
             )
-            _download_to(APISR_SOURCE_ARCHIVE_URL, archive)
+            _download_to(
+                APISR_SOURCE_ARCHIVE_URL,
+                archive,
+                max_bytes=APISR_SOURCE_ARCHIVE_MAX_BYTES,
+            )
             _extract_pinned_source(archive, staged)
             _validate_source_dir(staged, require_pinned=True)
             staged.replace(target)
@@ -251,7 +292,11 @@ def _ensure_official_weight() -> Path:
         handle.close()
         try:
             print(f"[APISR] downloading {APISR_WEIGHT_URL}", flush=True)
-            _download_to(APISR_WEIGHT_URL, temporary)
+            _download_to(
+                APISR_WEIGHT_URL,
+                temporary,
+                max_bytes=APISR_WEIGHT_SIZE,
+            )
             if temporary.stat().st_size != APISR_WEIGHT_SIZE:
                 raise RuntimeError(
                     "Downloaded APISR weight size mismatch: "
@@ -295,6 +340,23 @@ def _loaded_module_path(module) -> Path | None:
     return Path(value).resolve()
 
 
+def _architecture_module_snapshot() -> dict[str, object]:
+    """Capture the complete top-level architecture namespace before APISR import."""
+    return {
+        name: module
+        for name, module in tuple(sys.modules.items())
+        if name == "architecture" or name.startswith("architecture.")
+    }
+
+
+def _restore_architecture_modules(snapshot: dict[str, object]) -> None:
+    """Restore the exact architecture.* module-cache state from before import."""
+    for name in tuple(sys.modules):
+        if name == "architecture" or name.startswith("architecture."):
+            sys.modules.pop(name, None)
+    sys.modules.update(snapshot)
+
+
 @lru_cache(maxsize=1)
 def _load_grl_class() -> type[torch.nn.Module]:
     source_root = _ensure_apisr_source()
@@ -313,6 +375,7 @@ def _load_grl_class() -> type[torch.nn.Module]:
             )
 
     original_sys_path = list(sys.path)
+    original_architecture_modules = _architecture_module_snapshot()
     if source_text not in sys.path:
         sys.path.insert(0, source_text)
     try:
@@ -332,9 +395,10 @@ def _load_grl_class() -> type[torch.nn.Module]:
                 ) from error
             raise
     finally:
-        # APISR v0.1.0 grl.py itself appends cwd to sys.path. Restore the exact
-        # pre-import search path so upstream import side effects do not leak.
+        # APISR v0.1.0 mutates sys.path and imports through the generic
+        # architecture.* namespace. Restore both global import states exactly.
         sys.path[:] = original_sys_path
+        _restore_architecture_modules(original_architecture_modules)
 
     module_path = _loaded_module_path(module)
     if module_path is None or not _is_within(module_path, source_root):
