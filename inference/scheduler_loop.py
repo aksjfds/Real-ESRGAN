@@ -334,7 +334,29 @@ def run_scheduler(
         ):
             made_progress = True
 
+        handoff_worker = (
+            pump.encoder_handoff_worker_id()
+            if state.next_output in state.pending
+            else None
+        )
         while state.next_output in state.pending:
+            if handoff_worker is not None:
+                if (
+                    state.temporal_active[handoff_worker] is not None
+                    or state.sr_active[handoff_worker] is not None
+                ):
+                    break
+                worker_id, output_slot = state.pending.pop(state.next_output)
+                pump.handoff_first_output(
+                    state.next_output,
+                    worker_id,
+                    output_slot,
+                )
+                state.next_output += 1
+                made_progress = True
+                handoff_worker = None
+                continue
+
             worker_id, output_slot = state.pending.pop(state.next_output)
             pump.put(
                 state.next_output,
@@ -344,7 +366,14 @@ def run_scheduler(
             state.next_output += 1
             made_progress = True
 
+        blocked_handoff_worker = (
+            pump.encoder_handoff_worker_id()
+            if state.next_output in state.pending
+            else None
+        )
         for worker_id in range(len(state.gpu_ids)):
+            if blocked_handoff_worker == worker_id:
+                continue
             if state.planner.rife_enabled:
                 scheduled = state.schedule_idle_worker(worker_id)
             else:

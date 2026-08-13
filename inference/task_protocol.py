@@ -70,7 +70,12 @@ class SRTask:
     kind: TaskKind = TaskKind.SR
 
 
-WorkerTask: TypeAlias = BVSTask | RIFETask | SRTask
+@dataclass(frozen=True)
+class TrimCudaCache:
+    request_id: int
+
+
+WorkerTask: TypeAlias = BVSTask | RIFETask | SRTask | TrimCudaCache
 
 
 @dataclass(frozen=True)
@@ -78,6 +83,18 @@ class WorkerReady:
     worker_id: int
     gpu_id: int
     role: WorkerRole
+
+
+@dataclass(frozen=True)
+class CudaCacheTrimmed:
+    worker_id: int
+    gpu_id: int
+    role: WorkerRole
+    request_id: int
+    free_before: int
+    free_after: int
+    allocated: int
+    reserved: int
 
 
 @dataclass(frozen=True)
@@ -137,5 +154,10 @@ class TaskResult:
 
 
 WorkerMessage: TypeAlias = (
-    WorkerReady | TaskStarted | TaskComputeDone | TaskResult | TaskError
+    WorkerReady
+    | CudaCacheTrimmed
+    | TaskStarted
+    | TaskComputeDone
+    | TaskResult
+    | TaskError
 )

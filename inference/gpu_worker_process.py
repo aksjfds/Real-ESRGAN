@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from multiprocessing import shared_memory
+import gc
 from pathlib import Path
 import os
 import time
@@ -22,10 +23,12 @@ from .gpu_task_handlers import (
 )
 from .optimized_rife425 import OptimizedRIFE425Interpolator
 from .task_protocol import (
+    CudaCacheTrimmed,
     TaskComputeDone,
     TaskError,
     TaskResult,
     TaskStarted,
+    TrimCudaCache,
     WorkerReady,
     WorkerRole,
 )
@@ -134,6 +137,28 @@ def _run_task_loop(
         task = task_queue.get()
         if task is None:
             break
+
+        if isinstance(task, TrimCudaCache):
+            torch.cuda.current_stream(context.device).synchronize()
+            free_before, _total = torch.cuda.mem_get_info(context.device)
+            allocated = int(torch.cuda.memory_allocated(context.device))
+            reserved = int(torch.cuda.memory_reserved(context.device))
+            gc.collect()
+            torch.cuda.empty_cache()
+            free_after, _ = torch.cuda.mem_get_info(context.device)
+            send(
+                CudaCacheTrimmed(
+                    worker_id=worker_id,
+                    gpu_id=gpu_id,
+                    role=role,
+                    request_id=int(task.request_id),
+                    free_before=int(free_before),
+                    free_after=int(free_after),
+                    allocated=allocated,
+                    reserved=reserved,
+                )
+            )
+            continue
 
         handler = handlers.get(task.kind)
         if handler is None:

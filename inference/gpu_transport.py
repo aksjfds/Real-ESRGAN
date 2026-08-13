@@ -20,7 +20,7 @@ from .gpu_worker_process import (
     gpu_sr_worker_main,
     gpu_temporal_worker_main,
 )
-from .task_protocol import TaskError, WorkerReady, WorkerRole
+from .task_protocol import (CudaCacheTrimmed, TaskError, TrimCudaCache, WorkerReady, WorkerRole)
 
 _TASK_TIMEOUT = 300.0
 _SR_OUTPUT_BUFFERS = 2
@@ -61,6 +61,7 @@ class GPUWorkerTransport:
         self.sr_output_buffers = _SR_OUTPUT_BUFFERS
         self.enable_gpu_timing = bool(enable_gpu_timing)
         self.closed = False
+        self._control_request_id = 0
 
         if self.count < 1:
             raise ValueError(
@@ -442,6 +443,67 @@ class GPUWorkerTransport:
             startup_error = self._startup_exit_error(ready_workers)
             if startup_error is not None:
                 raise startup_error
+
+    def trim_cuda_cache(self, worker_id: int) -> tuple[CudaCacheTrimmed, ...]:
+        """Trim both idle role processes on one physical GPU and wait for ACKs."""
+        worker_id = int(worker_id)
+        if worker_id < 0 or worker_id >= self.count:
+            raise ValueError(f"Invalid GPU worker index: {worker_id}")
+
+        self._control_request_id += 1
+        request_id = self._control_request_id
+        command = TrimCudaCache(request_id=request_id)
+        self.temporal_task_queues[worker_id].put(command)
+        self.sr_task_queues[worker_id].put(command)
+
+        expected = {WorkerRole.TEMPORAL, WorkerRole.SR}
+        replies: dict[WorkerRole, CudaCacheTrimmed] = {}
+        deferred = deque()
+        deadline = time.monotonic() + _TASK_TIMEOUT
+
+        while set(replies) != expected:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                roles = ','.join(sorted(role.value for role in expected - set(replies)))
+                raise TimeoutError(
+                    f"Timed out trimming cuda:{self.gpu_ids[worker_id]} cache; missing={roles}"
+                )
+            self.wait_for_event(remaining)
+            while self._pending_messages:
+                message = self._pending_messages.popleft()
+                if (
+                    isinstance(message, CudaCacheTrimmed)
+                    and message.worker_id == worker_id
+                    and message.request_id == request_id
+                ):
+                    replies[message.role] = message
+                    continue
+                if isinstance(message, TaskError) and message.worker_id == worker_id:
+                    self._pending_messages.extendleft(reversed(deferred))
+                    raise RuntimeError(
+                        f"GPU worker {worker_id} failed during encoder handoff: "
+                        f"{message.error}\n{message.traceback_text}"
+                    )
+                deferred.append(message)
+
+            if not self.is_alive(worker_id):
+                self._pending_messages.extendleft(reversed(deferred))
+                raise RuntimeError(
+                    f"cuda:{self.gpu_ids[worker_id]} worker exited during encoder handoff"
+                )
+
+        self._pending_messages.extendleft(reversed(deferred))
+        ordered = tuple(replies[role] for role in (WorkerRole.TEMPORAL, WorkerRole.SR))
+        mib = 1024.0 * 1024.0
+        details = ' | '.join(
+            f"{reply.role.value} free={reply.free_before / mib:.0f}->{reply.free_after / mib:.0f} MiB"
+            for reply in ordered
+        )
+        print(
+            f"[gpu] cuda:{self.gpu_ids[worker_id]} encoder handoff cache barrier complete | {details}",
+            flush=True,
+        )
+        return ordered
 
     def can_submit_sr(self, worker_id: int) -> bool:
         with self._sr_lock:

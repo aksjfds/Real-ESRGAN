@@ -9,7 +9,7 @@ import numpy as np
 
 
 class ReservedNVENCWriter:
-    """Swap a primed temporary NVENC session for the real writer on first frame."""
+    """Hold a primed NVENC session until the scheduler performs an idle handoff."""
 
     def __init__(
         self,
@@ -25,6 +25,14 @@ class ReservedNVENCWriter:
         self._codec = str(codec)
         self._encode_gpu = int(encode_gpu)
         self._reservation_released = False
+
+    @property
+    def handoff_pending(self) -> bool:
+        return not self._reservation_released
+
+    @property
+    def handoff_gpu_id(self) -> int:
+        return self._encode_gpu
 
     def _release_reservation(self) -> None:
         if self._reservation_released:
@@ -44,9 +52,9 @@ class ReservedNVENCWriter:
         )
 
     def write(self, frame: np.ndarray) -> None:
-        # Keep the real NVENC footprint unavailable to inference until the first
-        # actual output frame is ready, then hand that footprint directly to the
-        # real writer with no dummy frame entering the final video.
+        # Normal calls reach here only after the scheduler has quiesced the
+        # shared encode GPU and trimmed both worker caches. Keeping the release
+        # immediately adjacent to the real write closes the allocation window.
         self._release_reservation()
         self._writer.write(frame)
 

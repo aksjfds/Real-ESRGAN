@@ -114,6 +114,7 @@ class OutputPump:
         self._heartbeat_stop = threading.Event()
         self._heartbeat_closed = False
         self._batch_mode = bool(getattr(progress, "disable", False))
+        self._process_lock = threading.Lock()
 
         self.thread = threading.Thread(
             target=self._run,
@@ -149,6 +150,69 @@ class OutputPump:
             (self.processed - 1) / max(now - self.first_output_at, 1e-6),
         )
 
+    def _process_item(self, item: tuple[int, int, int]) -> None:
+        _frame_id, worker_id, output_slot = item
+        try:
+            mark = time.monotonic()
+            frame = resize_frame(
+                self.workers.output(worker_id, output_slot),
+                self.width,
+                self.height,
+            )
+            self.resize_seconds += time.monotonic() - mark
+
+            mark = time.monotonic()
+            self.writer.write(frame)
+            self.write_seconds += time.monotonic() - mark
+
+            self.processed += 1
+            now = time.monotonic()
+            if self.first_output_at is None:
+                self.first_output_at = now
+            self.progress.update(1)
+            rate = self._stable_rate(now)
+            total = int(self.progress.total or 0)
+            remaining = max(0, total - self.processed)
+            eta = remaining / rate if rate > 1e-9 else float("inf")
+            self.progress.set_postfix_str(
+                f"{rate:.3f} frame/s | ETA {_format_duration(eta)}",
+                refresh=False,
+            )
+        finally:
+            self.workers.release(worker_id, output_slot)
+
+    def encoder_handoff_worker_id(self) -> int | None:
+        if not bool(getattr(self.writer, "handoff_pending", False)):
+            return None
+        gpu_id = getattr(self.writer, "handoff_gpu_id", None)
+        if gpu_id is None:
+            return None
+        try:
+            return self.workers.gpu_ids.index(int(gpu_id))
+        except ValueError:
+            return None
+
+    def handoff_first_output(
+        self,
+        frame_id: int,
+        worker_id: int,
+        output_slot: int,
+    ) -> None:
+        """Atomically trim the shared GPU then start the real encoder on frame 0."""
+        target = self.encoder_handoff_worker_id()
+        if target is None:
+            raise RuntimeError("NVENC handoff requested without a shared encode GPU")
+        self.check()
+        self.workers.trim_cuda_cache(target)
+        print(
+            f"[encode] cuda:{self.workers.gpu_ids[target]} workers idle/cache-trimmed; "
+            "performing NVENC handoff",
+            flush=True,
+        )
+        with self._process_lock:
+            self._process_item((int(frame_id), int(worker_id), int(output_slot)))
+        self.check()
+
     def _run(self) -> None:
         import traceback
 
@@ -158,35 +222,10 @@ class OutputPump:
                 if item is None:
                     self.queue.task_done()
                     break
-                _frame_id, worker_id, output_slot = item
                 try:
-                    mark = time.monotonic()
-                    frame = resize_frame(
-                        self.workers.output(worker_id, output_slot),
-                        self.width,
-                        self.height,
-                    )
-                    self.resize_seconds += time.monotonic() - mark
-
-                    mark = time.monotonic()
-                    self.writer.write(frame)
-                    self.write_seconds += time.monotonic() - mark
-
-                    self.processed += 1
-                    now = time.monotonic()
-                    if self.first_output_at is None:
-                        self.first_output_at = now
-                    self.progress.update(1)
-                    rate = self._stable_rate(now)
-                    total = int(self.progress.total or 0)
-                    remaining = max(0, total - self.processed)
-                    eta = remaining / rate if rate > 1e-9 else float("inf")
-                    self.progress.set_postfix_str(
-                        f"{rate:.3f} frame/s | ETA {_format_duration(eta)}",
-                        refresh=False,
-                    )
+                    with self._process_lock:
+                        self._process_item(item)
                 finally:
-                    self.workers.release(worker_id, output_slot)
                     self.queue.task_done()
         except Exception as error:
             self.error = error
