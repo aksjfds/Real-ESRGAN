@@ -14,6 +14,7 @@ import numpy as np
 from audio.runtime import mux_audio as mux_output_audio
 from . import runtime_api as base
 from .clip_source import ClipSource
+from .encoder_reservation import reserve_nvenc_for_workers
 from .gpu_workers import UnifiedGPUWorkers
 from .output_runtime import OutputPump, create_progress
 from .scheduler_loop import run_scheduler
@@ -359,6 +360,23 @@ def process_video(args) -> None:
             args.cq,
             args.nvenc_preset,
             args.encode_gpu,
+        )
+        writer = reserve_nvenc_for_workers(
+            writer,
+            writer_type=writer_type,
+            temp_video=temp_video,
+            ffmpeg_bin=args.ffmpeg_bin,
+            width=out_w,
+            height=out_h,
+            fps_rate=output_rate_text,
+            codec=args.video_codec,
+            crf=args.crf,
+            preset=args.preset,
+            cq=args.cq,
+            nvenc_preset=args.nvenc_preset,
+            encode_gpu=args.encode_gpu,
+            worker_gpu_ids=gpu_ids,
+            dtype=dtype,
         )
         raw_reader = base.RawVideoReader(
             input_path,
