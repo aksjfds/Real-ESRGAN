@@ -1,9 +1,9 @@
-"""Narrow public compatibility boundary for the legacy inference runtime.
+"""Narrow public compatibility boundary for the inference runtime.
 
-Current v6.x orchestration imports this module instead of reaching into private
-attributes of inference.runtime directly. Legacy implementations remain intact.
-The APISR branch installs its SR-only backend here so spawned GPU workers see
-exactly the same model registry and loader as the parent process.
+The APISR branch keeps the master orchestration/runtime intact and exposes its
+SR backend explicitly through this module. The legacy runtime is not mutated at
+import time, so spawned workers and the parent process share a stable API without
+monkey-patching global model functions.
 """
 
 from __future__ import annotations
@@ -14,13 +14,12 @@ from typing import Callable, Type
 
 import numpy as np
 
+from . import apisr_backend as sr_backend
 from . import runtime as _legacy
-from .apisr_backend import install_apisr_backend
 
 
-install_apisr_backend(_legacy)
-
-MODEL_URLS = _legacy.MODEL_URLS
+MODEL_URLS = sr_backend.MODEL_URLS
+DEFAULT_MODEL_NAME = sr_backend.DEFAULT_MODEL_NAME
 VideoInfo = _legacy.VideoInfo
 WorkerConfig = _legacy.WorkerConfig
 
@@ -107,14 +106,14 @@ require_binary = _legacy.require_binary
 probe_video = _legacy.probe_video
 resolve_range = _legacy.resolve_range
 parse_gpu_ids = _legacy.parse_gpu_ids
-resolve_model_paths = _legacy.resolve_model_paths
-load_worker_model = _legacy.load_worker_model
-infer_frame = _legacy.infer_frame
+resolve_model_paths = sr_backend.resolve_model_paths
+load_worker_model = sr_backend.load_worker_model
+infer_frame = sr_backend.infer_frame
 mux_audio = _legacy.mux_audio
 
 
 def model_native_scale(name: str) -> int:
-    return _legacy._model_native_scale(name)
+    return sr_backend.model_native_scale(name)
 
 
 def output_pixel_format(codec: str, bit_depth: int) -> str:

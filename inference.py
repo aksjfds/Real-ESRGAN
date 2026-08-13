@@ -22,8 +22,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, help="Output MP4 path")
     parser.add_argument(
         "--model",
-        choices=tuple(inference_runtime.MODEL_URLS),
-        default="APISR_GRL",
+        choices=tuple(pipeline_runtime.MODEL_URLS),
+        default=pipeline_runtime.DEFAULT_MODEL_NAME,
     )
     parser.add_argument(
         "--model-path",
