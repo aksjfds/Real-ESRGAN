@@ -1,4 +1,4 @@
-"""Explicit Real-ESRGAN CUDA helpers used by unified GPU workers."""
+"""Explicit CUDA SR helpers used by unified GPU workers."""
 
 from __future__ import annotations
 
@@ -8,6 +8,16 @@ import numpy as np
 import torch
 
 from .frame_transport import PinnedH2DStager
+
+
+def _model_input_dtype(model: torch.nn.Module) -> torch.dtype:
+    configured = getattr(model, "sr_input_dtype", None)
+    if isinstance(configured, torch.dtype):
+        return configured
+    try:
+        return next(model.parameters()).dtype
+    except StopIteration:
+        return torch.float32
 
 
 def infer_cuda_u8_batch(
@@ -39,9 +49,12 @@ def infer_cuda_u8_batch(
         device_frames.append(tensor.permute(2, 0, 1))
 
     tensor = torch.stack(device_frames, dim=0)
-    tensor = tensor.half()
+    tensor = tensor.to(dtype=_model_input_dtype(model))
     tensor.div_(255.0)
-    tensor = tensor.contiguous(memory_format=torch.channels_last)
+    if bool(getattr(model, "sr_channels_last", True)):
+        tensor = tensor.contiguous(memory_format=torch.channels_last)
+    else:
+        tensor = tensor.contiguous()
     with torch.inference_mode():
         output = model(tensor)
         output.clamp_(0, 1)

@@ -1,5 +1,10 @@
-# Fast video pipeline dependencies. Keep Kaggle's matched torch/torchvision CUDA build;
-# do not install the legacy torch==2.1.0 pins from upstream training requirements.
+# Fast video pipeline dependencies. Keep the environment's matched torch/torchvision CUDA build;
+# do not install APISR's legacy torch/torchvision pins over the runtime image.
 basicsr==1.4.2
 tqdm>=4.66,<5
 gdown>=5.2,<6
+
+# Official APISR 4x GRL runtime dependencies.
+omegaconf==2.3.0
+fairscale==0.4.13
+timm==0.9.7

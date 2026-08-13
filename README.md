@@ -1,8 +1,8 @@
-# Real-ESRGAN 动画视频推理
+# APISR 动画视频推理
 
 ## 当前版本流水线
 
-当前 v8.9 [Dev] 流水线：
+当前 APISR v8.9 [Dev] 流水线，以 `master` v8.9 为基线，仅替换 SR 模型后端：
 
 ```text
 视频增强（可关闭）：
@@ -10,7 +10,7 @@ FFmpeg 解码
 → FFmpeg 轻度 deband（Notebook 默认 0.006，可设 0 关闭）
 → BasicVSR++ NTIRE Track 1 同分辨率时序恢复
 → Practical-RIFE 4.25 任意 timestep 插帧（可关闭）
-→ Real-ESRGAN full-frame 超分
+→ APISR 4× GRL GAN full-frame 超分
 → NPP Lanczos CUDA 最终倍率调整（CPU Lanczos4 fallback）
 → NVENC（Notebook 可选 av1_nvenc / hevc_nvenc；默认 av1_nvenc）
 → ffprobe 成品验证（codec / profile / 位深 / 分辨率 / FPS / 音轨）
@@ -33,6 +33,8 @@ FFmpeg 解码
 
 v8.9 的 `ClipSource` 使用单槽有界异步预取：后台线程提前执行下一次 FFmpeg 读帧、scene signature 与 BVS clip 组装，`Queue(maxsize=1)` 只缓存 1 个待调度 clip；不改变帧顺序、scene-cut 判定、BVS/RIFE/SR 数学路径或编码参数。
 
+APISR 分支使用官方 4× GRL GAN 权重。官方 APISR 当前注明 GRL 的 FP16 推理存在问题，因此 SR 模型固定使用 FP32；其余 master 的 GPU 调度、shared-memory、异步 H2D/D2H、NPP Lanczos 和编码路径保持不变。
+
 `AUDIO_ENHANCE=False` 时不执行 DSP，继续只保留原音轨并优先 stream copy。
 
 v8.8 Notebook 暴露 `av1_nvenc` / `hevc_nvenc` 两种 GPU 编码器，默认仍为 `av1_nvenc`。两者共用 `PRESET`、`CQ`、`ENCODE_GPU`。AV1 的 profile 不再作为可变参数暴露；旧 CLI 的 `--av1-profile main` 仅作为兼容占位，成品会验证为 Main；VBR 使用 `CQ`，CBR 要求非零 bitrate 并设置匹配的 maxrate/bufsize，CONSTQP 使用 `QP`。`AV1_BIT_DEPTH` 表示 AV1 最低输出位深：设为 `8` 时 8-bit 片源保持 8-bit，设为 `10` 时 8-bit 片源编码为 10-bit；10-bit 片源始终保持 10-bit。启动日志中的 `encode=` 表示编码器输入/目标像素格式，任务完成后以最终文件的 ffprobe 结果作为实际输出事实。
@@ -41,9 +43,9 @@ AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频�
 
 ## 项目原则（必须遵守）
 
-**稳定 + 规范 + 低耦合 + 尽量无性能损失。** 所有修改必须基于当前真实代码和实际问题，优先采用可回退、可验证、职责边界清晰的实现，避免无必要重构、额外拷贝、同步、资源占用和性能退化；不得为了局部性能提升破坏稳定性、正确性、兼容性或代码结构。
+**稳定 + 规范 + 低耦合 + 尽量无性能损失。** 所有修改必须基于当前真实代码和实际问题，优先采用可回退、可验证、职责边界清晰的实现，避免无必要重构。额外拷贝、同步、资源占用和性能退化；不得为了局部性能提升破坏稳定性、正确性、兼容性或代码结构。
 
-修改完成后直接提交到 `master`，不得擅自创建分支、PR、tag 或其他远端引用；除非用户明确要求，否则不要拆成多轮提交、不要遗留“后续再优化”的已知问题，应尽量一次性完成本轮明确范围内的修改。
+修改完成后直接提交到 `APISR`，不得擅自创建分支、PR、tag 或其他远端引用；除非用户明确要求，否则不要拆成多轮提交、不要遗留“后续再优化”的已知问题，应尽量一次性完成本轮明确范围内的修改。
 
 开发中的版本默认标记为 `[Dev] 🔧`，只有经过用户实际测试并明确确认后，才能标记为 `[Release] ✅`。
 
@@ -51,8 +53,9 @@ AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频�
 
 ## 版本历史
 
+- APISR v8.9 [Dev] 🔧：以 `master` v8.9 为完整基线，保留现有 BVS/RIFE/调度/传输/NPP/编码/音频架构，仅将 Real-ESRGAN SR 后端替换为官方 APISR 4× GRL GAN；GRL 按官方限制使用 FP32。
 - v8.9 [Dev] 🔧：`ClipSource` 增加单槽有界异步预取；后台线程在当前 GPU 任务执行期间提前完成下一 BVS clip 的 FFmpeg 读帧、scene signature 与组帧，`Queue(maxsize=1)` 提供背压并限制额外内存，不改变视频处理数学路径与输出顺序。
-- v8.8 [Dev] 🔧：修复编码配置/日志一致性：AV1 VBR/CBR/CONSTQP 使用正确 FFmpeg 参数，CONSTQP 要求 AQ 关闭；移除 AV1 profile 的伪可配置语义并保留旧 CLI 兼容，成品验证为 Main；AV1/HEVC/H.264 增加源位深一致的 runtime probe；输出位深日志移除全局状态并显式传递；任务完成后用 ffprobe 验证成品 codec/profile/位深/分辨率/FPS/音轨；NVENC 默认改为仅 Spatial AQ，避免 Spatial/Temporal AQ 同时开启；清理活动路径中的陈旧版本文案。
+- v8.8 [Dev] 🔧：修复编码配置/日志一致性：AV1 VBR/CBR/CONSTQP 使用正确 FFmpeg 参数，CONSTQP 要求 AQ 关闭；移除 AV1 profile 的伪可配置语义并保留旧 CLI 兼容，成品验证为 Main；AV1/HEVC/H.264 增加源位深一致的 runtime probe；输出位深日志移除全局状态并显式传递；任务完成后用 ffprobe 验证成品 codec/profile/位深/分辨率/FPS/音轨；NVENC 默认改为仅 Spatial AQ，避免 Spatial/Temporal AQ 同时开启；清理活动路径中的陈��^���本文案。
 - v8.7 [Dev] 🔧：Notebook 恢复 `hevc_nvenc`，与 `av1_nvenc` 二选一；继续默认 AV1，HEVC 复用现有 NVENC 高质量 backend。
 - v8.6 [Dev] 🔧：在 FFmpeg 解码后、BasicVSR++ 前加入可选轻度 deband；新增 `DEBAND_STRENGTH` / `--deband-strength`，Notebook 默认 `0.006`，CLI 默认 `0` 保持旧行为。
 - v8.5 [Release] ✅：Notebook 使用 AV1 NVENC-only 高质量配置；P7/HQ、VBR CQ18、fullres multipass、AQ、B-ref 与 GOP，并新增 `AV1_BIT_DEPTH=8/10` 最低输出位深控制；10-bit 片源禁止降为 8-bit。
@@ -76,8 +79,9 @@ AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频�
 
 ## 当前结构
 
-- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），v8.8 Notebook 可选 `av1_nvenc` / `hevc_nvenc`，当前默认 `DUAL_GPU=True`、`AUDIO_ENHANCE=True`。
+- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），默认 `MODEL="APISR_GRL"`，可选 `av1_nvenc` / `hevc_nvenc`。
 - `inference.py`：视频增强 CLI 与总入口。
+- `inference/apisr_backend.py`：APISR GRL 模型注册、官方源码/权重解析、FP32 加载与尺寸保持包装层。
 - `inference/scheduler.py`：CPU 总编排、编码 fail-fast probe、最终音频边界与成品验证。
 - `inference/clip_source.py`：CPU scene-aware BVS clip 组装；v8.9 使用后台线程单槽预取下一 clip。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：调度状态、任务策略、结果处理与 watchdog。
@@ -86,9 +90,9 @@ AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频�
 - `inference/frame_transport.py`：`cudaHostRegister`、pinned fallback、异步 H2D/D2H 与 copy stream。
 - `inference/bvs_runtime.py` / `optimized_basicvsrpp.py`：BasicVSR++ runtime。
 - `inference/rife425.py` / `optimized_rife425.py`：Practical-RIFE 4.25 runtime。
-- `inference/sr_runtime.py`：Real-ESRGAN SR runtime。
+- `inference/sr_runtime.py`：通用 SR CUDA 输入/输出路径；APISR 根据模型声明使用 FP32 contiguous 输入。
 - `inference/output_runtime.py`：NPP Lanczos、输出 pump、编码与进度日志。
-- `inference/weights/`：仓库内置 BasicVSR++ 权重分片与 RIFE 模型压缩包。
+- `inference/weights/`：仓库内置 BasicVSR++ 权重分片与 RIFE 模型压缩包；APISR 源码/权重在运行时下载并缓存。
 - `audio/runtime.py`：FFmpeg dialogue-focused DSP、增强/原始双音轨 mux、音频旁路。
 - `audio/process.py`：`VIDEO_ENHANCE=False` 时的视频 stream-copy / 音频处理入口。
 
@@ -104,15 +108,16 @@ AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频�
 
 ### 运行时下载
 
-| 模型 / 文件 | 用途 | 下载链接 |
+| 模型 / 文件 | 用途 | 官方来源 |
 |---|---|---|
-| `realesr-animevideov3.pth` | 当前 Notebook 默认 Real-ESRGAN 动画视频超分模型，原生 4× | [Real-ESRGAN 官方 Release](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth) |
+| `4x_APISR_GRL_GAN_generator.pth` | 当前 APISR 分支唯一 SR 权重，原生 4× | APISR 官方 Release v0.1.0 |
+| APISR source commit `c0c0407ba68c0bc5026e43da05f0e7c1cf7b9b95` | 提供官方 `architecture/grl.py` 及其依赖源码 | `Kiteretsu77/APISR` 官方仓库固定 commit |
 
-当前默认流水线只需要上述模型资源。若手动修改 `MODEL` 使用其他 Real-ESRGAN 模型，程序会按代码中的官方 URL 下载对应权重；README 不重复罗列非默认模型。当前 FFmpeg 音频增强不需要额外神经网络模型或权重。
+当前 APISR 分支只暴露 `APISR_GRL`。模型权重与固定版本的 APISR 源码都在首次运行时下载并缓存；可通过 `MODEL_PATH` 指定本地权重，通过 `APISR_SOURCE_DIR` 指定本地 APISR 源码目录。
 
 ## 编码
 
-v8.8 Notebook 默认：
+Notebook 默认：
 
 - `VIDEO_CODEC="av1_nvenc"`；可改为 `hevc_nvenc`
 - 两种 NVENC 共用：P7 / CQ18 / `ENCODE_GPU=0`
@@ -124,4 +129,4 @@ v8.8 Notebook 默认：
 - HEVC 位深：8-bit 推理帧输出 8-bit；10-bit 推理帧输出 10-bit
 - AV1/HEVC/H.264 编码在模型加载前执行真实 runtime probe；成品 mux 后执行 ffprobe 验证
 
-底层仍保留 H.264/软件 HEVC/CPU AV1 编码后端，用于 CLI 兼容，不在 v8.8 Notebook 暴露。
+底层仍保留 H.264/软件 HEVC/CPU AV1 编码后端，用于 CLI 兼容，不在 Notebook 暴露。

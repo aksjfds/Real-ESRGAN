@@ -2,6 +2,8 @@
 
 Current v6.x orchestration imports this module instead of reaching into private
 attributes of inference.runtime directly. Legacy implementations remain intact.
+The APISR branch installs its SR-only backend here so spawned GPU workers see
+exactly the same model registry and loader as the parent process.
 """
 
 from __future__ import annotations
@@ -13,7 +15,10 @@ from typing import Callable, Type
 import numpy as np
 
 from . import runtime as _legacy
+from .apisr_backend import install_apisr_backend
 
+
+install_apisr_backend(_legacy)
 
 MODEL_URLS = _legacy.MODEL_URLS
 VideoInfo = _legacy.VideoInfo

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified Real-ESRGAN video inference entry point."""
+"""Unified APISR video inference entry point."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from inference.run_lock import exclusive_output_run
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="BVS + RIFE + Real-ESRGAN GPU video inference.",
+        description="BVS + RIFE + APISR GRL GPU video inference.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--input", required=True, help="Input video path")
@@ -23,7 +23,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         choices=tuple(inference_runtime.MODEL_URLS),
-        default="realesr-animevideov3",
+        default="APISR_GRL",
     )
     parser.add_argument(
         "--model-path",
