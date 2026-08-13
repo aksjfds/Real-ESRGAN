@@ -117,6 +117,13 @@ class APISRBackendTests(unittest.TestCase):
             model._apisr_reconstruct_tail(torch.randn((2, 4, 11, 37)))
         self.assertEqual(model._apisr_tail_strips, 1)
 
+    def test_wrapper_disables_microbatch_after_tail_streaming(self) -> None:
+        network = TailStreamingNetwork().eval()
+        model = backend.APISRGRL(network)
+        self.assertTrue(model.sr_micro_batch_safe)
+        network._apisr_tail_strips = 3
+        self.assertFalse(model.sr_micro_batch_safe)
+
     def test_dynamic_resolution_cache_is_one_entry(self) -> None:
         backend._cached_grl_class.cache_clear()
         with mock.patch.object(backend, "_load_grl_class", return_value=FakeGRL):

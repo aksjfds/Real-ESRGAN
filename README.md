@@ -2,17 +2,17 @@
 
 ## 当前版本流水线
 
-当前 **APISR v8.14 [Dev] 🔧** 以 `master` v8.9 为完整基线，仅替换 SR 模型后端，并保留 master 的 BVS / RIFE / 调度 / shared-memory / CUDA 传输 / NPP / 编码 / 音频架构。
+当前 **APISR v8.15 [Dev] 🔧** 以 `master` v8.9 为完整基线，仅替换 SR 模型后端，并保留 master 的 BVS / RIFE / 调度 / shared-memory / CUDA 传输 / NPP / 编码 / 音频架构。
 
 ```text
 视频增强（可关闭）：
 FFmpeg 解码
-→ FFmpeg 轻度 deband（Notebook 默认 0.006，可设 0 关闭）
+→ FFmpeg 轻度 deband（Notebook 默认 0，关闭）
 → BasicVSR++ NTIRE Track 1 同分辨率时序恢复
 → Practical-RIFE 4.25 任意 timestep 插帧（可关闭）
 → APISR 4× GRL GAN full-frame 超分（4×重建尾部 OOM 时流式条带 fallback）
 → NPP Lanczos CUDA 最终倍率调整（CPU Lanczos4 fallback）
-→ NVENC（Notebook 可选 av1_nvenc / hevc_nvenc；默认 av1_nvenc）
+→ NVENC（Notebook 可选 av1_nvenc / hevc_nvenc；默认 hevc_nvenc）
 → ffprobe 成品验证（codec / profile / 位深 / 分辨率 / FPS / 音轨）
 
 音频增强（可关闭，默认开启 FFmpeg 版本）：
@@ -29,7 +29,7 @@ FFmpeg 解码
    → Audio 2: Original，原音轨
 ```
 
-`DEBAND_STRENGTH=0` 时不执行 deband；Notebook 默认 `0.006`，只在 FFmpeg 解码后、BasicVSR++ 前处理。CLI 默认仍为 `0`，保持旧调用兼容。
+`DEBAND_STRENGTH=0` 时不执行 deband；Notebook 与 CLI 当前默认均为 `0`。需要时可显式设置非零阈值，在 FFmpeg 解码后、BasicVSR++ 前处理。
 
 v8.9 的 `ClipSource` 使用单槽有界异步预取：后台线程提前执行下一次 FFmpeg 读帧、scene signature 与 BVS clip 组装，`Queue(maxsize=1)` 只缓存 1 个待调度 clip；不改变帧顺序、scene-cut 判定、BVS/RIFE/SR 数学路径或编码参数。
 
@@ -39,7 +39,7 @@ APISR 官方 **v0.1.0 4× GRL GAN** 权重直接存放在仓库 `inference/weigh
 
 APISR v0.1.0 上游 GRL 使用通用顶层包名 `architecture.*`，且其源码会修改 `sys.path`。本分支在导入前保存并在导入后完整恢复 `sys.path` 与 `architecture.*` 的 `sys.modules` 状态，避免第三方源码 import side effect 泄漏到主运行时。
 
-SR worker 在发送 `WorkerReady` 前执行一次**完整 batch=1 SR startup probe**。APISR 始终以完整原始帧运行 GRL Transformer 主干；若官方 `nearest+conv` 的第二级 2× 上采样重建尾部发生真实 CUDA OOM，仅将已经完成主干后的 2× 64-channel feature 沿较长边流式分条执行 `nearest → conv_up2 → conv_hr → conv_last`，不重新计算 Transformer、不降低 1080p 输入分辨率。尾部连续 3 个 3×3 Conv 的 4×输出感受半径为 3 px，因此每条在 2× feature 上保留精确覆盖所需的 2 px halo，只写回 core；fallback 从 2 条开始，仍 OOM 才递增并在该 worker 保持已通过的最小条数。batch>1 OOM 继续由既有 micro-batch→batch=1 路径处理。NPP、D2H/shared-memory 和最终倍率调整不变。
+SR worker 在发送 `WorkerReady` 前执行一次**完整 batch=1 SR startup probe**。APISR 始终以完整原始帧运行 GRL Transformer 主干；若官方 `nearest+conv` 的第二级 2× 上采样重建尾部发生真实 CUDA OOM，仅将已经完成主干后的 2× 64-channel feature 沿较长边流式分条执行 `nearest → conv_up2 → conv_hr → conv_last`，不重新计算 Transformer、不降低 1080p 输入分辨率。尾部连续 3 个 3×3 Conv 的 4×输出感受半径为 3 px，因此每条在 2× feature 上保留精确覆盖所需的 2 px halo，只写回 core；fallback 从 2 条开始，仍 OOM 才递增并在该 worker 保持已通过的最小条数。startup probe 若已经启用 reconstruction-tail streaming，会直接把该 SR worker 固定为 batch=1，避免再尝试已知高风险的 batch=2。其他情况下若运行期 micro-batch OOM，会先退出异常处理作用域、回收 traceback/失败张量并清理未使用 CUDA cache，再重试 batch=1。NPP、D2H/shared-memory 和最终倍率调整不变。
 
 8-bit 始终使用 CUDA micro-batch 路径。10-bit 会先执行真实 CUDA `uint16` capability probe；只有当前 PyTorch/CUDA 组合确实支持所需 H2D / float conversion / uint16 quantize / D2H 时才启用 uint16 CUDA fast path，否则自动使用稳定的 FP32 GPU 推理 + CPU uint16 输出 fallback。支持 fast path 时，最终倍率调整优先调用 NPP `nppiResize_16u_C3R_Ctx`；NPP 不可用或运行失败时回退 CPU Lanczos4。SR micro-batch OOM 时只将对应 worker 锁定到 batch=1。
 
@@ -70,6 +70,7 @@ APISR 的基准是当前 `master`。静态审计只把以下两类内容视为 A
 
 ## 版本历史
 
+- **APISR v8.15 [Dev] 🔧**：修复运行期 `micro-batch=2` OOM 后立即在同一 `except` 栈内重试 batch=1 导致失败 batch traceback/locals 仍占用显存的问题；OOM fallback 现在先退出异常处理作用域，再 GC + `empty_cache()` 后执行 batch=1。若 startup probe 已因 1080p T4 显存压力启用 reconstruction-tail streaming，则直接将该 worker 固定 batch=1，避免无意义的 batch=2 OOM。同步 Notebook 当前 deband=0、RIFE=0、HEVC 默认配置说明。
 - **APISR v8.14 [Dev] 🔧**：修复 1920×1080 FP32 GRL 在约 15 GB GPU 上于 `conv_up2` 申请约 7.9 GiB 导致的 startup OOM。完整 Transformer 主干仍只计算一次；仅对已经生成的 2× reconstruction feature 自适应流式执行 4× `nearest+conv` 尾部，2 px feature halo 精确覆盖尾部 3 个 3×3 Conv 的边界依赖。启动 probe 自动选出能通过的最少条数并复用；不降采样输入、不改 master 调度/transport/NPP，也不把整网按 tile 重算。
 - **APISR v8.13 [Dev] 🔧**：将官方 v0.1.0 `4x_APISR_GRL_GAN_generator.pth`（6,479,400 bytes，SHA256 `56fff250139563dea59c4ca81af19cc098d94dc3abaad23640f14cec488e5da1`）直接纳入 `inference/weights/`；默认模型路径读取仓库内置权重并在启动前强校验，不再运行时下载 APISR 模型权重；保留 `--model-path` 覆盖与 APISR 源码固定版本缓存。
 - **APISR v8.12 [Dev] 🔧**：完成文件/目录结构清理：Kaggle Notebook 由 `realesrgan.ipynb` 统一命名为 `apisr.ipynb`；BasicVSR++ 分片 checkpoint 模块改为职责明确的 `basicvsrpp_checkpoint.py`；根入口直接使用 `scheduler.py`；删除已退出 active path 的旧 `pipeline` / `balanced_pipeline` / `progress_log`、v5.1/v5.4 runtime 兼容层、`v52_scheduler.py`、`stable_gpu_transport.py` 以及 master 专用 banding debug Notebook。不重排当前 active runtime 子目录，不改变推理数学路径或性能关键路径。

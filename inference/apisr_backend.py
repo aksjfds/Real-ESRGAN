@@ -656,9 +656,15 @@ class APISRGRL(torch.nn.Module):
         super().__init__()
         self.network = network
 
+    @property
+    def sr_micro_batch_safe(self) -> bool:
+        # If batch=1 already needs reconstruction-tail streaming, trying BCHW=2
+        # only creates a predictable high-memory failure in the transformer body.
+        return int(getattr(self.network, "_apisr_tail_strips", 1)) <= 1
+
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         # GRL owns padding/cropping and supports BCHW batches. Keeping the batch
-        # intact preserves the master's SR micro-batch fast path.
+        # intact preserves the master's SR micro-batch fast path when memory allows.
         return self.network(value)
 
 

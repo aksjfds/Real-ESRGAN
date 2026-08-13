@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gc
+
 from dataclasses import dataclass
 from typing import Callable, cast
 
@@ -51,6 +53,12 @@ class WorkerContext:
     npp_active_logged: bool = False
     sr_micro_batch_enabled: bool = True
     sr_uint16_cuda_enabled: bool = True
+
+
+def _release_cuda_after_oom() -> None:
+    """Collect failed-op traceback cycles before releasing CUDA cache."""
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def _notify_compute_done(context: WorkerContext) -> None:
@@ -472,6 +480,16 @@ def probe_sr_worker(context: WorkerContext) -> None:
     finally:
         torch.cuda.empty_cache()
 
+    if context.sr_micro_batch_enabled and not bool(
+        getattr(context.sr_model, "sr_micro_batch_safe", True)
+    ):
+        context.sr_micro_batch_enabled = False
+        print(
+            f"[sr] {context.device} startup probe selected memory-constrained "
+            "SR mode; locking this worker to batch=1",
+            flush=True,
+        )
+
     resize_needed = (
         int(context.sr_output_view.shape[1]) != int(sample.shape[0]) * 4
         or int(context.sr_output_view.shape[2]) != int(sample.shape[1]) * 4
@@ -515,6 +533,7 @@ def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
     if dtype == np.dtype(np.uint16) and not context.sr_uint16_cuda_enabled:
         _run_sr_cpu_output_fallback(context, frames, output_slots)
     elif len(frames) > 1 and context.sr_micro_batch_enabled:
+        micro_batch_oom = False
         try:
             result_cuda = infer_cuda_batch(
                 context.sr_model,
@@ -523,14 +542,10 @@ def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
                 h2d_stager=_require_h2d_stager(context),
             )
         except torch.cuda.OutOfMemoryError:
+            # Do not retry while the active exception still owns its traceback:
+            # failed infer locals can remain live until the except suite exits.
             context.sr_micro_batch_enabled = False
-            torch.cuda.empty_cache()
-            print(
-                f"[sr] {context.device} micro-batch={len(frames)} OOM; "
-                "locking this worker to batch=1 fallback",
-                flush=True,
-            )
-            _run_sr_sequential_fallback(context, frames, output_slots)
+            micro_batch_oom = True
         else:
             _store_sr_cuda_batch(
                 context,
@@ -539,9 +554,21 @@ def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
                 publish_boundary=True,
             )
             del result_cuda
+
+        if micro_batch_oom:
+            # We are now outside the except suite. Collect traceback cycles first,
+            # then release only genuinely unused CUDA cache before batch=1 retry.
+            _release_cuda_after_oom()
+            print(
+                f"[sr] {context.device} micro-batch={len(frames)} OOM; "
+                "locking this worker to batch=1 fallback",
+                flush=True,
+            )
+            _run_sr_sequential_fallback(context, frames, output_slots)
     elif len(frames) > 1:
         _run_sr_sequential_fallback(context, frames, output_slots)
     else:
+        uint16_batch1_oom = False
         try:
             result_cuda = infer_cuda_batch(
                 context.sr_model,
@@ -560,7 +587,10 @@ def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
             if dtype != np.dtype(np.uint16):
                 raise
             context.sr_uint16_cuda_enabled = False
-            torch.cuda.empty_cache()
+            uint16_batch1_oom = True
+
+        if uint16_batch1_oom:
+            _release_cuda_after_oom()
             print(
                 f"[sr] {context.device} 10-bit CUDA batch=1 OOM after startup; "
                 "switching this worker to stable CPU-output fallback",
