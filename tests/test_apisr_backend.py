@@ -30,6 +30,27 @@ class CountingNetwork(torch.nn.Module):
         return value
 
 
+class TailStreamingNetwork(backend._APISRReconstructionTailMixin, torch.nn.Module):
+    def __init__(self, *, oom_width: int | None = None) -> None:
+        torch.nn.Module.__init__(self)
+        self.conv_up2 = torch.nn.Conv2d(4, 4, 3, 1, 1)
+        self.conv_hr = torch.nn.Conv2d(4, 4, 3, 1, 1)
+        self.conv_last = torch.nn.Conv2d(4, 3, 3, 1, 1)
+        self.lrelu = torch.nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        self._oom_width = oom_width
+        self._apisr_init_tail_stream()
+        if oom_width is not None:
+            original = self.conv_up2
+
+            class OOMConv(torch.nn.Module):
+                def forward(inner_self, value: torch.Tensor) -> torch.Tensor:
+                    if int(value.shape[-1]) > int(oom_width):
+                        raise torch.cuda.OutOfMemoryError("synthetic reconstruction-tail OOM")
+                    return original(value)
+
+            self.conv_up2 = OOMConv()
+
+
 class FakeGRL(torch.nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
@@ -68,6 +89,34 @@ class APISRBackendTests(unittest.TestCase):
         self.assertEqual(network.calls, 1)
         self.assertEqual(tuple(output.shape), tuple(value.shape))
 
+    def test_reconstruction_tail_streaming_is_exact(self) -> None:
+        torch.manual_seed(17)
+        model = TailStreamingNetwork().eval()
+        for shape in ((1, 4, 11, 37), (2, 4, 31, 20), (1, 4, 17, 17)):
+            value = torch.randn(shape)
+            reference = model._apisr_full_reconstruction_tail(value)
+            for strips in (2, 3, 4, 7):
+                model._apisr_tail_shape = (int(shape[-2]), int(shape[-1]))
+                model._apisr_tail_strips = strips
+                actual = model._apisr_streamed_reconstruction_tail(value)
+                self.assertTrue(torch.equal(reference, actual))
+
+    def test_batch1_tail_oom_selects_minimal_persistent_strips(self) -> None:
+        model = TailStreamingNetwork(oom_width=50).eval()
+        value = torch.randn((1, 4, 11, 37))
+        output = model._apisr_reconstruct_tail(value)
+        self.assertEqual(tuple(output.shape), (1, 3, 22, 74))
+        self.assertEqual(model._apisr_tail_strips, 2)
+        second = model._apisr_reconstruct_tail(value)
+        self.assertEqual(model._apisr_tail_strips, 2)
+        self.assertTrue(torch.equal(output, second))
+
+    def test_batch2_tail_oom_remains_microbatch_responsibility(self) -> None:
+        model = TailStreamingNetwork(oom_width=50).eval()
+        with self.assertRaises(torch.cuda.OutOfMemoryError):
+            model._apisr_reconstruct_tail(torch.randn((2, 4, 11, 37)))
+        self.assertEqual(model._apisr_tail_strips, 1)
+
     def test_dynamic_resolution_cache_is_one_entry(self) -> None:
         backend._cached_grl_class.cache_clear()
         with mock.patch.object(backend, "_load_grl_class", return_value=FakeGRL):
@@ -92,6 +141,8 @@ class APISRBackendTests(unittest.TestCase):
         self.assertGreaterEqual(len(backend.APISR_SOURCE_BLOBS), 10)
         self.assertGreater(backend.APISR_SOURCE_ARCHIVE_MAX_BYTES, 0)
         self.assertFalse(backend.SR_MATMUL_TF32)
+        self.assertEqual(backend.APISR_TAIL_HALO, 2)
+        self.assertGreaterEqual(backend.APISR_TAIL_MAX_STRIPS, 2)
 
     def test_bundled_official_weight_is_present_and_valid(self) -> None:
         path = backend._bundled_official_weight()

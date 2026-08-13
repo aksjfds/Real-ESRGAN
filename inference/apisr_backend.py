@@ -44,6 +44,8 @@ APISR_DOWNLOAD_RETRIES = 3
 APISR_SOURCE_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024
 APISR_SOURCE_MAX_FILE_BYTES = 2 * 1024 * 1024
 SR_MATMUL_TF32 = False
+APISR_TAIL_HALO = 2
+APISR_TAIL_MAX_STRIPS = 16
 MODEL_URLS = {APISR_MODEL_NAME: (APISR_WEIGHT_URL,)}
 
 # Git blob IDs from the APISR v0.1.0 source commit. Validate the complete GRL
@@ -391,17 +393,196 @@ def _load_grl_class() -> type[torch.nn.Module]:
     return grl
 
 
+class _APISRReconstructionTailMixin:
+    """Stream only GRL's 4x reconstruction tail after the full transformer body."""
+
+    def _apisr_init_tail_stream(self) -> None:
+        self._apisr_tail_shape: tuple[int, int] | None = None
+        self._apisr_tail_strips = 1
+        self._apisr_tail_active_logged = False
+
+    @staticmethod
+    def _apisr_tail_boundaries(length: int, strips: int) -> tuple[int, ...]:
+        length = int(length)
+        strips = int(strips)
+        if length <= 0 or strips <= 0:
+            raise ValueError("APISR reconstruction-tail geometry must be positive")
+        if strips > length:
+            raise ValueError("APISR reconstruction-tail strip count exceeds extent")
+        return tuple((length * index) // strips for index in range(strips)) + (length,)
+
+    def _apisr_reset_tail_stream(self, shape: tuple[int, int]) -> None:
+        self._apisr_tail_shape = (int(shape[0]), int(shape[1]))
+        self._apisr_tail_strips = 1
+        self._apisr_tail_active_logged = False
+
+    def _apisr_advance_tail_stream(self, height: int, width: int) -> int | None:
+        shape = (int(height), int(width))
+        if self._apisr_tail_shape != shape:
+            self._apisr_reset_tail_stream(shape)
+        maximum = min(APISR_TAIL_MAX_STRIPS, max(shape))
+        if self._apisr_tail_strips >= maximum:
+            return None
+        self._apisr_tail_strips += 1
+        self._apisr_tail_active_logged = False
+        return self._apisr_tail_strips
+
+    def _apisr_tail_description(self) -> str:
+        if self._apisr_tail_shape is None or self._apisr_tail_strips <= 1:
+            return "full-tail"
+        height, width = self._apisr_tail_shape
+        axis_name = "width" if width >= height else "height"
+        return (
+            f"{axis_name} strips={self._apisr_tail_strips} | "
+            f"feature={width}x{height} | halo={APISR_TAIL_HALO}"
+        )
+
+    def _apisr_full_reconstruction_tail(self, value: torch.Tensor) -> torch.Tensor:
+        value = self.lrelu(
+            self.conv_up2(
+                torch.nn.functional.interpolate(
+                    value,
+                    scale_factor=2,
+                    mode="nearest",
+                )
+            )
+        )
+        return self.conv_last(self.lrelu(self.conv_hr(value)))
+
+    def _apisr_streamed_reconstruction_tail(
+        self,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        height = int(value.shape[-2])
+        width = int(value.shape[-1])
+        axis = 3 if width >= height else 2
+        length = width if axis == 3 else height
+        boundaries = self._apisr_tail_boundaries(length, self._apisr_tail_strips)
+        output: torch.Tensor | None = None
+
+        for core_start, core_end in zip(boundaries, boundaries[1:]):
+            tile_start = max(0, core_start - APISR_TAIL_HALO)
+            tile_end = min(length, core_end + APISR_TAIL_HALO)
+            if axis == 3:
+                tile = value[..., tile_start:tile_end]
+            else:
+                tile = value[..., tile_start:tile_end, :]
+
+            tile = torch.nn.functional.interpolate(
+                tile,
+                scale_factor=2,
+                mode="nearest",
+            )
+            tile = self.lrelu(self.conv_up2(tile))
+            tile = self.lrelu(self.conv_hr(tile))
+            tile = self.conv_last(tile)
+
+            if output is None:
+                output = tile.new_empty(
+                    (
+                        int(value.shape[0]),
+                        int(tile.shape[1]),
+                        height * 2,
+                        width * 2,
+                    )
+                )
+
+            source_start = (core_start - tile_start) * 2
+            source_end = (core_end - tile_start) * 2
+            if axis == 3:
+                output[..., core_start * 2 : core_end * 2] = tile[
+                    ..., source_start:source_end
+                ]
+            else:
+                output[..., core_start * 2 : core_end * 2, :] = tile[
+                    ..., source_start:source_end, :
+                ]
+            del tile
+
+        if output is None:
+            raise RuntimeError("APISR reconstruction-tail streaming produced no output")
+        return output
+
+    def _apisr_reconstruct_tail(self, value: torch.Tensor) -> torch.Tensor:
+        shape = (int(value.shape[-2]), int(value.shape[-1]))
+        if self._apisr_tail_shape != shape:
+            self._apisr_reset_tail_stream(shape)
+
+        while True:
+            try:
+                if self._apisr_tail_strips > 1:
+                    output = self._apisr_streamed_reconstruction_tail(value)
+                    if not self._apisr_tail_active_logged:
+                        self._apisr_tail_active_logged = True
+                        print(
+                            f"[APISR] {value.device} reconstruction-tail streaming active | "
+                            f"{self._apisr_tail_description()}",
+                            flush=True,
+                        )
+                    return output
+                return self._apisr_full_reconstruction_tail(value)
+            except torch.cuda.OutOfMemoryError:
+                # Startup probes batch=1 first, so a real single-frame tail OOM
+                # selects the smallest persistent strip count. Batch>1 OOM stays
+                # owned by the master's existing micro-batch -> batch=1 fallback.
+                if int(value.shape[0]) != 1:
+                    raise
+                strips = self._apisr_advance_tail_stream(*shape)
+                if strips is None:
+                    raise
+                # The failed full/tiled temporary is now unreferenced. Releasing
+                # only cached blocks here is useful; live model/body tensors stay.
+                if value.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                print(
+                    f"[APISR] {value.device} reconstruction-tail OOM; retrying "
+                    f"full-resolution SR with {self._apisr_tail_description()}",
+                    flush=True,
+                )
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        if self.upsampler != "nearest+conv" or int(self.upscale) != 4:
+            return super().forward(value)
+
+        original_h, original_w = value.shape[2:]
+        value = self.check_image_size(value)
+        self.mean = self.mean.type_as(value)
+        value = (value - self.mean) * self.img_range
+
+        value = self.conv_first(value)
+        value = self.conv_after_body(self.forward_features(value)) + value
+        value = self.conv_before_upsample(value)
+        value = self.lrelu(
+            self.conv_up1(
+                torch.nn.functional.interpolate(
+                    value,
+                    scale_factor=2,
+                    mode="nearest",
+                )
+            )
+        )
+        value = self._apisr_reconstruct_tail(value)
+        value = value / self.img_range + self.mean
+        return value[
+            :,
+            :,
+            : original_h * self.upscale,
+            : original_w * self.upscale,
+        ]
+
+
 @lru_cache(maxsize=1)
 def _cached_grl_class() -> type[torch.nn.Module]:
     grl = _load_grl_class()
 
-    class CachedGRL(grl):  # type: ignore[misc, valid-type]
+    class CachedGRL(_APISRReconstructionTailMixin, grl):  # type: ignore[misc, valid-type]
         """Official GRL with one-entry dynamic-resolution table/mask cache."""
 
         def __init__(self, *args, **kwargs) -> None:
             super().__init__(*args, **kwargs)
             self._apisr_cache_key: tuple[int, int, str] | None = None
             self._apisr_cache_value: dict[str, torch.Tensor] | None = None
+            self._apisr_init_tail_stream()
 
         def get_table_index_mask(self, device=None, input_resolution=None):
             if input_resolution == self.input_resolution or input_resolution is None:
@@ -529,6 +710,8 @@ __all__ = [
     "APISR_MODEL_NAME",
     "APISR_NATIVE_SCALE",
     "APISR_SOURCE_COMMIT",
+    "APISR_TAIL_HALO",
+    "APISR_TAIL_MAX_STRIPS",
     "APISR_WEIGHT_FILENAME",
     "APISR_WEIGHT_SHA256",
     "APISR_WEIGHT_URL",
