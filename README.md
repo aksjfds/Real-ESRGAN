@@ -2,7 +2,7 @@
 
 ## 当前版本流水线
 
-当前 **APISR v8.9 [Dev] 🔧** 以 `master` v8.9 为完整基线，仅替换 SR 模型后端，并保留 master 的 BVS / RIFE / 调度 / shared-memory / CUDA 传输 / NPP / 编码 / 音频架构。
+当前 **APISR v8.10 [Dev] 🔧** 以 `master` v8.9 为完整基线，仅替换 SR 模型后端，并保留 master 的 BVS / RIFE / 调度 / shared-memory / CUDA 传输 / NPP / 编码 / 音频架构。
 
 ```text
 视频增强（可关闭）：
@@ -33,13 +33,15 @@ FFmpeg 解码
 
 v8.9 的 `ClipSource` 使用单槽有界异步预取：后台线程提前执行下一次 FFmpeg 读帧、scene signature 与 BVS clip 组装，`Queue(maxsize=1)` 只缓存 1 个待调度 clip；不改变帧顺序、scene-cut 判定、BVS/RIFE/SR 数学路径或编码参数。
 
-APISR 分支使用官方 **v0.1.0 4× GRL GAN** 权重，并固定到该 Release 对应源码 commit `fabe8332413bc7f4024e6db39141c68692e88ea5`。官方 APISR 对 GRL 的 FP16 推理仍注明存在问题，因此 SR 模型固定使用 FP32。
+APISR 分支使用官方 **v0.1.0 4× GRL GAN** 权重，并固定到该 Release 对应源码 commit `fabe8332413bc7f4024e6db39141c68692e88ea5`。GRL 按官方限制继续使用 FP32；SR worker 的 FP32 matmul 使用 IEEE 精度，不强制启用 TF32，cuDNN convolution 仍允许 TF32 以保留卷积性能。
 
-APISR 首次运行会把源码和权重缓存到 `~/.cache/realesrgan/apisr/`：源码按 Git blob manifest 校验，官方权重按大小和 SHA256 校验；POSIX 下使用独立 cache file lock，避免多进程首次启动时竞争写入。可用 `APISR_CACHE_DIR` 改缓存根目录；`APISR_SOURCE_DIR` 可显式指定本地 APISR 源码覆盖。
+APISR 首次运行会把源码和权重缓存到 `~/.cache/realesrgan/apisr/`。源码只提取 GRL 推理实际需要的文件，并按 Git blob manifest 校验；官方权重按大小和 SHA256 校验；下载使用有限超时/重试；POSIX 下使用独立 cache file lock，避免多进程首次启动时竞争写入。可用 `APISR_CACHE_DIR` 改缓存根目录；`APISR_SOURCE_DIR` 可显式指定本地 APISR 源码覆盖。
 
-SR worker 在发送 `WorkerReady` 前，会对实际输入分辨率执行一次 full-frame、batch=1 GRL warmup：用于提前发现显存不足并预热 GRL 动态 resolution table/mask cache。不会自动缩小输入或静默改为 tile，以避免改变数学路径。
+APISR v0.1.0 上游 `grl.py` 会自行修改 `sys.path`。本分支在导入前保存完整 `sys.path` 快照并在导入后完整恢复，避免第三方源码 import side effect 泄漏到主运行时。
 
-8-bit 与 10-bit SR 都使用 CUDA micro-batch 路径。10-bit 最终倍率调整优先调用 NPP `nppiResize_16u_C3R_Ctx`；NPP 不可用或运行失败时仍回退 CPU Lanczos4。SR micro-batch OOM 时只将对应 worker 锁定到 batch=1；batch=1 full-frame OOM 会在 worker 启动 warmup 阶段直接失败。
+SR worker 在发送 `WorkerReady` 前会执行一次**完整 batch=1 SR startup probe**：实际经过 shared input → H2D → GRL → 输出量化 → 必要的 NPP/CPU Lanczos → D2H/shared output。这样会在视频处理开始前验证 full-frame 显存、真实输出尺寸、NPP 路径、D2H/shared-memory 路径，并预热 GRL 动态 resolution table/mask cache。不会自动缩小输入或静默切 tile，以避免改变数学路径。
+
+8-bit 始终使用 CUDA micro-batch 路径。10-bit 会先执行真实 CUDA `uint16` capability probe；只有当前 PyTorch/CUDA 组合确实支持所需 H2D / float conversion / uint16 quantize / D2H 时才启用 uint16 CUDA fast path，否则自动使用稳定的 FP32 GPU 推理 + CPU uint16 输出 fallback。支持 fast path 时，最终倍率调整优先调用 NPP `nppiResize_16u_C3R_Ctx`；NPP 不可用或运行失败时回退 CPU Lanczos4。SR micro-batch OOM 时只将对应 worker 锁定到 batch=1。
 
 `AUDIO_ENHANCE=False` 时不执行 DSP，只保留原音轨并优先 stream copy。
 
@@ -55,7 +57,8 @@ SR worker 在发送 `WorkerReady` 前，会对实际输入分辨率执行一次 
 
 ## 版本历史
 
-- **APISR v8.9 [Dev] 🔧**：以 `master` v8.9 为完整基线，将 Real-ESRGAN SR 后端替换为 APISR 4× GRL GAN；后续补齐真正 BCHW micro-batch、GRL 动态 resolution table/mask 单槽缓存、显式 SR backend 边界、v0.1.0 源码/权重一致性与完整性校验、并发 cache lock、实际尺寸 batch=1 warmup，以及 uint16 CUDA/NPP SR 路径；GRL 继续使用 FP32。
+- **APISR v8.10 [Dev] 🔧**：在 v8.9 APISR backend 基础上完成运行边界收口：完整 SR startup probe 取代 model-only warmup；10-bit CUDA `uint16` 改为 capability-gated fast path 并提供稳定 fallback；`frame_transport` 泛化为 uint8/uint16 共用路径，删除 APISR handler 重复 transport；APISR FP32 matmul 恢复 IEEE 语义；完整恢复第三方源码 import 前后的 `sys.path`；下载增加超时/重试并只安全提取 pinned GRL runtime 文件；Notebook 默认执行 CPU 回归测试。
+- **APISR v8.9 [Dev] 🔧**：以 `master` v8.9 为完整基线，将 Real-ESRGAN SR 后端替换为 APISR 4× GRL GAN；补齐真正 BCHW micro-batch、GRL 动态 resolution table/mask 单槽缓存、显式 SR backend 边界、v0.1.0 源码/权重一致性与完整性校验、并发 cache lock 和 uint16 CUDA/NPP 初始路径；GRL 使用 FP32。
 - **v8.9 [Dev] 🔧**：`ClipSource` 增加单槽有界异步预取；后台线程在当前 GPU 任务执行期间提前完成下一 BVS clip 的 FFmpeg 读帧、scene signature 与组帧，`Queue(maxsize=1)` 提供背压并限制额外内存，不改变视频处理数学路径与输出顺序。
 - **v8.8 [Dev] 🔧**：修复编码配置/日志一致性；AV1 VBR/CBR/CONSTQP 参数语义、源位深 runtime probe、最终 ffprobe 验证、NVENC AQ 配置等统一。
 - **v8.7 [Dev] 🔧**：Notebook 恢复 `hevc_nvenc`，与 `av1_nvenc` 二选一；继续默认 AV1。
@@ -81,23 +84,23 @@ SR worker 在发送 `WorkerReady` 前，会对实际输入分辨率执行一次 
 
 ## 当前结构
 
-- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），默认 `MODEL="APISR_GRL"`。
+- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），默认 `MODEL="APISR_GRL"`，环境单元执行 APISR CPU 回归测试。
 - `inference.py`：视频增强 CLI 与总入口。
-- `inference/apisr_backend.py`：APISR v0.1.0 GRL 注册、源码/权重缓存、完整性校验、FP32 模型加载、resolution cache 与 warmup。
+- `inference/apisr_backend.py`：APISR v0.1.0 GRL 注册、最小源码/权重缓存、完整性校验、FP32 模型加载与 resolution cache。
 - `inference/scheduler.py`：CPU 总编排、编码 fail-fast probe、最终音频边界与成品验证。
 - `inference/clip_source.py`：CPU scene-aware BVS clip 组装与单槽预取。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：调度状态、任务策略、结果处理与 watchdog。
 - `inference/task_protocol.py` / `worker_protocols.py`：BVS/RIFE/SR typed task/result 与 worker API。
-- `inference/gpu_transport.py` / `gpu_workers.py` / `gpu_worker_process.py`：常驻 GPU workers、shared memory、FrameHandle 与进程生命周期。
-- `inference/frame_transport.py`：`cudaHostRegister`、pinned fallback、异步 H2D/D2H 与 copy stream。
+- `inference/gpu_transport.py` / `gpu_workers.py` / `gpu_worker_process.py`：常驻 GPU workers、shared memory、FrameHandle、SR startup probe 与进程生命周期。
+- `inference/frame_transport.py`：`cudaHostRegister`、pinned fallback、uint8/uint16 异步 H2D/D2H 与 copy stream。
 - `inference/bvs_runtime.py` / `optimized_basicvsrpp.py`：BasicVSR++ runtime。
 - `inference/rife425.py` / `optimized_rife425.py`：Practical-RIFE 4.25 runtime。
-- `inference/sr_runtime.py`：通用 uint8/uint16 SR CUDA 输入/输出路径；APISR 使用 FP32 contiguous 模型输入。
+- `inference/sr_runtime.py`：通用 uint8/uint16 SR CUDA 路径与 CUDA uint16 capability probe；APISR 使用 FP32 contiguous 模型输入。
 - `inference/npp_resize.py`：NPP uint8/uint16 C3 Lanczos CUDA resize。
 - `inference/output_runtime.py`：输出 pump、编码与进度日志。
 - `audio/runtime.py`：FFmpeg dialogue-focused DSP、增强/原始双音轨 mux、音频旁路。
 - `audio/process.py`：`VIDEO_ENHANCE=False` 时的视频 stream-copy / 音频处理入口。
-- `tests/test_apisr_backend.py`：APISR backend 的轻量 CPU 回归测试。
+- `tests/test_apisr_backend.py` / `tests/test_sr_runtime.py`：APISR backend、源码隔离/完整性、dtype capability 的轻量 CPU 回归测试。
 
 ## 模型与资源
 

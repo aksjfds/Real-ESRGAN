@@ -8,15 +8,15 @@ from typing import Callable, cast
 import numpy as np
 import torch
 
+from . import runtime_api as base
 from .frame_transport import (
-    PendingD2H,
     PinnedD2HStager,
     PinnedH2DStager,
     begin_cuda_frames_to_slots,
     copy_host_frames_to_slots,
 )
 from .npp_resize import NppLanczosResizer
-from .sr_runtime import infer_cuda_batch, infer_cuda_tensor
+from .sr_runtime import infer_cuda_batch, infer_cuda_tensor, probe_cuda_uint16
 from .task_protocol import (
     BVSResult,
     BVSTask,
@@ -50,6 +50,7 @@ class WorkerContext:
     npp_checked: bool = False
     npp_active_logged: bool = False
     sr_micro_batch_enabled: bool = True
+    sr_uint16_cuda_enabled: bool = True
 
 
 def _notify_compute_done(context: WorkerContext) -> None:
@@ -277,63 +278,6 @@ def _cpu_resize_sr_batch(
         np.copyto(output_view[int(slot)], resized, casting="no")
 
 
-def _begin_sr_cuda_frames_to_slots(
-    frames: torch.Tensor,
-    output_view: np.ndarray,
-    slots: tuple[int, ...],
-    stager: PinnedD2HStager,
-) -> PendingD2H | None:
-    """Use master uint8 transport; extend the same direct path to uint16 SR."""
-    if frames.dtype == torch.uint8:
-        return begin_cuda_frames_to_slots(frames, output_view, slots, stager)
-    if frames.dtype != torch.uint16:
-        raise TypeError(f"SR transport supports uint8/uint16, got {frames.dtype}")
-    if frames.device.type != "cuda" or frames.ndim != 4 or not frames.is_contiguous():
-        raise RuntimeError("uint16 SR transport requires contiguous CUDA [N,H,W,C]")
-    if np.dtype(output_view.dtype) != np.dtype(np.uint16):
-        raise TypeError(
-            f"uint16 SR output requires uint16 shared pool, got {output_view.dtype}"
-        )
-
-    slot_ids = tuple(int(slot) for slot in slots)
-    count = int(frames.shape[0])
-    if count != len(slot_ids):
-        raise RuntimeError(
-            f"SR transport frame/slot mismatch: frames={count}, slots={len(slot_ids)}"
-        )
-    expected_shape = tuple(int(value) for value in output_view.shape[1:])
-    actual_shape = tuple(int(value) for value in frames.shape[1:])
-    if actual_shape != expected_shape:
-        raise RuntimeError(
-            f"SR transport frame shape mismatch: {actual_shape} != {expected_shape}"
-        )
-    if len(set(slot_ids)) != len(slot_ids):
-        raise RuntimeError("SR transport received duplicate output slots")
-    for slot in slot_ids:
-        if slot < 0 or slot >= int(output_view.shape[0]):
-            raise RuntimeError(
-                f"SR transport output slot out of range: {slot}/{output_view.shape[0]}"
-            )
-    if count == 0:
-        return None
-
-    first = slot_ids[0]
-    contiguous = slot_ids == tuple(range(first, first + count))
-    if contiguous:
-        return stager.begin_copy(
-            frames,
-            target=output_view[first : first + count],
-        )
-    return stager.begin_copy(
-        frames,
-        finalize=lambda array: copy_host_frames_to_slots(
-            array,
-            output_view,
-            slot_ids,
-        ),
-    )
-
-
 def _store_sr_cuda_batch(
     context: WorkerContext,
     result_cuda: torch.Tensor,
@@ -392,7 +336,7 @@ def _store_sr_cuda_batch(
             )
             return
 
-    pending = _begin_sr_cuda_frames_to_slots(
+    pending = begin_cuda_frames_to_slots(
         resized_cuda,
         context.sr_output_view,
         output_slots,
@@ -428,6 +372,122 @@ def _run_sr_sequential_fallback(
     _notify_compute_done(context)
 
 
+def _run_sr_cpu_output_fallback(
+    context: WorkerContext,
+    frames: tuple[np.ndarray, ...],
+    output_slots: tuple[int, ...],
+) -> None:
+    """Stable path that never requires eager CUDA uint16 tensors."""
+    if context.sr_model is None or context.sr_output_view is None:
+        raise RuntimeError("SR worker fallback is missing model/output storage")
+
+    import cv2
+
+    target_h = int(context.sr_output_view.shape[1])
+    target_w = int(context.sr_output_view.shape[2])
+    for frame, slot in zip(frames, output_slots):
+        result = base.infer_frame(context.sr_model, frame, context.device)
+        if result.shape[0] != target_h or result.shape[1] != target_w:
+            result = cv2.resize(
+                result,
+                (target_w, target_h),
+                interpolation=cv2.INTER_LANCZOS4,
+            )
+        np.copyto(context.sr_output_view[int(slot)], result, casting="no")
+        del result
+    _notify_compute_done(context)
+
+
+def probe_sr_worker(context: WorkerContext) -> None:
+    """Exercise the exact batch=1 SR/resize/transport path before WorkerReady."""
+    if context.sr_model is None or context.sr_output_view is None:
+        raise RuntimeError("SR startup probe requires model and shared output storage")
+    if int(context.input_view.shape[0]) < 1 or int(context.sr_output_view.shape[0]) < 1:
+        raise RuntimeError("SR startup probe requires at least one input/output slot")
+
+    dtype = np.dtype(context.dtype)
+    if dtype not in {np.dtype(np.uint8), np.dtype(np.uint16)}:
+        raise TypeError(f"SR worker supports uint8/uint16 frames, got {dtype}")
+
+    sample = context.input_view[0]
+    sample.fill(0)
+    path = "cuda"
+    uint16_detail = "not applicable"
+
+    if dtype == np.dtype(np.uint16):
+        context.sr_uint16_cuda_enabled, uint16_detail = probe_cuda_uint16(
+            context.device
+        )
+        if not context.sr_uint16_cuda_enabled:
+            path = "cpu-output-fallback"
+            print(
+                f"[sr] {context.device} CUDA uint16 fast path unavailable; "
+                f"using stable 10-bit fallback | {uint16_detail}",
+                flush=True,
+            )
+
+    try:
+        if dtype == np.dtype(np.uint16) and not context.sr_uint16_cuda_enabled:
+            _run_sr_cpu_output_fallback(context, (sample,), (0,))
+        else:
+            result_cuda = infer_cuda_batch(
+                context.sr_model,
+                (sample,),
+                context.device,
+                h2d_stager=_require_h2d_stager(context),
+            )
+            _store_sr_cuda_batch(
+                context,
+                result_cuda,
+                (0,),
+                publish_boundary=False,
+            )
+            del result_cuda
+        torch.cuda.current_stream(context.device).synchronize()
+    except torch.cuda.OutOfMemoryError as error:
+        torch.cuda.empty_cache()
+        if dtype == np.dtype(np.uint16) and context.sr_uint16_cuda_enabled:
+            context.sr_uint16_cuda_enabled = False
+            path = "cpu-output-fallback"
+            print(
+                f"[sr] {context.device} 10-bit CUDA fast path OOM at batch=1; "
+                "retrying startup probe with stable CPU-output fallback",
+                flush=True,
+            )
+            try:
+                _run_sr_cpu_output_fallback(context, (sample,), (0,))
+                torch.cuda.current_stream(context.device).synchronize()
+            except torch.cuda.OutOfMemoryError as fallback_error:
+                torch.cuda.empty_cache()
+                raise RuntimeError(
+                    "APISR full-frame batch=1 SR probe ran out of VRAM even on "
+                    f"the stable 10-bit fallback at {sample.shape[1]}x{sample.shape[0]} "
+                    f"on {context.device}."
+                ) from fallback_error
+        else:
+            raise RuntimeError(
+                "APISR full-frame batch=1 SR probe ran out of VRAM at "
+                f"{sample.shape[1]}x{sample.shape[0]} on {context.device}."
+            ) from error
+    finally:
+        torch.cuda.empty_cache()
+
+    resize_needed = (
+        int(context.sr_output_view.shape[1]) != int(sample.shape[0]) * 4
+        or int(context.sr_output_view.shape[2]) != int(sample.shape[1]) * 4
+    )
+    if resize_needed:
+        resize_path = "npp" if context.npp_resizer is not None else "cpu-lanczos"
+    else:
+        resize_path = "native-4x"
+    print(
+        f"[sr] {context.device} startup probe passed | input="
+        f"{sample.shape[1]}x{sample.shape[0]} | dtype={dtype} | "
+        f"path={path} | resize={resize_path} | batch=1",
+        flush=True,
+    )
+
+
 def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
     if context.sr_model is None:
         raise RuntimeError("SR task submitted to a worker without an SR model")
@@ -448,10 +508,13 @@ def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
             raise RuntimeError(f"SR output slot out of range: {slot}/{slot_count}")
 
     frames = tuple(resolve_frame(context, value) for value in task.frames)
-    if np.dtype(context.dtype) not in {np.dtype(np.uint8), np.dtype(np.uint16)}:
+    dtype = np.dtype(context.dtype)
+    if dtype not in {np.dtype(np.uint8), np.dtype(np.uint16)}:
         raise TypeError(f"SR worker supports uint8/uint16 frames, got {context.dtype}")
 
-    if len(frames) > 1 and context.sr_micro_batch_enabled:
+    if dtype == np.dtype(np.uint16) and not context.sr_uint16_cuda_enabled:
+        _run_sr_cpu_output_fallback(context, frames, output_slots)
+    elif len(frames) > 1 and context.sr_micro_batch_enabled:
         try:
             result_cuda = infer_cuda_batch(
                 context.sr_model,
@@ -479,19 +542,31 @@ def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
     elif len(frames) > 1:
         _run_sr_sequential_fallback(context, frames, output_slots)
     else:
-        result_cuda = infer_cuda_batch(
-            context.sr_model,
-            frames,
-            context.device,
-            h2d_stager=_require_h2d_stager(context),
-        )
-        _store_sr_cuda_batch(
-            context,
-            result_cuda,
-            output_slots,
-            publish_boundary=True,
-        )
-        del result_cuda
+        try:
+            result_cuda = infer_cuda_batch(
+                context.sr_model,
+                frames,
+                context.device,
+                h2d_stager=_require_h2d_stager(context),
+            )
+            _store_sr_cuda_batch(
+                context,
+                result_cuda,
+                output_slots,
+                publish_boundary=True,
+            )
+            del result_cuda
+        except torch.cuda.OutOfMemoryError:
+            if dtype != np.dtype(np.uint16):
+                raise
+            context.sr_uint16_cuda_enabled = False
+            torch.cuda.empty_cache()
+            print(
+                f"[sr] {context.device} 10-bit CUDA batch=1 OOM after startup; "
+                "switching this worker to stable CPU-output fallback",
+                flush=True,
+            )
+            _run_sr_cpu_output_fallback(context, frames, output_slots)
 
     return SRResult(
         frame_ids=tuple(int(value) for value in task.frame_ids),

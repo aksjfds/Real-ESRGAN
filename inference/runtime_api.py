@@ -18,8 +18,9 @@ from . import apisr_backend as sr_backend
 from . import runtime as _legacy
 
 
-MODEL_URLS = sr_backend.MODEL_URLS
+MODEL_URLS = dict(sr_backend.MODEL_URLS)
 DEFAULT_MODEL_NAME = sr_backend.DEFAULT_MODEL_NAME
+SR_MATMUL_TF32 = sr_backend.SR_MATMUL_TF32
 VideoInfo = _legacy.VideoInfo
 WorkerConfig = _legacy.WorkerConfig
 
@@ -108,7 +109,6 @@ resolve_range = _legacy.resolve_range
 parse_gpu_ids = _legacy.parse_gpu_ids
 resolve_model_paths = sr_backend.resolve_model_paths
 load_worker_model = sr_backend.load_worker_model
-warmup_worker_model = sr_backend.warmup_worker_model
 infer_frame = sr_backend.infer_frame
 mux_audio = _legacy.mux_audio
 

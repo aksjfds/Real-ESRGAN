@@ -67,7 +67,10 @@ def _library_candidates(stem: str) -> list[str]:
         Path("/usr/lib/x86_64-linux-gnu"),
     ]
     try:
-        roots.extend(Path(value) / "nvidia" / "npp" / "lib" for value in site.getsitepackages())
+        roots.extend(
+            Path(value) / "nvidia" / "npp" / "lib"
+            for value in site.getsitepackages()
+        )
     except Exception:
         pass
     for value in sys.path:
@@ -170,9 +173,12 @@ class NppLanczosResizer:
     def _resize_for_dtype(self, dtype: torch.dtype):
         if dtype == torch.uint8:
             return self._resize_8u, "nppiResize_8u_C3R_Ctx"
-        if dtype == torch.uint16:
+        uint16 = getattr(torch, "uint16", None)
+        if isinstance(uint16, torch.dtype) and dtype == uint16:
             if self._resize_16u is None:
-                raise RuntimeError("NPP library does not expose nppiResize_16u_C3R_Ctx")
+                raise RuntimeError(
+                    "NPP library does not expose nppiResize_16u_C3R_Ctx"
+                )
             return self._resize_16u, "nppiResize_16u_C3R_Ctx"
         raise TypeError(f"NPP resize supports uint8/uint16, got {dtype}")
 

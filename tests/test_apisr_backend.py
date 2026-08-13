@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
+import zipfile
 
 import torch
 
@@ -37,6 +41,10 @@ class FakeGRL(torch.nn.Module):
 
 
 class APISRBackendTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        backend._load_grl_class.cache_clear()
+        backend._cached_grl_class.cache_clear()
+
     def test_wrapper_preserves_batch(self) -> None:
         network = CountingNetwork()
         model = backend.APISRGRL(network)
@@ -46,6 +54,7 @@ class APISRBackendTests(unittest.TestCase):
         self.assertEqual(tuple(output.shape), tuple(value.shape))
 
     def test_dynamic_resolution_cache_is_one_entry(self) -> None:
+        backend._cached_grl_class.cache_clear()
         with mock.patch.object(backend, "_load_grl_class", return_value=FakeGRL):
             cached_type = backend._cached_grl_class()
         model = cached_type()
@@ -65,6 +74,71 @@ class APISRBackendTests(unittest.TestCase):
         self.assertEqual(len(backend.APISR_WEIGHT_SHA256), 64)
         self.assertIn("architecture/grl.py", backend.APISR_SOURCE_BLOBS)
         self.assertGreaterEqual(len(backend.APISR_SOURCE_BLOBS), 10)
+        self.assertFalse(backend.SR_MATMUL_TF32)
+
+    def test_pinned_source_validation_rejects_changed_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            for relative in backend.APISR_SOURCE_BLOBS:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"placeholder")
+
+            def fake_blob_sha(path: Path) -> str:
+                relative = path.relative_to(root).as_posix()
+                if relative == "architecture/grl.py":
+                    return "0" * 40
+                return backend.APISR_SOURCE_BLOBS[relative]
+
+            with mock.patch.object(backend, "_git_blob_sha", side_effect=fake_blob_sha):
+                with self.assertRaises(RuntimeError):
+                    backend._validate_source_dir(root, require_pinned=True)
+
+    def test_grl_import_restores_entire_sys_path(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            grl_path = root / "architecture" / "grl.py"
+            grl_path.parent.mkdir(parents=True, exist_ok=True)
+            grl_path.write_text("# fake", encoding="utf-8")
+            original = list(sys.path)
+            previous_arch = sys.modules.pop("architecture", None)
+
+            def fake_import(name: str):
+                self.assertEqual(name, "architecture.grl")
+                sys.path.append("/tmp/apisr-upstream-side-effect")
+                return SimpleNamespace(__file__=str(grl_path), GRL=FakeGRL)
+
+            backend._load_grl_class.cache_clear()
+            try:
+                with mock.patch.object(backend, "_ensure_apisr_source", return_value=root):
+                    with mock.patch.object(
+                        backend.importlib,
+                        "import_module",
+                        side_effect=fake_import,
+                    ):
+                        self.assertIs(backend._load_grl_class(), FakeGRL)
+                self.assertEqual(sys.path, original)
+            finally:
+                sys.path[:] = original
+                if previous_arch is not None:
+                    sys.modules["architecture"] = previous_arch
+                else:
+                    sys.modules.pop("architecture", None)
+
+    def test_archive_extraction_ignores_unrelated_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            archive = root / "source.zip"
+            destination = root / "out"
+            prefix = f"APISR-{backend.APISR_SOURCE_COMMIT}/"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                for relative in backend.APISR_SOURCE_BLOBS:
+                    bundle.writestr(prefix + relative, b"runtime")
+                bundle.writestr(prefix + "train_code/unused.py", b"unused")
+            backend._extract_pinned_source(archive, destination)
+            for relative in backend.APISR_SOURCE_BLOBS:
+                self.assertTrue((destination / relative).is_file())
+            self.assertFalse((destination / "train_code" / "unused.py").exists())
 
 
 if __name__ == "__main__":

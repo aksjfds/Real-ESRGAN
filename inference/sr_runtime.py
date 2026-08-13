@@ -20,13 +20,66 @@ def _model_input_dtype(model: torch.nn.Module) -> torch.dtype:
         return torch.float32
 
 
+def _uint16_torch_dtype() -> torch.dtype:
+    dtype = getattr(torch, "uint16", None)
+    if not isinstance(dtype, torch.dtype):
+        raise RuntimeError(
+            "This PyTorch build does not expose torch.uint16; "
+            "use the stable 10-bit CPU-output fallback."
+        )
+    return dtype
+
+
 def _frame_output_spec(dtype: np.dtype) -> tuple[float, torch.dtype]:
     dtype = np.dtype(dtype)
     if dtype == np.dtype(np.uint8):
         return 255.0, torch.uint8
     if dtype == np.dtype(np.uint16):
-        return 65535.0, torch.uint16
+        return 65535.0, _uint16_torch_dtype()
     raise TypeError(f"SR CUDA path supports uint8/uint16, got {dtype}")
+
+
+def probe_cuda_uint16(device: torch.device) -> tuple[bool, str]:
+    """Probe the exact eager-mode uint16 primitives needed by the fast SR path."""
+    if device.type != "cuda":
+        return False, "device is not CUDA"
+    try:
+        uint16 = _uint16_torch_dtype()
+        source = np.array([0, 1, 1023, 32768, 65535], dtype=np.uint16)
+        host = torch.from_numpy(source)
+        pinned = torch.empty(
+            host.shape,
+            dtype=uint16,
+            device="cpu",
+            pin_memory=True,
+        )
+        pinned.copy_(host)
+        stream = torch.cuda.current_stream(device)
+        cuda_value = pinned.to(device, non_blocking=True)
+        restored = (
+            cuda_value.to(dtype=torch.float32)
+            .div_(65535.0)
+            .mul_(65535.0)
+            .round_()
+            .to(dtype=uint16)
+        )
+        host_out = torch.empty(
+            restored.shape,
+            dtype=uint16,
+            device="cpu",
+            pin_memory=True,
+        )
+        host_out.copy_(restored, non_blocking=True)
+        stream.synchronize()
+        if not np.array_equal(host_out.numpy(), source):
+            return False, "uint16 CUDA round-trip changed sample values"
+        return True, "uint16 CUDA H2D/cast/D2H probe passed"
+    except Exception as error:
+        try:
+            torch.cuda.current_stream(device).synchronize()
+        except Exception:
+            pass
+        return False, f"{type(error).__name__}: {error}"
 
 
 def infer_cuda_batch(

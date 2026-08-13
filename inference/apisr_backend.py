@@ -15,6 +15,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -37,6 +38,10 @@ APISR_WEIGHT_URL = (
 )
 APISR_WEIGHT_SIZE = 6_479_400
 APISR_WEIGHT_SHA256 = "56fff250139563dea59c4ca81af19cc098d94dc3abaad23640f14cec488e5da1"
+APISR_DOWNLOAD_TIMEOUT = 60.0
+APISR_DOWNLOAD_RETRIES = 3
+APISR_SOURCE_MAX_FILE_BYTES = 2 * 1024 * 1024
+SR_MATMUL_TF32 = False
 MODEL_URLS = {APISR_MODEL_NAME: (APISR_WEIGHT_URL,)}
 
 # Git blob IDs from the APISR v0.1.0 source commit. Validate the complete GRL
@@ -86,7 +91,7 @@ def _is_within(path: Path, root: Path) -> bool:
 
 @contextmanager
 def _cache_lock(name: str) -> Iterator[None]:
-    """Serialize first-use cache writes; POSIX workers may start concurrently."""
+    """Serialize first-use cache writes; production targets are POSIX/Linux."""
     lock_root = _cache_root() / "locks"
     lock_root.mkdir(parents=True, exist_ok=True)
     handle = (lock_root / f"{name}.lock").open("a+b")
@@ -106,20 +111,43 @@ def _cache_lock(name: str) -> Iterator[None]:
         handle.close()
 
 
+def _download_to(url: str, target: Path) -> None:
+    """Download with a finite timeout/retry policy into an existing temp path."""
+    last_error: Exception | None = None
+    for attempt in range(1, APISR_DOWNLOAD_RETRIES + 1):
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Real-ESRGAN-APISR-runtime"},
+            )
+            with urllib.request.urlopen(
+                request,
+                timeout=APISR_DOWNLOAD_TIMEOUT,
+            ) as response, target.open("wb") as output:
+                shutil.copyfileobj(response, output, length=1024 * 1024)
+            return
+        except Exception as error:
+            last_error = error
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if attempt < APISR_DOWNLOAD_RETRIES:
+                time.sleep(min(2.0**(attempt - 1), 4.0))
+    raise RuntimeError(
+        f"Failed to download APISR asset after {APISR_DOWNLOAD_RETRIES} attempts: {url}"
+    ) from last_error
+
+
 def _validate_source_dir(path: Path, *, require_pinned: bool) -> Path:
     path = path.expanduser().resolve()
-    grl_path = path / "architecture" / "grl.py"
-    common_root = path / "architecture" / "grl_common"
-    if not grl_path.is_file() or not common_root.is_dir():
-        raise FileNotFoundError(
-            "APISR source must contain architecture/grl.py and "
-            f"architecture/grl_common; received: {path}"
-        )
-    if require_pinned:
-        for relative, expected in APISR_SOURCE_BLOBS.items():
-            candidate = path / relative
-            if not candidate.is_file():
-                raise RuntimeError(f"Pinned APISR source file is missing: {relative}")
+    for relative, expected in APISR_SOURCE_BLOBS.items():
+        candidate = path / relative
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"APISR source is missing required GRL runtime file: {relative}"
+            )
+        if require_pinned:
             actual = _git_blob_sha(candidate)
             if actual != expected:
                 raise RuntimeError(
@@ -135,6 +163,31 @@ def _configured_source_dir() -> Path | None:
         return None
     # Explicit local override intentionally permits modified APISR source.
     return _validate_source_dir(Path(value), require_pinned=False)
+
+
+def _extract_pinned_source(archive: Path, destination: Path) -> None:
+    """Extract only the GRL runtime boundary from the pinned GitHub archive."""
+    prefix = f"APISR-{APISR_SOURCE_COMMIT}/"
+    destination.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive) as bundle:
+        for relative in APISR_SOURCE_BLOBS:
+            member_name = prefix + relative
+            try:
+                member = bundle.getinfo(member_name)
+            except KeyError as error:
+                raise RuntimeError(
+                    f"Pinned APISR archive is missing runtime source: {relative}"
+                ) from error
+            if member.is_dir() or member.file_size > APISR_SOURCE_MAX_FILE_BYTES:
+                raise RuntimeError(
+                    f"Invalid APISR archive member for runtime source: {relative}"
+                )
+            output = (destination / relative).resolve()
+            if not _is_within(output, destination):
+                raise RuntimeError(f"Unsafe APISR archive path: {relative}")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with bundle.open(member, "r") as source, output.open("wb") as target:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
 
 
 def _ensure_apisr_source() -> Path:
@@ -155,30 +208,16 @@ def _ensure_apisr_source() -> Path:
             tempfile.mkdtemp(prefix="apisr-source-", dir=str(target.parent))
         )
         archive = temporary_root / "apisr.zip"
+        staged = temporary_root / "source"
         try:
             print(
                 f"[APISR] downloading v0.1.0 source commit {APISR_SOURCE_COMMIT}",
                 flush=True,
             )
-            urllib.request.urlretrieve(APISR_SOURCE_ARCHIVE_URL, archive)
-            with zipfile.ZipFile(archive) as bundle:
-                bundle.extractall(temporary_root)
-
-            extracted = temporary_root / f"APISR-{APISR_SOURCE_COMMIT}"
-            if not extracted.is_dir():
-                candidates = [
-                    item
-                    for item in temporary_root.iterdir()
-                    if item.is_dir() and (item / "architecture" / "grl.py").is_file()
-                ]
-                if len(candidates) != 1:
-                    raise RuntimeError(
-                        "Downloaded APISR archive did not contain one valid source tree"
-                    )
-                extracted = candidates[0]
-
-            _validate_source_dir(extracted, require_pinned=True)
-            extracted.replace(target)
+            _download_to(APISR_SOURCE_ARCHIVE_URL, archive)
+            _extract_pinned_source(archive, staged)
+            _validate_source_dir(staged, require_pinned=True)
+            staged.replace(target)
         finally:
             shutil.rmtree(temporary_root, ignore_errors=True)
 
@@ -212,7 +251,7 @@ def _ensure_official_weight() -> Path:
         handle.close()
         try:
             print(f"[APISR] downloading {APISR_WEIGHT_URL}", flush=True)
-            urllib.request.urlretrieve(APISR_WEIGHT_URL, temporary)
+            _download_to(APISR_WEIGHT_URL, temporary)
             if temporary.stat().st_size != APISR_WEIGHT_SIZE:
                 raise RuntimeError(
                     "Downloaded APISR weight size mismatch: "
@@ -235,8 +274,10 @@ def resolve_model_paths(args) -> tuple[str, ...]:
     if args.model != APISR_MODEL_NAME:
         raise ValueError(f"Unsupported APISR branch model: {args.model}")
 
-    # Fail before worker startup if the source boundary cannot be prepared.
+    # Fail before worker startup if the source boundary or its Python
+    # dependencies are unusable. Importing the class does not allocate a model.
     _ensure_apisr_source()
+    _load_grl_class()
 
     if args.model_path:
         primary = Path(args.model_path).expanduser().resolve()
@@ -261,32 +302,39 @@ def _load_grl_class() -> type[torch.nn.Module]:
 
     existing_arch = sys.modules.get("architecture")
     if existing_arch is not None:
-        locations = [Path(value).resolve() for value in getattr(existing_arch, "__path__", ())]
+        locations = [
+            Path(value).resolve()
+            for value in getattr(existing_arch, "__path__", ())
+        ]
         if not any(_is_within(location, source_root) for location in locations):
             raise RuntimeError(
                 "A conflicting top-level 'architecture' package is already loaded; "
                 "cannot safely import the pinned APISR GRL source."
             )
 
-    inserted = source_text not in sys.path
-    if inserted:
+    original_sys_path = list(sys.path)
+    if source_text not in sys.path:
         sys.path.insert(0, source_text)
     try:
         try:
             module = importlib.import_module("architecture.grl")
         except ModuleNotFoundError as error:
-            if error.name in {"fairscale", "omegaconf", "timm"}:
+            if error.name in {
+                "cv2",
+                "fairscale",
+                "omegaconf",
+                "timm",
+                "torchvision",
+            }:
                 raise RuntimeError(
-                    "APISR GRL dependency is missing. Install requirements.txt "
-                    "before inference."
+                    f"APISR GRL dependency is missing ({error.name}). "
+                    "Install/repair the runtime dependencies before inference."
                 ) from error
             raise
     finally:
-        if inserted:
-            try:
-                sys.path.remove(source_text)
-            except ValueError:
-                pass
+        # APISR v0.1.0 grl.py itself appends cwd to sys.path. Restore the exact
+        # pre-import search path so upstream import side effects do not leak.
+        sys.path[:] = original_sys_path
 
     module_path = _loaded_module_path(module)
     if module_path is None or not _is_within(module_path, source_root):
@@ -301,6 +349,7 @@ def _load_grl_class() -> type[torch.nn.Module]:
     return grl
 
 
+@lru_cache(maxsize=1)
 def _cached_grl_class() -> type[torch.nn.Module]:
     grl = _load_grl_class()
 
@@ -412,60 +461,18 @@ def load_worker_model(config, device: torch.device):
     return model, APISR_NATIVE_SCALE
 
 
-def warmup_worker_model(
-    model: torch.nn.Module,
-    device: torch.device,
-    input_shape: tuple[int, int, int],
-) -> None:
-    """Fail fast on full-frame batch=1 VRAM and prebuild the GRL resolution cache."""
-    height, width, channels = (int(value) for value in input_shape)
-    if channels != 3 or height <= 0 or width <= 0:
-        raise ValueError(f"Invalid APISR input shape: {input_shape}")
-
-    sample = None
-    output = None
-    try:
-        sample = torch.zeros(
-            (1, channels, height, width),
-            dtype=torch.float32,
-            device=device,
-        )
-        with torch.inference_mode():
-            output = model(sample)
-        expected = (1, 3, height * APISR_NATIVE_SCALE, width * APISR_NATIVE_SCALE)
-        if tuple(int(value) for value in output.shape) != expected:
-            raise RuntimeError(
-                f"APISR warmup output shape mismatch: expected {expected}, "
-                f"got {tuple(output.shape)}"
-            )
-        torch.cuda.current_stream(device).synchronize()
-    except torch.cuda.OutOfMemoryError as error:
-        torch.cuda.empty_cache()
-        raise RuntimeError(
-            "APISR GRL full-frame batch=1 warmup ran out of VRAM at "
-            f"{width}x{height} on {device}; inference cannot safely start."
-        ) from error
-    finally:
-        del output
-        del sample
-
-    # Release transient warmup allocations back to the other persistent GPU
-    # process; the GRL resolution cache remains referenced by the model.
-    torch.cuda.empty_cache()
-    print(
-        f"[APISR] {device} full-frame warmup passed | input={width}x{height} | batch=1",
-        flush=True,
-    )
-
-
 def infer_frame(
     model: torch.nn.Module,
     frame: np.ndarray,
     device: torch.device,
 ) -> np.ndarray:
+    """Stable single-frame CPU-output fallback, including old PyTorch 10-bit."""
     is_10bit = frame.dtype.kind == "u" and frame.dtype.itemsize == 2
     max_value = 65535.0 if is_10bit else 255.0
-    tensor = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0)
+    # Convert uint16 to FP32 on CPU first so this fallback does not depend on
+    # PyTorch's limited/shell uint16 eager-mode support.
+    source = frame.astype(np.float32, copy=False) if is_10bit else frame
+    tensor = torch.from_numpy(source).permute(2, 0, 1).unsqueeze(0)
     tensor = tensor.to(device=device, dtype=torch.float32, non_blocking=True)
     tensor.div_(max_value)
     with torch.inference_mode():
@@ -485,10 +492,10 @@ __all__ = [
     "APISRGRL",
     "DEFAULT_MODEL_NAME",
     "MODEL_URLS",
+    "SR_MATMUL_TF32",
     "build_apisr_grl",
     "infer_frame",
     "load_worker_model",
     "model_native_scale",
     "resolve_model_paths",
-    "warmup_worker_model",
 ]

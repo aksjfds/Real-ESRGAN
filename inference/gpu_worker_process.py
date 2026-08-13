@@ -18,6 +18,7 @@ from .gpu_task_handlers import (
     WorkerContext,
     build_sr_handlers,
     build_temporal_handlers,
+    probe_sr_worker,
 )
 from .optimized_rife425 import OptimizedRIFE425Interpolator
 from .task_protocol import (
@@ -38,6 +39,21 @@ def _configure_worker_cpu_threads() -> None:
         torch.set_num_interop_threads(1)
     except RuntimeError:
         pass
+
+
+def _set_cuda_fp32_policy(*, matmul_tf32: bool, cudnn_tf32: bool) -> None:
+    """Use the non-conflicting precision API appropriate for this PyTorch version."""
+    matmul_backend = torch.backends.cuda.matmul
+    if hasattr(matmul_backend, "fp32_precision"):
+        matmul_backend.fp32_precision = "tf32" if matmul_tf32 else "ieee"
+    else:
+        matmul_backend.allow_tf32 = bool(matmul_tf32)
+
+    cudnn_conv = getattr(torch.backends.cudnn, "conv", None)
+    if cudnn_conv is not None and hasattr(cudnn_conv, "fp32_precision"):
+        cudnn_conv.fp32_precision = "tf32" if cudnn_tf32 else "ieee"
+    else:
+        torch.backends.cudnn.allow_tf32 = bool(cudnn_tf32)
 
 
 def _register_shared_views(
@@ -192,8 +208,7 @@ def gpu_temporal_worker_main(
 
         with torch.cuda.device(device):
             torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cuda.matmul.allow_tf32 = True
+            _set_cuda_fp32_policy(matmul_tf32=True, cudnn_tf32=True)
 
             from .basicvsrpp_api import BasicVSRPPConfig
 
@@ -308,15 +323,15 @@ def gpu_sr_worker_main(
 
         with torch.cuda.device(device):
             torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cuda.matmul.allow_tf32 = True
+            # APISR GRL is an FP32 model. Preserve PyTorch/APISR's IEEE matmul
+            # default while retaining cuDNN TF32 convolution acceleration.
+            _set_cuda_fp32_policy(
+                matmul_tf32=bool(base.SR_MATMUL_TF32),
+                cudnn_tf32=True,
+            )
 
             config = base.WorkerConfig(**config_dict)
             sr_model, _native_scale = base.load_worker_model(config, device)
-            # Do not announce WorkerReady until the exact full-frame batch=1
-            # model path has proved it fits on this GPU. This also primes GRL's
-            # dynamic-resolution table/mask cache for the steady-state video size.
-            base.warmup_worker_model(sr_model, device, input_shape)
 
             input_shm = shared_memory.SharedMemory(name=input_name)
             frame_output_shm = shared_memory.SharedMemory(name=frame_output_name)
@@ -354,6 +369,11 @@ def gpu_sr_worker_main(
                 sr_model=sr_model,
                 sr_output_view=sr_output_view,
             )
+            # Exercise the real H2D -> GRL -> quantize -> resize -> D2H/shared
+            # path before WorkerReady so runtime/capability failures happen at
+            # startup rather than after video processing has begun.
+            probe_sr_worker(context)
+
             _run_task_loop(
                 worker_id=worker_id,
                 gpu_id=gpu_id,
