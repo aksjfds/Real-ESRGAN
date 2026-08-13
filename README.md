@@ -2,7 +2,7 @@
 
 ## 当前版本流水线
 
-当前 **APISR v8.16 [Dev] 🔧** 以 `master` v8.9 为完整基线，仅替换 SR 模型后端，并保留 master 的 BVS / RIFE / 调度 / shared-memory / CUDA 传输 / NPP / 编码 / 音频架构。
+当前 **APISR v8.17 [Dev] 🔧** 以 `master` v8.9 为完整基线，仅替换 SR 模型后端，并保留 master 的 BVS / RIFE / 调度 / shared-memory / CUDA 传输 / NPP / 编码 / 音频架构。
 
 ```text
 视频增强（可关闭）：
@@ -43,6 +43,8 @@ SR worker 在发送 `WorkerReady` 前执行一次**完整 batch=1 SR startup pro
 
 当 `*_nvenc` 的 `encode_gpu` 与推理 worker 共用 GPU 时，正式 worker 启动前会以**最终输出分辨率、位深和完全相同的 NVENC 参数**启动一个临时编码会话并写入两帧黑帧完成真实初始化；该会话保持存活到第一张真实输出帧到达，使 APISR/BVS 的 startup 与正式首批计算始终在“NVENC 显存已占用”的真实并发预算下运行。第一张真实帧写入前，临时会话立即关闭并由正式 writer 接管释放出的同一份编码显存；黑帧只进入临时会话，不会进入成品。若编码 GPU 不在 worker GPU 列表中或使用 CPU 编码器，则完全跳过该机制。
 
+APISR v8.17 对显存受限 SR worker 启用碎片感知的 CUDA allocator 策略：默认仅在用户未显式设置 allocator 配置时使用 `expandable_segments:True,garbage_collection_threshold:0.80`。运行期不会每帧无条件清缓存；只有 startup 已判定为 memory-constrained 且全局空闲显存低于安全线、同时本进程存在至少 512 MiB 可回收 `reserved-allocated` 缓存时，才在 batch=1 推理前调用一次 `empty_cache()` 释放空闲缓存。若仍出现单帧 OOM，则退出异常作用域后 GC/清缓存并只重试一次；第二次 OOM 仍按真实显存不足失败，不降采样、不改变 GRL 数学路径。
+
 8-bit 始终使用 CUDA micro-batch 路径。10-bit 会先执行真实 CUDA `uint16` capability probe；只有当前 PyTorch/CUDA 组合确实支持所需 H2D / float conversion / uint16 quantize / D2H 时才启用 uint16 CUDA fast path，否则自动使用稳定的 FP32 GPU 推理 + CPU uint16 输出 fallback。支持 fast path 时，最终倍率调整优先调用 NPP `nppiResize_16u_C3R_Ctx`；NPP 不可用或运行失败时回退 CPU Lanczos4。SR micro-batch OOM 时只将对应 worker 锁定到 batch=1。
 
 `AUDIO_ENHANCE=False` 时不执行 DSP，只保留原音轨并优先 stream copy。
@@ -72,6 +74,7 @@ APISR 的基准是当前 `master`。静态审计只把以下两类内容视为 A
 
 ## 版本历史
 
+- **APISR v8.17 [Dev] 🔧**：修复 1080p/T4 + NVENC 并发下 SR worker 出现 `allocated≈6.78 GiB` 但 `reserved-but-unallocated≈3.68 GiB`，随后 GRL attention 再申请约 1014 MiB 失败的问题。默认启用 PyTorch `expandable_segments` + 0.80 allocator garbage-collection threshold（尊重用户显式配置），并只在 APISR memory-constrained batch=1 且检测到真实低全局显存/高可回收 cache 时自适应释放空闲缓存；单帧 OOM 再执行一次异常作用域外清理与单次重试。无每帧固定同步、无降采样、无模型/编码参数变化。
 - **APISR v8.16 [Dev] 🔧**：修复 APISR/BVS worker 与 4K NVENC 共用 GPU 时，正式 `RawVideoWriter` 直到第一帧才启动 FFmpeg，导致 NVENC 在模型显存已占满后 `InitializeEncoder failed: out of memory (10)`。新增精确 NVENC reservation：用最终输出尺寸/位深/codec/质量参数预先初始化并保持临时会话，worker startup probe 与首批计算据此适配真实并发显存；第一张真实输出帧写入前释放临时会话并立即启动正式 writer。无降采样、无 HEVC/AV1 参数降级、无正常热路径额外拷贝。
 - **APISR v8.15 [Dev] 🔧**：修复运行期 `micro-batch=2` OOM 后立即在同一 `except` 栈内重试 batch=1 导致失败 batch traceback/locals 仍占用显存的问题；OOM fallback 现在先退出异常处理作用域，再 GC + `empty_cache()` 后执行 batch=1。若 startup probe 已因 1080p T4 显存压力启用 reconstruction-tail streaming，则直接将该 worker 固定 batch=1，避免无意义的 batch=2 OOM。同步 Notebook 当前 deband=0、RIFE=0、HEVC 默认配置说明。
 - **APISR v8.14 [Dev] 🔧**：修复 1920×1080 FP32 GRL 在约 15 GB GPU 上于 `conv_up2` 申请约 7.9 GiB 导致的 startup OOM。完整 Transformer 主干仍只计算一次；仅对已经生成的 2× reconstruction feature 自适应流式执行 4× `nearest+conv` 尾部，2 px feature halo 精确覆盖尾部 3 个 3×3 Conv 的边界依赖。启动 probe 自动选出能通过的最少条数并复用；不降采样输入、不改 master 调度/transport/NPP，也不把整网按 tile 重算。

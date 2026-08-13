@@ -60,6 +60,27 @@ class GPUTaskHandlerTests(unittest.TestCase):
         self.assertFalse(context.sr_micro_batch_enabled)
         self.assertEqual(result.frame_ids, (10, 11))
 
+    def test_memory_constrained_batch1_retries_once_after_oom(self) -> None:
+        context = self._context()
+
+        class ConstrainedModel(torch.nn.Identity):
+            sr_micro_batch_safe = False
+
+        context.sr_model = ConstrainedModel()
+        frame = context.input_view[0]
+        recovered = torch.zeros((8, 8, 3), dtype=torch.uint8)
+        calls = [torch.cuda.OutOfMemoryError("synthetic"), recovered]
+
+        with (
+            mock.patch.object(handlers, "_prepare_memory_constrained_sr"),
+            mock.patch.object(handlers, "_release_cuda_after_oom") as release,
+            mock.patch.object(handlers, "infer_cuda_tensor", side_effect=calls),
+        ):
+            result = handlers._infer_sr_single_with_recovery(context, frame)
+
+        self.assertIs(result, recovered)
+        release.assert_called_once_with()
+
     def test_probe_honors_model_microbatch_safety(self) -> None:
         class ProbeModel(torch.nn.Identity):
             sr_micro_batch_safe = False

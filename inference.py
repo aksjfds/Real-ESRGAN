@@ -6,6 +6,13 @@ from __future__ import annotations
 import argparse
 import multiprocessing as mp
 
+from inference.cuda_memory_policy import configure_cuda_allocator_env
+
+# Configure before importing torch-bearing runtime modules so spawned CUDA workers
+# inherit the allocator policy before their first CUDA allocation. Explicit user
+# PYTORCH_ALLOC_CONF/PYTORCH_CUDA_ALLOC_CONF values always win.
+configure_cuda_allocator_env()
+
 from encode import runtime as encode_runtime
 from inference import runtime as inference_runtime
 from inference import runtime_api as pipeline_runtime

@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from . import runtime_api as base
+from .cuda_memory_policy import trim_cuda_cache_under_pressure
 from .frame_transport import (
     PinnedD2HStager,
     PinnedH2DStager,
@@ -53,12 +54,73 @@ class WorkerContext:
     npp_active_logged: bool = False
     sr_micro_batch_enabled: bool = True
     sr_uint16_cuda_enabled: bool = True
+    sr_cache_trim_logged: bool = False
+    sr_batch1_retry_logged: bool = False
 
 
 def _release_cuda_after_oom() -> None:
     """Collect failed-op traceback cycles before releasing CUDA cache."""
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def _sr_memory_constrained(context: WorkerContext) -> bool:
+    model = context.sr_model
+    return model is not None and not bool(
+        getattr(model, "sr_micro_batch_safe", True)
+    )
+
+
+def _prepare_memory_constrained_sr(context: WorkerContext) -> None:
+    trim = trim_cuda_cache_under_pressure(
+        context.device,
+        enabled=_sr_memory_constrained(context),
+    )
+    if trim is None or context.sr_cache_trim_logged:
+        return
+    context.sr_cache_trim_logged = True
+    mib = 1024.0 * 1024.0
+    print(
+        f"[sr] {context.device} reclaimed idle CUDA cache under memory pressure | "
+        f"free={trim.free_before / mib:.0f}->{trim.free_after / mib:.0f} MiB | "
+        f"reclaimable={trim.reclaimable / mib:.0f} MiB",
+        flush=True,
+    )
+
+
+def _infer_sr_single_with_recovery(
+    context: WorkerContext,
+    frame: np.ndarray,
+) -> torch.Tensor:
+    if context.sr_model is None:
+        raise RuntimeError("SR worker model is unavailable")
+
+    _prepare_memory_constrained_sr(context)
+    try:
+        return infer_cuda_tensor(
+            context.sr_model,
+            frame,
+            context.device,
+            h2d_stager=_require_h2d_stager(context),
+        )
+    except torch.cuda.OutOfMemoryError:
+        if not _sr_memory_constrained(context):
+            raise
+
+    _release_cuda_after_oom()
+    if not context.sr_batch1_retry_logged:
+        context.sr_batch1_retry_logged = True
+        print(
+            f"[sr] {context.device} batch=1 OOM in memory-constrained mode; "
+            "released idle cache and retrying once",
+            flush=True,
+        )
+    return infer_cuda_tensor(
+        context.sr_model,
+        frame,
+        context.device,
+        h2d_stager=_require_h2d_stager(context),
+    )
 
 
 def _notify_compute_done(context: WorkerContext) -> None:
@@ -364,12 +426,7 @@ def _run_sr_sequential_fallback(
     if context.sr_model is None:
         raise RuntimeError("SR worker model is unavailable")
     for frame, slot in zip(frames, output_slots):
-        result_cuda = infer_cuda_tensor(
-            context.sr_model,
-            frame,
-            context.device,
-            h2d_stager=_require_h2d_stager(context),
-        )
+        result_cuda = _infer_sr_single_with_recovery(context, frame)
         _store_sr_cuda_batch(
             context,
             result_cuda.unsqueeze(0),
@@ -570,15 +627,10 @@ def run_sr(context: WorkerContext, task: SRTask) -> SRResult:
     else:
         uint16_batch1_oom = False
         try:
-            result_cuda = infer_cuda_batch(
-                context.sr_model,
-                frames,
-                context.device,
-                h2d_stager=_require_h2d_stager(context),
-            )
+            result_cuda = _infer_sr_single_with_recovery(context, frames[0])
             _store_sr_cuda_batch(
                 context,
-                result_cuda,
+                result_cuda.unsqueeze(0),
                 output_slots,
                 publish_boundary=True,
             )
