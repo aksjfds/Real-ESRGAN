@@ -248,7 +248,7 @@ def process_video(args) -> None:
     input_shape = (in_h, in_w, 3)
     final_output_shape = (out_h, out_w, 3)
 
-    from .checkpoint_parts import resolve_checkpoint
+    from .basicvsrpp_checkpoint import resolve_checkpoint
 
     checkpoint_path = resolve_checkpoint(
         Path(__file__).resolve().parent / "weights"

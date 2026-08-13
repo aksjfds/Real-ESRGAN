@@ -2,7 +2,7 @@
 
 ## 当前版本流水线
 
-当前 **APISR v8.11 [Dev] 🔧** 以 `master` v8.9 为完整基线，仅替换 SR 模型后端，并保留 master 的 BVS / RIFE / 调度 / shared-memory / CUDA 传输 / NPP / 编码 / 音频架构。
+当前 **APISR v8.12 [Dev] 🔧** 以 `master` v8.9 为完整基线，仅替换 SR 模型后端，并保留 master 的 BVS / RIFE / 调度 / shared-memory / CUDA 传输 / NPP / 编码 / 音频架构。
 
 ```text
 视频增强（可关闭）：
@@ -70,6 +70,7 @@ APISR 的基准是当前 `master`。静态审计只把以下两类内容视为 A
 
 ## 版本历史
 
+- **APISR v8.12 [Dev] 🔧**：完成文件/目录结构清理：Kaggle Notebook 由 `realesrgan.ipynb` 统一命名为 `apisr.ipynb`；BasicVSR++ 分片 checkpoint 模块改为职责明确的 `basicvsrpp_checkpoint.py`；根入口直接使用 `scheduler.py`；删除已退出 active path 的旧 `pipeline` / `balanced_pipeline` / `progress_log`、v5.1/v5.4 runtime 兼容层、`v52_scheduler.py`、`stable_gpu_transport.py` 以及 master 专用 banding debug Notebook。不重排当前 active runtime 子目录，不改变推理数学路径或性能关键路径。
 - **APISR v8.11 [Dev] 🔧**：完成静态审计闭环：第三方 GRL import 同时恢复 `sys.path` 与 `architecture.*` 的 `sys.modules` 状态；APISR source/weight 下载加入硬性字节上限并补回归测试；README 固化 APISR↔master 审计边界，避免把 master 原样继承内容反复误报为 APISR 缺陷；补充上游 GPL-3.0 / academic-use disclaimer 提示。
 - **APISR v8.10 [Dev] 🔧**：在 v8.9 APISR backend 基础上完成运行边界收口：完整 SR startup probe 取代 model-only warmup；10-bit CUDA `uint16` 改为 capability-gated fast path 并提供稳定 fallback；`frame_transport` 泛化为 uint8/uint16 共用路径，删除 APISR handler 重复 transport；APISR FP32 matmul 恢复 IEEE 语义；完整恢复第三方源码 import 前后的 `sys.path`；下载增加超时/重试并只安全提取 pinned GRL runtime 文件；Notebook 默认执行 CPU 回归测试。
 - **APISR v8.9 [Dev] 🔧**：以 `master` v8.9 为完整基线，将 Real-ESRGAN SR 后端替换为 APISR 4× GRL GAN；补齐真正 BCHW micro-batch、GRL 动态 resolution table/mask 单槽缓存、显式 SR backend 边界、v0.1.0 源码/权重一致性与完整性校验、并发 cache lock 和 uint16 CUDA/NPP 初始路径；GRL 使用 FP32。
@@ -98,7 +99,7 @@ APISR 的基准是当前 `master`。静态审计只把以下两类内容视为 A
 
 ## 当前结构
 
-- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），默认 `MODEL="APISR_GRL"`，环境单元执行 APISR CPU 回归测试。
+- `apisr.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），默认 `MODEL="APISR_GRL"`，环境单元执行 APISR CPU 回归测试。
 - `inference.py`：视频增强 CLI 与总入口。
 - `inference/apisr_backend.py`：APISR v0.1.0 GRL 注册、最小源码/权重缓存、完整性校验、FP32 模型加载与 resolution cache。
 - `inference/scheduler.py`：CPU 总编排、编码 fail-fast probe、最终音频边界与成品验证。
@@ -107,6 +108,7 @@ APISR 的基准是当前 `master`。静态审计只把以下两类内容视为 A
 - `inference/task_protocol.py` / `worker_protocols.py`：BVS/RIFE/SR typed task/result 与 worker API。
 - `inference/gpu_transport.py` / `gpu_workers.py` / `gpu_worker_process.py`：常驻 GPU workers、shared memory、FrameHandle、SR startup probe 与进程生命周期。
 - `inference/frame_transport.py`：`cudaHostRegister`、pinned fallback、uint8/uint16 异步 H2D/D2H 与 copy stream。
+- `inference/basicvsrpp_checkpoint.py`：BasicVSR++ 仓库分片权重的运行时合并、完整性验证与临时兼容路径管理。
 - `inference/bvs_runtime.py` / `optimized_basicvsrpp.py`：BasicVSR++ runtime。
 - `inference/rife425.py` / `optimized_rife425.py`：Practical-RIFE 4.25 runtime。
 - `inference/sr_runtime.py`：通用 uint8/uint16 SR CUDA 路径与 CUDA uint16 capability probe；APISR 使用 FP32 contiguous 模型输入。

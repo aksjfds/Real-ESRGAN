@@ -9,7 +9,7 @@ import multiprocessing as mp
 from encode import runtime as encode_runtime
 from inference import runtime as inference_runtime
 from inference import runtime_api as pipeline_runtime
-from inference import v52_scheduler as inference_pipeline
+from inference import scheduler as inference_pipeline
 from inference.run_lock import exclusive_output_run
 
 
