@@ -11,7 +11,6 @@ import time
 
 import numpy as np
 
-from audio.runtime import mux_audio as mux_output_audio
 from . import runtime_api as base
 from .clip_source import ClipSource
 from .gpu_workers import UnifiedGPUWorkers
@@ -66,7 +65,6 @@ def _verify_output_file(
     expected_fps: float,
     expected_bit_depth: int,
     expected_audio_streams: int,
-    expect_enhanced_audio: bool,
 ) -> str:
     command = [
         ffprobe_bin,
@@ -140,13 +138,6 @@ def _verify_output_file(
             "Final output audio stream count mismatch: "
             f"expected {expected_audio_streams}, got {len(audios)}"
         )
-    if expect_enhanced_audio:
-        defaults = [int(stream.get("disposition", {}).get("default", 0)) for stream in audios]
-        if defaults != [1, 0]:
-            raise RuntimeError(
-                "Final enhanced/original audio default dispositions are incorrect: "
-                f"default={defaults}"
-            )
 
     return (
         f"{actual_codec} | profile={profile} | {actual_bit_depth}-bit ({pix_fmt}) | "
@@ -340,7 +331,7 @@ def process_video(args) -> None:
     started = time.monotonic()
     worker_model_time = 0.0
     flush_time = 0.0
-    audio_time = 0.0
+    mux_time = 0.0
     scheduler_wait = 0.0
     state = None
     clean = False
@@ -481,8 +472,8 @@ def process_video(args) -> None:
         raise RuntimeError("No complete video was encoded.")
 
     actual_duration = processed / output_fps
-    audio_started = time.monotonic()
-    mux_output_audio(
+    mux_started = time.monotonic()
+    base.mux_original_audio(
         temp_video,
         input_path,
         output_path,
@@ -490,17 +481,10 @@ def process_video(args) -> None:
         start,
         actual_duration,
         info.has_audio,
-        args.audio_codec,
-        args.audio_bitrate,
-        enhance=bool(args.audio_enhance),
     )
-    audio_time = time.monotonic() - audio_started
+    mux_time = time.monotonic() - mux_started
 
-    expected_audio_streams = (
-        0
-        if not info.has_audio
-        else (2 if bool(args.audio_enhance) else 1)
-    )
+    expected_audio_streams = 1 if info.has_audio else 0
     verification_text = _verify_output_file(
         output_path,
         args.ffprobe_bin,
@@ -510,7 +494,6 @@ def process_video(args) -> None:
         expected_fps=output_fps,
         expected_bit_depth=output_bit_depth,
         expected_audio_streams=expected_audio_streams,
-        expect_enhanced_audio=bool(args.audio_enhance and info.has_audio),
     )
     if temp_video.exists():
         temp_video.unlink()
@@ -546,7 +529,7 @@ def process_video(args) -> None:
         scheduler_wait=scheduler_wait,
         pump=pump,
         flush_time=flush_time,
-        audio_time=audio_time,
+        mux_time=mux_time,
         selected_tile=selected_tile,
         clip_length=clip_length,
         batch_size=batch_size,

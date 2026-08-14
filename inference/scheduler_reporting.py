@@ -99,7 +99,7 @@ def print_completed(
     scheduler_wait: float,
     pump,
     flush_time: float,
-    audio_time: float,
+    mux_time: float,
     selected_tile: int,
     clip_length: int,
     batch_size: int,
@@ -132,7 +132,7 @@ def print_completed(
         f"scheduler_wait={scheduler_wait:.1f}s | "
         f"resize={pump.resize_seconds:.1f}s | "
         f"write={pump.write_seconds:.1f}s | "
-        f"flush={flush_time:.1f}s | audio={audio_time:.1f}s",
+        f"flush={flush_time:.1f}s | mux={mux_time:.1f}s",
         flush=True,
     )
     if state.gpu_timing_samples:

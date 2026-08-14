@@ -8,7 +8,6 @@ import multiprocessing as mp
 
 from encode import runtime as encode_runtime
 from inference import runtime as inference_runtime
-from inference import runtime_api as pipeline_runtime
 from inference import v52_scheduler as inference_pipeline
 from inference.run_lock import exclusive_output_run
 
@@ -37,29 +36,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Final output scale",
     )
     parser.add_argument(
-        "--deband-strength",
-        type=float,
-        default=0.0,
-        help=(
-            "FFmpeg pre-model deband threshold; 0 disables, otherwise "
-            "must be within 0.00003..0.5"
-        ),
-    )
-    parser.add_argument(
         "--gpu-ids",
         default="0",
         help="Comma-separated CUDA GPU IDs; defaults to one GPU",
-    )
-    parser.add_argument(
-        "--audio-codec",
-        choices=("aac", "copy"),
-        default="aac",
-    )
-    parser.add_argument("--audio-bitrate", default="192k")
-    parser.add_argument(
-        "--audio-enhance",
-        action="store_true",
-        help="Enable FFmpeg dialogue-focused audio enhancement",
     )
     parser.add_argument(
         "--start-time",
@@ -134,24 +113,12 @@ def _validate_args(args) -> None:
         raise ValueError("--bvs-batch-size must be at least 1")
     if float(args.rife_fps) < 0:
         raise ValueError("--rife-fps must be 0 or a positive FPS")
-    deband_strength = float(args.deband_strength)
-    if deband_strength < 0.0 or deband_strength > 0.5:
-        raise ValueError("--deband-strength must be 0 or within 0.00003..0.5")
-    if 0.0 < deband_strength < 0.00003:
-        raise ValueError("--deband-strength must be 0 or within 0.00003..0.5")
-    if bool(args.audio_enhance) and args.audio_codec != "aac":
-        raise ValueError("--audio-enhance requires --audio-codec aac")
 
 
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
     _validate_args(args)
-    if args.audio_enhance:
-        from audio.runtime import validate_runtime
-
-        validate_runtime(args.ffmpeg_bin)
-    pipeline_runtime.configure_deband(args.deband_strength)
     with exclusive_output_run(args.output):
         encode_runtime.prepare_runtime(inference_runtime, args)
         inference_pipeline.process_video(args)

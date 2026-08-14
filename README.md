@@ -2,40 +2,25 @@
 
 ## 当前版本流水线
 
-当前 v8.9 [Dev] 流水线：
+当前 v8.10 [Dev] 流水线：
 
 ```text
 视频增强（可关闭）：
 FFmpeg 解码
-→ FFmpeg 轻度 deband（Notebook 默认 0.006，可设 0 关闭）
 → BasicVSR++ NTIRE Track 1 同分辨率时序恢复
 → Practical-RIFE 4.25 任意 timestep 插帧（可关闭）
 → Real-ESRGAN full-frame 超分
 → NPP Lanczos CUDA 最终倍率调整（CPU Lanczos4 fallback）
 → NVENC（Notebook 可选 av1_nvenc / hevc_nvenc；默认 av1_nvenc）
+→ 原始音轨 stream copy mux（若源视频有音频；不解码、不滤镜、不重编码）
 → ffprobe 成品验证（codec / profile / 位深 / 分辨率 / FPS / 音轨）
-
-音频增强（可关闭，默认开启 FFmpeg 版本）：
-原始音频
-├→ FFmpeg DSP
-│  → 55 Hz high-pass
-│  → 500 Hz -0.8 dB / 3 kHz +0.8 dB / 11 kHz high-shelf +0.8 dB
-│  → 1.8:1 gentle compression
-│  → de-esser
-│  → EBU R128 loudnorm（-16 LUFS / -1.5 dBTP）
-│  → 48 kHz AAC
-│  → Audio 1: Enhanced (FFmpeg)，默认音轨
-└→ stream copy
-   → Audio 2: Original，原音轨
 ```
 
-`DEBAND_STRENGTH=0` 时不执行 deband；Notebook 默认 `0.006`，只在 FFmpeg 解码后、BasicVSR++ 前处理。CLI 默认仍为 `0`，保持旧调用兼容。
+v8.10 已移除 deband 与音频处理：CLI / Notebook 不再提供 `DEBAND_STRENGTH`、`--deband-strength`、`AUDIO_ENHANCE`、`--audio-enhance`、`--audio-codec` 或 `--audio-bitrate`；不再执行音频 DSP、AAC 重编码或失败后的 AAC fallback。源视频若有音频，只复制第一条原始音轨到最终文件；若 stream copy 与 MP4 容器不兼容则直接报错，不自动转码。
 
 v8.9 的 `ClipSource` 使用单槽有界异步预取：后台线程提前执行下一次 FFmpeg 读帧、scene signature 与 BVS clip 组装，`Queue(maxsize=1)` 只缓存 1 个待调度 clip；不改变帧顺序、scene-cut 判定、BVS/RIFE/SR 数学路径或编码参数。
 
-`AUDIO_ENHANCE=False` 时不执行 DSP，继续只保留原音轨并优先 stream copy。
-
-v8.8 Notebook 暴露 `av1_nvenc` / `hevc_nvenc` 两种 GPU 编码器，默认仍为 `av1_nvenc`。两者共用 `PRESET`、`CQ`、`ENCODE_GPU`。AV1 的 profile 不再作为可变参数暴露；旧 CLI 的 `--av1-profile main` 仅作为兼容占位，成品会验证为 Main；VBR 使用 `CQ`，CBR 要求非零 bitrate 并设置匹配的 maxrate/bufsize，CONSTQP 使用 `QP`。`AV1_BIT_DEPTH` 表示 AV1 最低输出位深：设为 `8` 时 8-bit 片源保持 8-bit，设为 `10` 时 8-bit 片源编码为 10-bit；10-bit 片源始终保持 10-bit。启动日志中的 `encode=` 表示编码器输入/目标像素格式，任务完成后以最终文件的 ffprobe 结果作为实际输出事实。
+v8.10 Notebook 暴露 `av1_nvenc` / `hevc_nvenc` 两种 GPU 编码器，默认仍为 `av1_nvenc`。两者共用 `PRESET`、`CQ`、`ENCODE_GPU`。AV1 的 profile 不再作为可变参数暴露；旧 CLI 的 `--av1-profile main` 仅作为兼容占位，成品会验证为 Main；VBR 使用 `CQ`，CBR 要求非零 bitrate 并设置匹配的 maxrate/bufsize，CONSTQP 使用 `QP`。`AV1_BIT_DEPTH` 表示 AV1 最低输出位深：设为 `8` 时 8-bit 片源保持 8-bit，设为 `10` 时 8-bit 片源编码为 10-bit；10-bit 片源始终保持 10-bit。启动日志中的 `encode=` 表示编码器输入/目标像素格式，任务完成后以最终文件的 ffprobe 结果作为实际输出事实。
 
 AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频相同位深的测试帧执行一次真实编码 probe；GPU、驱动、10-bit、lookahead、AQ 等参数组合不兼容时会提前失败。NVENC 默认只启用 Spatial AQ，Temporal AQ 默认关闭；AV1 参数校验禁止同时开启两种 AQ，CONSTQP 则要求两种 AQ 都关闭，以保证 QP 语义不被 AQ 改写。
 
@@ -53,7 +38,7 @@ AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频�
 
 静态审计必须以**当前 `master` HEAD / 明确指定 commit、用户本轮明确范围，以及该 commit 相对其直接基线的实际代码变化**为上下文；不得脱离当前代码和变更事实无限扩张审查范围。对于 active path 中能够指出明确失败路径的历史问题，即使该行代码本轮未修改，也仍可作为真实缺陷处理；但同一 commit 已完成闭环审计后，不得仅因为换了审查角度、命名方式或理想架构偏好，就把相同事实重新包装成“新问题”。
 
-每次宣告“静态审计完成”前，必须一次性检查并记录以下边界：**FFmpeg 解码/deband、BasicVSR++、RIFE、SR 模型与权重、输入输出/位深/精度、最终 resize、H2D/D2H/shared-memory/NPP、GPU 调度与 OOM、并发/生命周期/资源释放、import/global state、下载/cache/完整性、依赖/许可证、失败/fallback/fail-fast、编码/音频/mux/ffprobe、CLI/Notebook/文档、回归测试，以及各 runtime/API/进程边界。** 对本轮实际未触及但属于共享基础设施的区域，也要确认是否被本轮变化间接影响；确认无影响后记录为已覆盖，不应留到下一轮再作为“新发现”。
+每次宣告“静态审计完成”前，必须一次性检查并记录以下边界：**FFmpeg 解码、BasicVSR++、RIFE、SR 模型与权重、输入输出/位深/精度、最终 resize、H2D/D2H/shared-memory/NPP、GPU 调度与 OOM、并发/生命周期/资源释放、import/global state、下载/cache/完整性、依赖/许可证、失败/fallback/fail-fast、编码/原音轨 stream-copy mux/ffprobe、CLI/Notebook/文档、回归测试，以及各 runtime/API/进程边界。** 对本轮实际未触及但属于共享基础设施的区域，也要确认是否被本轮变化间接影响；确认无影响后记录为已覆盖，不应留到下一轮再作为“新发现”。
 
 同一 commit 在上述清单已经完整审过且代码未变化时，后续再次审查只允许新增以下四类问题：**① 代码发生新变化；② 出现新的真实运行/测试/日志证据；③ 上游依赖、CUDA/PyTorch/FFmpeg/驱动或其他运行环境约束发生变化；④ 能指出上一次闭环清单中遗漏的具体、可复现失败路径。** 若不满足这些条件，应直接说明“未发现新的静态缺陷”，不得为了继续产出内容而扩大问题定义。
 
@@ -65,6 +50,7 @@ AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频�
 
 ## 版本历史
 
+- v8.10 [Dev] 🔧：移除 deband 和音频处理功能；删除相关 CLI / Notebook 参数、FFmpeg DSP/AAC 转码与 fallback、独立 `audio` 处理入口和色带调试 Notebook。源音频仅保留第一条原始音轨并使用 stream copy mux；`VIDEO_ENHANCE=False` 时 Notebook 直接 stream copy 原视频/音频。
 - v8.9 [Dev] 🔧：`ClipSource` 增加单槽有界异步预取；后台线程在当前 GPU 任务执行期间提前完成下一 BVS clip 的 FFmpeg 读帧、scene signature 与组帧，`Queue(maxsize=1)` 提供背压并限制额外内存，不改变视频处理数学路径与输出顺序。
 - v8.8 [Dev] 🔧：修复编码配置/日志一致性：AV1 VBR/CBR/CONSTQP 使用正确 FFmpeg 参数，CONSTQP 要求 AQ 关闭；移除 AV1 profile 的伪可配置语义并保留旧 CLI 兼容，成品验证为 Main；AV1/HEVC/H.264 增加源位深一致的 runtime probe；输出位深日志移除全局状态并显式传递；任务完成后用 ffprobe 验证成品 codec/profile/位深/分辨率/FPS/音轨；NVENC 默认改为仅 Spatial AQ，避免 Spatial/Temporal AQ 同时开启；清理活动路径中的陈旧版本文案。
 - v8.7 [Dev] 🔧：Notebook 恢复 `hevc_nvenc`，与 `av1_nvenc` 二选一；继续默认 AV1，HEVC 复用现有 NVENC 高质量 backend。
@@ -90,9 +76,10 @@ AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频�
 
 ## 当前结构
 
-- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），v8.8 Notebook 可选 `av1_nvenc` / `hevc_nvenc`，当前默认 `DUAL_GPU=True`、`AUDIO_ENHANCE=True`。
+- `realesrgan.ipynb`：Kaggle 入口；3 个代码单元（环境 / 配置 / 执行），v8.10 Notebook 可选 `av1_nvenc` / `hevc_nvenc`，当前默认 `DUAL_GPU=True`。`VIDEO_ENHANCE=False` 时仅 stream copy 原视频和原音频。
 - `inference.py`：视频增强 CLI 与总入口。
-- `inference/scheduler.py`：CPU 总编排、编码 fail-fast probe、最终音频边界与成品验证。
+- `inference/runtime.py` / `runtime_api.py`：基础视频探测、FFmpeg 解码、模型加载兼容边界与原音轨 stream-copy mux。
+- `inference/scheduler.py`：CPU 总编排、编码 fail-fast probe、最终原音轨 mux 与成品验证。
 - `inference/clip_source.py`：CPU scene-aware BVS clip 组装；v8.9 使用后台线程单槽预取下一 clip。
 - `inference/scheduler_state.py` / `scheduler_loop.py`：调度状态、任务策略、结果处理与 watchdog。
 - `inference/task_protocol.py` / `worker_protocols.py`：BVS / RIFE / SR typed task/result 与 worker API。
@@ -103,8 +90,6 @@ AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频�
 - `inference/sr_runtime.py`：Real-ESRGAN SR runtime。
 - `inference/output_runtime.py`：NPP Lanczos、输出 pump、编码与进度日志。
 - `inference/weights/`：仓库内置 BasicVSR++ 权重分片与 RIFE 模型压缩包。
-- `audio/runtime.py`：FFmpeg dialogue-focused DSP、增强/原始双音轨 mux、音频旁路。
-- `audio/process.py`：`VIDEO_ENHANCE=False` 时的视频 stream-copy / 音频处理入口。
 
 ## 模型与资源
 
@@ -122,11 +107,11 @@ AV1 与 HEVC/H.264 backend 都会在模型下载/加载前，使用与源视频�
 |---|---|---|
 | `realesr-animevideov3.pth` | 当前 Notebook 默认 Real-ESRGAN 动画视频超分模型，原生 4× | [Real-ESRGAN 官方 Release](https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth) |
 
-当前默认流水线只需要上述模型资源。若手动修改 `MODEL` 使用其他 Real-ESRGAN 模型，程序会按代码中的官方 URL 下载对应权重；README 不重复罗列非默认模型。当前 FFmpeg 音频增强不需要额外神经网络模型或权重。
+当前默认流水线只需要上述模型资源。若手动修改 `MODEL` 使用其他 Real-ESRGAN 模型，程序会按代码中的官方 URL 下载对应权重；README 不重复罗列非默认模型。
 
 ## 编码
 
-v8.8 Notebook 默认：
+v8.10 Notebook 默认：
 
 - `VIDEO_CODEC="av1_nvenc"`；可改为 `hevc_nvenc`
 - 两种 NVENC 共用：P7 / CQ18 / `ENCODE_GPU=0`
@@ -137,5 +122,6 @@ v8.8 Notebook 默认：
 - HEVC：HQ / VBR CQ18 / fullres multipass / Spatial AQ strength=8 / lookahead 32 / B-frame 3
 - HEVC 位深：8-bit 推理帧输出 8-bit；10-bit 推理帧输出 10-bit
 - AV1/HEVC/H.264 编码在模型加载前执行真实 runtime probe；成品 mux 后执行 ffprobe 验证
+- 源视频若有音频，最终文件仅 stream copy 第一条原始音轨，不执行任何 DSP 或音频重编码
 
-底层仍保留 H.264/软件 HEVC/CPU AV1 编码后端，用于 CLI 兼容，不在 v8.8 Notebook 暴露。
+底层仍保留 H.264/软件 HEVC/CPU AV1 编码后端，用于 CLI 兼容，不在 v8.10 Notebook 暴露。
